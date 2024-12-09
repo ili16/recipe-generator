@@ -1,2 +1,7 @@
 .idea/
 /.idea/
+/.terraform.lock.hcl
+/.terraform/
+.terraform.*
+terraform*
+/.terraform.tfstate.lock.info
