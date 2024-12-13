@@ -82,7 +82,7 @@ func main() {
 	})
 
 	log.Println("Server is running on port 8080")
-	log.Fatal(http.ListenAndServe("192.168.10.24:8080", logRequests(addCORSHeaders(mux))))
+	log.Fatal(http.ListenAndServe(":8080", logRequests(addCORSHeaders(mux))))
 }
 
 func logRequests(next http.Handler) http.Handler {
