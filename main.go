@@ -30,7 +30,9 @@ type RecipeLinkRequest struct {
 }
 
 func main() {
-	http.HandleFunc("/add-recipe", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/add-recipe", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
 			return
@@ -57,7 +59,7 @@ func main() {
 		_, _ = fmt.Fprint(w, "Recipe added successfully!")
 	})
 
-	http.HandleFunc("/api/v1/generate/by-name", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/generate/by-name", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
 			return
@@ -83,7 +85,7 @@ func main() {
 		_, _ = fmt.Fprint(w, "Recipe generated successfully!")
 	})
 
-	http.HandleFunc("/api/v1/generate/by-link", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/generate/by-link", func(w http.ResponseWriter, r *http.Request) {
 
 		if r.Method != http.MethodPost {
 			http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
@@ -110,7 +112,7 @@ func main() {
 		_, _ = fmt.Fprintf(w, "New recipe created successfully: %s", recipe)
 	})
 
-	http.HandleFunc("/test/get-content", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/test/get-content", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
 			return
@@ -140,7 +142,23 @@ func main() {
 	})
 
 	log.Println("Server is running on port 8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(http.ListenAndServe(":8080", addCORSHeaders(mux)))
+}
+
+func addCORSHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "https://recipe-generator.ili16.de") // Adjust origin as needed
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		// Handle preflight requests
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 func GenerateRecipeByLink(URL string) (string, error) {
