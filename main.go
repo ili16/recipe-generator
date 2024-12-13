@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"strings"
@@ -29,88 +31,26 @@ type RecipeLinkRequest struct {
 	URL string `json:"url"`
 }
 
+type RecipeImageRequest struct {
+	Image string `json:"image"`
+}
+
 func main() {
+
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/add-recipe", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
-			return
-		}
+	if !validateEnvVars() {
+		log.Fatal("Missing environment variables")
+		return
+	}
 
-		var req RecipeRequest
-		err := json.NewDecoder(r.Body).Decode(&req)
-		if err != nil {
-			http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
-			return
-		}
+	mux.HandleFunc("/add-recipe", HandleAddRecipe)
 
-		if req.Recipename == "" || req.Recipe == "" {
-			http.Error(w, "Missing recipename or recipe", http.StatusBadRequest)
-			return
-		}
+	mux.HandleFunc("/api/v1/generate/by-name", HandleGenerateByName)
 
-		err = AddRecipe(req.Recipename, req.Recipe)
-		if err != nil {
-			http.Error(w, "Error adding recipe", http.StatusInternalServerError)
-			return
-		}
+	mux.HandleFunc("/api/v1/generate/by-link", HandleGenerateByLink)
 
-		_, _ = fmt.Fprint(w, "Recipe added successfully!")
-	})
-
-	mux.HandleFunc("/api/v1/generate/by-name", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
-			return
-		}
-		var req RecipeGenerateRequest
-		err := json.NewDecoder(r.Body).Decode(&req)
-		if err != nil {
-			http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
-			return
-		}
-
-		if req.Recipename == "" {
-			http.Error(w, "Missing recipename", http.StatusBadRequest)
-			return
-		}
-
-		err = GenerateRecipeByName(req.Recipename, req.Details)
-		if err != nil {
-			http.Error(w, "Error generating recipe", http.StatusInternalServerError)
-			return
-		}
-
-		_, _ = fmt.Fprint(w, "Recipe generated successfully!")
-	})
-
-	mux.HandleFunc("/api/v1/generate/by-link", func(w http.ResponseWriter, r *http.Request) {
-
-		if r.Method != http.MethodPost {
-			http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
-			return
-		}
-		var req RecipeLinkRequest
-		err := json.NewDecoder(r.Body).Decode(&req)
-		if err != nil {
-			http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
-			return
-		}
-
-		if req.URL == "" {
-			http.Error(w, "Missing link", http.StatusBadRequest)
-			return
-		}
-
-		recipe, err := GenerateRecipeByLink(req.URL)
-		if err != nil {
-			http.Error(w, "Error generating recipe", http.StatusInternalServerError)
-			return
-		}
-
-		_, _ = fmt.Fprintf(w, "New recipe created successfully: %s", recipe)
-	})
+	mux.HandleFunc("/api/v1/generate/by-image", HandleGenerateByImage)
 
 	mux.HandleFunc("/test/get-content", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -142,12 +82,28 @@ func main() {
 	})
 
 	log.Println("Server is running on port 8080")
-	log.Fatal(http.ListenAndServe(":8080", addCORSHeaders(mux)))
+	log.Fatal(http.ListenAndServe("192.168.10.24:8080", logRequests(addCORSHeaders(mux))))
+}
+
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("Received request: Method=%s, URL=%s, Headers=%v, RemoteAddr=%s",
+			r.Method, r.URL.String(), r.Header, r.RemoteAddr)
+		next.ServeHTTP(w, r)
+	})
 }
 
 func addCORSHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "https://recipe-generator.ili16.de") // Adjust origin as needed
+		allowedOrigins := map[string]bool{
+			"https://recipe-generator.ili16.de": true,
+			"http://192.168.10.163:1000":        true,
+		}
+
+		origin := r.Header.Get("Origin")
+		if allowedOrigins[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
@@ -159,6 +115,165 @@ func addCORSHeaders(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func validateEnvVars() bool {
+	_, found := os.LookupEnv("OPENAI_KEY")
+	if !found {
+		log.Println("OPENAI_KEY not found")
+		return false
+	}
+
+	_, found = os.LookupEnv("GITHUB_PAT")
+	if !found {
+		log.Println("GITHUB_PAT not found")
+		return false
+	}
+	return true
+}
+
+func GithubClient() *github.Client {
+	githubPAT, found := os.LookupEnv("GITHUB_PAT")
+	if !found {
+		log.Println("GITHUB_PAT not found")
+		return nil
+	}
+
+	client := github.NewClient(nil).WithAuthToken(githubPAT)
+	return client
+}
+
+func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req RecipeRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	if req.Recipename == "" || req.Recipe == "" {
+		http.Error(w, "Missing recipename or recipe", http.StatusBadRequest)
+		return
+	}
+
+	err = AddRecipe(req.Recipename, req.Recipe)
+	if err != nil {
+		http.Error(w, "Error adding recipe", http.StatusInternalServerError)
+		return
+	}
+
+	_, _ = fmt.Fprint(w, "Recipe added successfully!")
+}
+func HandleGenerateByName(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
+	}
+	var req RecipeGenerateRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	if req.Recipename == "" {
+		http.Error(w, "Missing recipename", http.StatusBadRequest)
+		return
+	}
+
+	err = GenerateRecipeByName(req.Recipename, req.Details)
+	if err != nil {
+		http.Error(w, "Error generating recipe", http.StatusInternalServerError)
+		return
+	}
+
+	_, _ = fmt.Fprint(w, "Recipe generated successfully!")
+}
+func HandleGenerateByLink(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
+	}
+	var req RecipeLinkRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	if req.URL == "" {
+		http.Error(w, "Missing link", http.StatusBadRequest)
+		return
+	}
+
+	recipe, err := GenerateRecipeByLink(req.URL)
+	if err != nil {
+		http.Error(w, "Error generating recipe", http.StatusInternalServerError)
+		return
+	}
+
+	_, _ = fmt.Fprintf(w, "New recipe created successfully: %s", recipe)
+}
+
+func HandleGenerateByImage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req RecipeImageRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	if req.Image == "" {
+		http.Error(w, "Missing image", http.StatusBadRequest)
+		return
+	}
+
+	err = r.ParseMultipartForm(10 << 20) // 10 MB max file size
+	if err != nil {
+		http.Error(w, "Failed to parse form data", http.StatusBadRequest)
+		return
+	}
+
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		http.Error(w, "Failed to get the image file", http.StatusBadRequest)
+		return
+	}
+	defer func(file multipart.File) {
+		err := file.Close()
+		if err != nil {
+
+		}
+	}(file)
+
+	imageData, err := encodeToBase64(file)
+	if err != nil {
+		http.Error(w, "Failed to encode image", http.StatusInternalServerError)
+		return
+	}
+
+	recipe, err := GenerateRecipeByImage(imageData)
+	if err != nil {
+		http.Error(w, "Failed to generate recipe", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	err = json.NewEncoder(w).Encode(map[string]string{"recipe": recipe})
+	if err != nil {
+		return
+	}
 }
 
 func GenerateRecipeByLink(URL string) (string, error) {
@@ -208,15 +323,22 @@ func GenerateRecipeByName(RecipeName string, Details string) error {
 	return nil
 }
 
-func GithubClient() *github.Client {
-	githubPAT, found := os.LookupEnv("GITHUB_PAT")
-	if !found {
-		log.Println("GITHUB_PAT not found")
-		return nil
+func GenerateRecipeByImage(Image string) (string, error) {
+	recipe, err := openAIgenerateRecipeImage(Image)
+	if err != nil {
+		fmt.Println("Error generating recipe:", err)
+		return "", err
 	}
 
-	client := github.NewClient(nil).WithAuthToken(githubPAT)
-	return client
+	err = AddRecipe("New Recipe", recipe)
+	if err != nil {
+		fmt.Println("Error adding recipe:", err)
+		return "", err
+	}
+
+	log.Println("Recipe generated successfully!")
+
+	return recipe, nil
 }
 
 func CreateRef(RecipeName string) (*string, error) {
@@ -419,6 +541,42 @@ func openAIgenerateRecipeLink(Recipe string) (string, error) {
 	}
 
 	return completion.Choices[0].Message.Content, nil
+}
+
+func openAIgenerateRecipeImage(Recipe string) (string, error) {
+	client := openAIclient()
+
+	systemmessage := openai.SystemMessage(
+		" You are an agent that parses recipe images and converts them to a written format" +
+			"The recipe needs to be in markdown format: " +
+			"# <Recipe Name>\n" + "## Ingredients\n" + "- **<UNIT>** Ingredient \n" + "## Instructionset 1\n" + "## Instructionset 2" +
+			"All ingredients need to be in metric units.")
+
+	var usermessage openai.ChatCompletionMessageParamUnion
+	usermessage = openai.UserMessage("Change to markdown format: " + Recipe)
+
+	completion, err := client.Chat.Completions.New(context.TODO(), openai.ChatCompletionNewParams{
+		Messages: openai.F([]openai.ChatCompletionMessageParamUnion{
+			systemmessage,
+			usermessage,
+		}),
+		Model: openai.F(openai.ChatModelGPT4oMini),
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return completion.Choices[0].Message.Content, nil
+}
+
+func encodeToBase64(file io.Reader) (string, error) {
+	buffer, err := io.ReadAll(file)
+	if err != nil {
+		return "", err
+	}
+
+	base64String := base64.StdEncoding.EncodeToString(buffer)
+	return base64String, nil
 }
 
 func GetWebsite(link string) (string, error) {
