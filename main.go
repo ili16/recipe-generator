@@ -44,6 +44,8 @@ func main() {
 		return
 	}
 
+	mux.HandleFunc("/health", HandleHealth)
+
 	mux.HandleFunc("/add-recipe", HandleAddRecipe)
 
 	mux.HandleFunc("/api/v1/generate/by-name", HandleGenerateByName)
@@ -141,6 +143,15 @@ func GithubClient() *github.Client {
 
 	client := github.NewClient(nil).WithAuthToken(githubPAT)
 	return client
+}
+
+func HandleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, err := fmt.Fprintf(w, `{"status": "Healthy"}`)
+	if err != nil {
+		log.Println("Error writing response:", err)
+	}
 }
 
 func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
