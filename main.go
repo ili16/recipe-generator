@@ -35,6 +35,11 @@ type RecipeLinkRequest struct {
 	IsGerman bool   `json:"isGerman"`
 }
 
+type RecipeImageRequest struct {
+	RecipeName string `json:"recipename"`
+	IsGerman   bool   `json:"isGerman"`
+}
+
 func main() {
 
 	mux := http.NewServeMux()
@@ -225,13 +230,13 @@ func HandleGenerateByLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	recipe, err := GenerateRecipeByLink(req.URL)
+	recipe, err := GenerateRecipeByLink(req.URL, req.IsGerman)
 	if err != nil {
 		http.Error(w, "Error generating recipe", http.StatusInternalServerError)
 		return
 	}
 
-	_, _ = fmt.Fprintf(w, "New recipe created successfully: %s", recipe)
+	_, _ = fmt.Fprintf(w, recipe)
 }
 
 func HandleGenerateByImage(w http.ResponseWriter, r *http.Request) {
@@ -260,21 +265,55 @@ func HandleGenerateByImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}(file)
 
-	// Use the utility function to encode the image to base64
+	var recipeRequest RecipeImageRequest
+	if recipeName := r.FormValue("recipename"); recipeName != "" {
+		recipeRequest.RecipeName = recipeName
+	}
+	if isGerman := r.FormValue("isGerman"); isGerman != "" {
+		if isGerman == "true" {
+			recipeRequest.IsGerman = true
+		} else if isGerman == "false" {
+			recipeRequest.IsGerman = false
+		} else {
+			http.Error(w, "isGerman must be 'true' or 'false'", http.StatusBadRequest)
+			return
+		}
+	} else {
+		http.Error(w, "isGerman cannot be empty", http.StatusBadRequest)
+		return
+	}
+
 	base64Data, err := EncodeImageToBase64(file)
 	if err != nil {
 		http.Error(w, "Failed to encode image to base64", http.StatusInternalServerError)
 		return
 	}
 
-	// Generate the recipe based on the image
 	recipe, err := GenerateRecipeByImage(base64Data)
 	if err != nil {
 		http.Error(w, "Failed to generate recipe", http.StatusInternalServerError)
 		return
 	}
 
-	// Return the recipe in JSON format
+	var Recipename string
+
+	if recipeRequest.RecipeName != "" {
+		Recipename = recipeRequest.RecipeName
+	} else {
+		Recipename, err = openAIgenerateRecipeName(recipe)
+		if err != nil {
+			http.Error(w, "Error generating recipe", http.StatusInternalServerError)
+			log.Println("Error generating recipe name:", err)
+			return
+		}
+	}
+
+	err = AddRecipe(Recipename, recipe)
+	if err != nil {
+		http.Error(w, "Error adding recipe", http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	err = json.NewEncoder(w).Encode(map[string]string{"recipe": recipe})
 	if err != nil {
@@ -322,7 +361,7 @@ func HandleTransformRecipe(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprint(w, "Recipe generated successfully!")
 }
 
-func GenerateRecipeByLink(URL string) (string, error) {
+func GenerateRecipeByLink(URL string, isGerman bool) (string, error) {
 
 	websitecontent, err := GetWebsite(URL)
 	if err != nil {
@@ -330,7 +369,7 @@ func GenerateRecipeByLink(URL string) (string, error) {
 		return "", err
 	}
 
-	recipe, err := openAIgenerateRecipeLink(websitecontent)
+	recipe, err := openAIgenerateRecipeLink(websitecontent, isGerman)
 	if err != nil {
 		fmt.Println("Error generating recipe:", err)
 		return "", err
@@ -375,14 +414,6 @@ func GenerateRecipeByImage(Image string) (string, error) {
 		fmt.Println("Error generating recipe:", err)
 		return "", err
 	}
-
-	err = AddRecipe("New Recipe", recipe)
-	if err != nil {
-		fmt.Println("Error adding recipe:", err)
-		return "", err
-	}
-
-	log.Println("Recipe generated successfully!")
 
 	return recipe, nil
 }
@@ -609,17 +640,34 @@ func openAIgenerateRecipeName(Recipe string) (string, error) {
 	return completion.Choices[0].Message.Content, nil
 }
 
-func openAIgenerateRecipeLink(Recipe string) (string, error) {
+func openAIgenerateRecipeLink(Recipe string, isGerman bool) (string, error) {
 	client := openAIclient()
 
-	systemmessage := openai.SystemMessage(
-		" You are an agent that changes the format recipes" +
-			"The recipe needs to be in markdown format: " +
-			"# <Recipe Name>\n" + "## Ingredients\n" + "- **<UNIT>** Ingredient \n" + "## Instructionset 1\n" + "## Instructionset 2" +
-			"All ingredients need to be in metric units.")
+	var systemmessage openai.ChatCompletionMessageParamUnion
+
+	if isGerman {
+		systemmessage = openai.SystemMessage("Du bist ein Agent, der das Format von Rezepten ändert." +
+			"Das Rezept muss im Markdown-Format sein: " +
+			"# <Rezeptname>\n" +
+			"## Zutaten\n" +
+			"- **<MENGE>** Zutat \n" +
+			"## Anweisung 1\n" +
+			"## Anweisung 2" +
+			"Alle Zutaten müssen in metrischen Einheiten angegeben werden.")
+	} else {
+		systemmessage = openai.SystemMessage(
+			" You are an agent that changes the format recipes" +
+				"The recipe needs to be in markdown format: " +
+				"# <Recipe Name>\n" + "## Ingredients\n" + "- **<UNIT>** Ingredient \n" + "## Instructionset 1\n" + "## Instructionset 2" +
+				"All ingredients need to be in metric units.")
+	}
 
 	var usermessage openai.ChatCompletionMessageParamUnion
-	usermessage = openai.UserMessage("Change to markdown format: " + Recipe)
+	if isGerman {
+		usermessage = openai.UserMessage("Ändere das Rezept in Markdown-Format: " + Recipe)
+	} else {
+		usermessage = openai.UserMessage("Change to markdown format: " + Recipe)
+	}
 
 	completion, err := client.Chat.Completions.New(context.TODO(), openai.ChatCompletionNewParams{
 		Messages: openai.F([]openai.ChatCompletionMessageParamUnion{
