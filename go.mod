@@ -6,11 +6,12 @@ toolchain go1.23.3
 
 require (
 	github.com/google/go-github/v66 v66.0.1-0.20241122153411-45574f42f3e2
-	github.com/openai/openai-go v0.1.0-alpha.38
+	github.com/openai/openai-go v0.1.0-alpha.43
 )
 
 require (
 	github.com/google/go-querystring v1.1.0 // indirect
+	github.com/sashabaranov/go-openai v1.36.1 // indirect
 	github.com/tidwall/gjson v1.14.4 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect

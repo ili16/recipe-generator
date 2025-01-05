@@ -15,24 +15,24 @@ import (
 	"github.com/google/go-github/v66/github"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
+	goopenai "github.com/sashabaranov/go-openai"
 )
 
 type RecipeRequest struct {
 	Recipename string `json:"recipename"`
 	Recipe     string `json:"recipe"`
+	IsGerman   bool   `json:"isGerman"`
 }
 
 type RecipeGenerateRequest struct {
 	Recipename string `json:"recipename"`
 	Details    string `json:"details"`
+	IsGerman   bool   `json:"isGerman"`
 }
 
 type RecipeLinkRequest struct {
-	URL string `json:"url"`
-}
-
-type RecipeImageRequest struct {
-	Image string `json:"image"`
+	URL      string `json:"url"`
+	IsGerman bool   `json:"isGerman"`
 }
 
 func main() {
@@ -53,6 +53,8 @@ func main() {
 	mux.HandleFunc("/api/v1/generate/by-link", HandleGenerateByLink)
 
 	mux.HandleFunc("/api/v1/generate/by-image", HandleGenerateByImage)
+
+	mux.HandleFunc("/api/v1/transform", HandleTransformRecipe)
 
 	mux.HandleFunc("/test/get-content", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -145,7 +147,7 @@ func GithubClient() *github.Client {
 	return client
 }
 
-func HandleHealth(w http.ResponseWriter, r *http.Request) {
+func HandleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, err := fmt.Fprintf(w, `{"status": "Healthy"}`)
@@ -238,24 +240,14 @@ func HandleGenerateByImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req RecipeImageRequest
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
-		return
-	}
-
-	if req.Image == "" {
-		http.Error(w, "Missing image", http.StatusBadRequest)
-		return
-	}
-
-	err = r.ParseMultipartForm(10 << 20) // 10 MB max file size
+	// Parse multipart form data (10 MB max)
+	err := r.ParseMultipartForm(10 << 20)
 	if err != nil {
 		http.Error(w, "Failed to parse form data", http.StatusBadRequest)
 		return
 	}
 
+	// Retrieve the image file from the form
 	file, _, err := r.FormFile("image")
 	if err != nil {
 		http.Error(w, "Failed to get the image file", http.StatusBadRequest)
@@ -268,23 +260,66 @@ func HandleGenerateByImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}(file)
 
-	imageData, err := encodeToBase64(file)
+	// Use the utility function to encode the image to base64
+	base64Data, err := EncodeImageToBase64(file)
 	if err != nil {
-		http.Error(w, "Failed to encode image", http.StatusInternalServerError)
+		http.Error(w, "Failed to encode image to base64", http.StatusInternalServerError)
 		return
 	}
 
-	recipe, err := GenerateRecipeByImage(imageData)
+	// Generate the recipe based on the image
+	recipe, err := GenerateRecipeByImage(base64Data)
 	if err != nil {
 		http.Error(w, "Failed to generate recipe", http.StatusInternalServerError)
 		return
 	}
 
+	// Return the recipe in JSON format
 	w.Header().Set("Content-Type", "application/json")
 	err = json.NewEncoder(w).Encode(map[string]string{"recipe": recipe})
 	if err != nil {
+		log.Println("Failed to send response:", err)
+	}
+}
+
+func HandleTransformRecipe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
 		return
 	}
+	var req RecipeRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	transformedRecipe, err := TransformRecipe(req.Recipe, req.IsGerman)
+	if err != nil {
+		http.Error(w, "Error generating recipe", http.StatusInternalServerError)
+		return
+	}
+
+	var Recipename string
+
+	if req.Recipename != "" {
+		Recipename = req.Recipename
+	} else {
+		Recipename, err = openAIgenerateRecipeName(transformedRecipe)
+		if err != nil {
+			http.Error(w, "Error generating recipe", http.StatusInternalServerError)
+			log.Println("Error generating recipe name:", err)
+			return
+		}
+	}
+
+	err = AddRecipe(Recipename, transformedRecipe)
+	if err != nil {
+		http.Error(w, "Error adding recipe", http.StatusInternalServerError)
+		return
+	}
+
+	_, _ = fmt.Fprint(w, "Recipe generated successfully!")
 }
 
 func GenerateRecipeByLink(URL string) (string, error) {
@@ -335,7 +370,7 @@ func GenerateRecipeByName(RecipeName string, Details string) error {
 }
 
 func GenerateRecipeByImage(Image string) (string, error) {
-	recipe, err := openAIgenerateRecipeImage(Image)
+	recipe, err := goopenAIgenerateRecipeImage(Image)
 	if err != nil {
 		fmt.Println("Error generating recipe:", err)
 		return "", err
@@ -350,6 +385,52 @@ func GenerateRecipeByImage(Image string) (string, error) {
 	log.Println("Recipe generated successfully!")
 
 	return recipe, nil
+}
+
+func TransformRecipe(Recipe string, isGerman bool) (string, error) {
+	client := goopenai.NewClient(os.Getenv("OPENAI_KEY"))
+
+	var SystemMessage string
+
+	if isGerman {
+		SystemMessage = "Du bist ein Agent, der das Format von Rezepten ändert." +
+			"Das Rezept muss im Markdown-Format sein: " +
+			"# <Rezeptname>\n" +
+			"## Zutaten\n" +
+			"- **<MENGE>** Zutat \n" +
+			"## Anweisung 1\n" +
+			"## Anweisung 2" +
+			"Alle Zutaten müssen in metrischen Einheiten angegeben werden."
+	} else {
+		SystemMessage = "You are an agent that changes the format recipes" +
+			"The recipe needs to be in markdown format: " +
+			"# <Recipe Name>\n" + "## Ingredients\n" + "- **<UNIT>** Ingredient \n" + "## Instructionset 1\n" + "## Instructionset 2" +
+			"All ingredients need to be in metric units."
+	}
+
+	response, err := client.CreateChatCompletion(context.Background(), goopenai.ChatCompletionRequest{
+		Model: goopenai.GPT4oMini,
+		Messages: []goopenai.ChatCompletionMessage{
+			{
+				Role: goopenai.ChatMessageRoleUser,
+				MultiContent: []goopenai.ChatMessagePart{
+					{
+						Type: goopenai.ChatMessagePartTypeText,
+						Text: SystemMessage,
+					},
+					{
+						Type: goopenai.ChatMessagePartTypeText,
+						Text: Recipe,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return response.Choices[0].Message.Content, nil
 }
 
 func CreateRef(RecipeName string) (*string, error) {
@@ -554,40 +635,46 @@ func openAIgenerateRecipeLink(Recipe string) (string, error) {
 	return completion.Choices[0].Message.Content, nil
 }
 
-func openAIgenerateRecipeImage(Recipe string) (string, error) {
-	client := openAIclient()
+func goopenAIgenerateRecipeImage(RecipeBase64 string) (string, error) {
+	client := goopenai.NewClient(os.Getenv("OPENAI_KEY"))
 
-	systemmessage := openai.SystemMessage(
-		" You are an agent that parses recipe images and converts them to a written format" +
-			"The recipe needs to be in markdown format: " +
-			"# <Recipe Name>\n" + "## Ingredients\n" + "- **<UNIT>** Ingredient \n" + "## Instructionset 1\n" + "## Instructionset 2" +
-			"All ingredients need to be in metric units.")
-
-	var usermessage openai.ChatCompletionMessageParamUnion
-	usermessage = openai.UserMessage("Change to markdown format: " + Recipe)
-
-	completion, err := client.Chat.Completions.New(context.TODO(), openai.ChatCompletionNewParams{
-		Messages: openai.F([]openai.ChatCompletionMessageParamUnion{
-			systemmessage,
-			usermessage,
-		}),
-		Model: openai.F(openai.ChatModelGPT4oMini),
+	response, err := client.CreateChatCompletion(context.Background(), goopenai.ChatCompletionRequest{
+		Model: goopenai.GPT4oMini,
+		Messages: []goopenai.ChatCompletionMessage{
+			{
+				Role: goopenai.ChatMessageRoleUser,
+				MultiContent: []goopenai.ChatMessagePart{
+					{
+						Type: goopenai.ChatMessagePartTypeText,
+						Text: "You are a top chef inspired by the world's best recipes. You are creating a new recipe via a picture" + ". The recipe needs to be in markdown format: # <Recipe Name> ## Ingredients - **<UNIT>** Ingredient ## Instructionset 1 ## Instructionset 2 All ingredients need to be in metric units.",
+					},
+					{
+						Type: goopenai.ChatMessagePartTypeImageURL,
+						ImageURL: &goopenai.ChatMessageImageURL{
+							URL: "data:image/jpeg;base64," + RecipeBase64,
+						},
+					},
+				},
+			},
+		},
 	})
 	if err != nil {
 		return "", err
 	}
 
-	return completion.Choices[0].Message.Content, nil
+	return response.Choices[0].Message.Content, nil
 }
 
-func encodeToBase64(file io.Reader) (string, error) {
-	buffer, err := io.ReadAll(file)
+func EncodeImageToBase64(imageData io.Reader) (string, error) {
+	// Read all the data from the image
+	data, err := io.ReadAll(imageData)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to read image data: %w", err)
 	}
 
-	base64String := base64.StdEncoding.EncodeToString(buffer)
-	return base64String, nil
+	// Encode the data to a base64 string
+	base64Data := base64.StdEncoding.EncodeToString(data)
+	return base64Data, nil
 }
 
 func GetWebsite(link string) (string, error) {
