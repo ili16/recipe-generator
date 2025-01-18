@@ -254,6 +254,7 @@ func HandleGenerateByLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	fmt.Println("New recipe created successfully:", recipe)
 	_, _ = fmt.Fprintf(w, recipe)
 }
 
@@ -408,7 +409,7 @@ func GenerateRecipeByLink(URL string, isGerman bool) (string, error) {
 		return "", err
 	}
 
-	return recipename, nil
+	return recipe, nil
 }
 
 func GenerateRecipeByName(RecipeName string, Details string, isGerman bool) (string, error) {
@@ -508,6 +509,9 @@ func CreateRef(RecipeName string) (*string, error) {
 }
 
 func AddRecipe(RecipeName string, Content string) error {
+
+	log.Println("Content:", Content)
+
 	debugMode := os.Getenv("DEBUG_MODE")
 	if debugMode == "true" {
 		return nil
