@@ -25,14 +25,20 @@ const (
 		"## Zutaten\n" +
 		"- **<MENGE>** Zutat \n" +
 		"## Zubereitung \n" +
-		"### Schritt 1\n" +
-		"### Schritt 2\n" +
-		"### Schritt N" +
+		"### Anweisung 1\n" +
+		"- Schritt a\n" +
+		"- Schritt b\n" +
+		"### Anweisung 2\n" +
+		"- Schritt a\n" +
 		"Alle Zutaten müssen in metrischen Einheiten angegeben werden."
 
 	englishSystemMessage = "You are an agent that changes the format recipes" +
 		"The recipe needs to be in markdown format: " +
-		"# <Recipe Name>\n" + "## Ingredients\n" + "- **<UNIT>** Ingredient \n" + "## Preparation" + "### Instructionset 1\n" + "### Instructionset 2" +
+		"# <Recipe Name>\n" + "## Ingredients\n" + "- **<UNIT>** Ingredient \n" + "## Preparation" +
+		"### Instructionset 1\n" +
+		"- Steps\n" +
+		"### Instructionset 2" +
+		"- Steps\n" +
 		"All ingredients need to be in metric units."
 )
 
