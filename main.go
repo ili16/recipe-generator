@@ -254,7 +254,6 @@ func HandleGenerateByLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Println("New recipe created successfully:", recipe)
 	_, _ = fmt.Fprintf(w, recipe)
 }
 
