@@ -25,11 +25,10 @@ const (
 		"## Zutaten\n" +
 		"- **<MENGE>** Zutat \n" +
 		"## Zubereitung \n" +
-		"### Anweisung 1\n" +
-		"- Schritt a\n" +
-		"- Schritt b\n" +
-		"### Anweisung 2\n" +
-		"- Schritt a\n" +
+		"### Anweisung z.B. Teig anrühren/Vorbereitung\n" +
+		"- <Schritte>\n" +
+		"### Anweisung z.B. Backen/Braten\n" +
+		"- <Scritte>\n" +
 		"Alle Zutaten müssen in metrischen Einheiten angegeben werden."
 
 	englishSystemMessage = "You are an agent that changes the format recipes" +
