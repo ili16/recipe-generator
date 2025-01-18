@@ -338,12 +338,6 @@ func HandleGenerateByImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w).Encode(map[string]string{"recipe": recipe})
-	if err != nil {
-		log.Println("Failed to send response:", err)
-	}
-
 	_, err = fmt.Fprintf(w, recipe)
 
 }
