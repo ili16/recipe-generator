@@ -382,7 +382,6 @@ func HandleTransformRecipe(w http.ResponseWriter, r *http.Request) {
 }
 
 func GenerateRecipeByLink(URL string, isGerman bool) (string, error) {
-
 	websitecontent, err := GetWebsite(URL)
 	if err != nil {
 		fmt.Println("Error fetching website content:", err)
@@ -507,9 +506,6 @@ func CreateRef(RecipeName string) (*string, error) {
 }
 
 func AddRecipe(RecipeName string, Content string) error {
-
-	log.Println("Content:", Content)
-
 	debugMode := os.Getenv("DEBUG_MODE")
 	if debugMode == "true" {
 		return nil

@@ -41,7 +41,7 @@ jobs:
           registryPassword: ${{ secrets.RECIPEGENERATORBACKENDAPP_REGISTRY_PASSWORD }}
           containerAppName: recipe-generator-backend-app
           resourceGroup: recipe-generator
-          imageToBuild: ilijakovac1@googlemail.com/recipe-generator-backend-app:${{ github.sha }}
+          imageToBuild: ili16/recipe-generator:${{ github.sha }}
           _buildArgumentsKey_: |
             _buildArgumentsValues_
 
