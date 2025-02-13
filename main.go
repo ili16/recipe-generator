@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/google/go-github/v66/github"
+	"github.com/jackc/pgx/v5"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 	goopenai "github.com/sashabaranov/go-openai"
@@ -25,9 +26,9 @@ const (
 		"## Zutaten\n" +
 		"- **<MENGE>** Zutat \n" +
 		"## Zubereitung \n" +
-		"### Anweisung z.B. Teig anrühren/Vorbereitung\n" +
+		"### <Anweisung> z.B. Teig anrühren/Vorbereitung\n" +
 		"- <Schritte>\n" +
-		"### Anweisung z.B. Backen/Braten\n" +
+		"### <Anweisung> z.B. Backen/Braten\n" +
 		"- <Scritte>\n" +
 		"Alle Zutaten müssen in metrischen Einheiten angegeben werden."
 
@@ -59,8 +60,13 @@ type RecipeLinkRequest struct {
 }
 
 type RecipeImageRequest struct {
-	RecipeName string `json:"recipename"`
+	Recipename string `json:"recipename"`
 	IsGerman   bool   `json:"isGerman"`
+}
+
+type RecipeResponse struct {
+	Recipename string `json:"recipename"`
+	Recipe     string `json:"recipe"`
 }
 
 func main() {
@@ -74,7 +80,7 @@ func main() {
 
 	mux.HandleFunc("/health", HandleHealth)
 
-	mux.HandleFunc("/add-recipe", HandleAddRecipe)
+	mux.HandleFunc("/api/v1/add-recipe", HandleAddRecipe)
 
 	mux.HandleFunc("/api/v1/generate/by-name", HandleGenerateByName)
 
@@ -233,7 +239,18 @@ func HandleGenerateByName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, _ = fmt.Fprint(w, recipe)
+	resp := RecipeResponse{
+		Recipename: req.Recipename,
+		Recipe:     recipe,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	err = json.NewEncoder(w).Encode(resp)
+	if err != nil {
+		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
+	}
 }
 func HandleGenerateByLink(w http.ResponseWriter, r *http.Request) {
 
@@ -253,13 +270,24 @@ func HandleGenerateByLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	recipe, err := GenerateRecipeByLink(req.URL, req.IsGerman)
+	recipename, recipe, err := GenerateRecipeByLink(req.URL, req.IsGerman)
 	if err != nil {
 		http.Error(w, "Error generating recipe", http.StatusInternalServerError)
 		return
 	}
 
-	_, _ = fmt.Fprintf(w, recipe)
+	resp := RecipeResponse{
+		Recipename: recipename,
+		Recipe:     recipe,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	err = json.NewEncoder(w).Encode(resp)
+	if err != nil {
+		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
+	}
 }
 
 func HandleGenerateByImage(w http.ResponseWriter, r *http.Request) {
@@ -290,7 +318,7 @@ func HandleGenerateByImage(w http.ResponseWriter, r *http.Request) {
 
 	var recipeRequest RecipeImageRequest
 	if recipeName := r.FormValue("recipename"); recipeName != "" {
-		recipeRequest.RecipeName = recipeName
+		recipeRequest.Recipename = recipeName
 	}
 	if isGerman := r.FormValue("isGerman"); isGerman != "" {
 		if isGerman == "true" {
@@ -318,12 +346,12 @@ func HandleGenerateByImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var Recipename string
+	var recipename string
 
-	if recipeRequest.RecipeName != "" {
-		Recipename = recipeRequest.RecipeName
+	if recipeRequest.Recipename != "" {
+		recipename = recipeRequest.Recipename
 	} else {
-		Recipename, err = openAIgenerateRecipeName(recipe, recipeRequest.IsGerman)
+		recipename, err = openAIgenerateRecipeName(recipe, recipeRequest.IsGerman)
 		if err != nil {
 			http.Error(w, "Error generating recipe", http.StatusInternalServerError)
 			log.Println("Error generating recipe name:", err)
@@ -331,14 +359,18 @@ func HandleGenerateByImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	err = AddRecipe(Recipename, recipe)
-	if err != nil {
-		http.Error(w, "Error adding recipe", http.StatusInternalServerError)
-		return
+	resp := RecipeResponse{
+		Recipename: recipename,
+		Recipe:     recipe,
 	}
 
-	_, err = fmt.Fprintf(w, recipe)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 
+	err = json.NewEncoder(w).Encode(resp)
+	if err != nil {
+		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
+	}
 }
 
 func HandleTransformRecipe(w http.ResponseWriter, r *http.Request) {
@@ -359,12 +391,12 @@ func HandleTransformRecipe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var Recipename string
+	var recipename string
 
 	if req.Recipename != "" {
-		Recipename = req.Recipename
+		recipename = req.Recipename
 	} else {
-		Recipename, err = openAIgenerateRecipeName(transformedRecipe, req.IsGerman)
+		recipename, err = openAIgenerateRecipeName(transformedRecipe, req.IsGerman)
 		if err != nil {
 			http.Error(w, "Error generating recipe", http.StatusInternalServerError)
 			log.Println("Error generating recipe name:", err)
@@ -372,53 +404,46 @@ func HandleTransformRecipe(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	err = AddRecipe(Recipename, transformedRecipe)
-	if err != nil {
-		http.Error(w, "Error adding recipe", http.StatusInternalServerError)
-		return
+	resp := RecipeResponse{
+		Recipename: recipename,
+		Recipe:     transformedRecipe,
 	}
 
-	_, err = fmt.Fprintf(w, transformedRecipe)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	err = json.NewEncoder(w).Encode(resp)
+	if err != nil {
+		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
+	}
 }
 
-func GenerateRecipeByLink(URL string, isGerman bool) (string, error) {
+func GenerateRecipeByLink(URL string, isGerman bool) (string, string, error) {
 	websitecontent, err := GetWebsite(URL)
 	if err != nil {
 		fmt.Println("Error fetching website content:", err)
-		return "", err
+		return "", "", err
 	}
 
 	recipe, err := openAIgenerateRecipeLink(websitecontent, isGerman)
 	if err != nil {
 		fmt.Println("Error generating recipe:", err)
-		return "", err
+		return "", "", err
 	}
 
 	recipename, err := openAIgenerateRecipeName(recipe, isGerman)
 	if err != nil {
 		fmt.Println("Error generating recipe name:", err)
-		return "", err
+		return "", "", err
 	}
 
-	err = AddRecipe(recipename, recipe)
-	if err != nil {
-		fmt.Println("Error adding recipe:", err)
-		return "", err
-	}
-
-	return recipe, nil
+	return recipename, recipe, nil
 }
 
 func GenerateRecipeByName(RecipeName string, Details string, isGerman bool) (string, error) {
 	recipe, err := openAIgenerateRecipe(RecipeName, Details, isGerman)
 	if err != nil {
 		fmt.Println("Error generating recipe:", err)
-		return "", err
-	}
-
-	err = AddRecipe(RecipeName, recipe)
-	if err != nil {
-		fmt.Println("Error adding recipe:", err)
 		return "", err
 	}
 
@@ -505,44 +530,29 @@ func CreateRef(RecipeName string) (*string, error) {
 	return newRef.Ref, err
 }
 
-func AddRecipe(RecipeName string, Content string) error {
-	debugMode := os.Getenv("DEBUG_MODE")
-	if debugMode == "true" {
-		return nil
-	}
-
-	client := GithubClient()
-
-	RecipeReplaced := strings.ReplaceAll(RecipeName, " ", "-")
-
-	newRef, err := CreateRef(RecipeReplaced)
+func AddRecipe(RecipeName string, Recipe string) error {
+	conn, err := pgx.Connect(context.Background(), os.Getenv("DB_URL"))
 	if err != nil {
-		fmt.Println("Error creating reference:", err)
+		_, err := fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
+		if err != nil {
+			return err
+		}
+		os.Exit(1)
+	}
+	defer func(conn *pgx.Conn, ctx context.Context) {
+		err := conn.Close(ctx)
+		if err != nil {
+
+		}
+	}(conn, context.Background())
+
+	_, err = conn.Exec(context.Background(), "insert into recipes_test(recipename, recipe) values($1, $2)", RecipeName, Recipe)
+	if err != nil {
+		log.Printf("QueryRow failed: %v\n\n", err)
 		return err
 	}
 
-	_, _, err = client.Repositories.CreateFile(
-		context.Background(),
-		"ili16",
-		"ili16.github.io",
-		"recipes/"+RecipeReplaced+".md",
-		&github.RepositoryContentFileOptions{
-			Message: github.String("Add " + RecipeName + " recipe"),
-			Content: []byte(Content),
-			Branch:  newRef,
-		})
-	if err != nil {
-		fmt.Println(err)
-		return err
-	}
-
-	err = appendRecipeListFile(RecipeName, newRef)
-	if err != nil {
-		fmt.Println("Error appending recipe to list:", err)
-		return err
-	}
-	fmt.Println("Recipe added successfully!")
-
+	log.Println("added recipe to database")
 	return nil
 }
 
