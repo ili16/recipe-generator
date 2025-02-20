@@ -10,9 +10,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
-	"strings"
 
-	"github.com/google/go-github/v66/github"
 	"github.com/jackc/pgx/v5"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -90,34 +88,9 @@ func main() {
 
 	mux.HandleFunc("/api/v1/transform", HandleTransformRecipe)
 
-	mux.HandleFunc("/test/get-content", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
-			return
-		}
-		var req RecipeLinkRequest
-		err := json.NewDecoder(r.Body).Decode(&req)
-		if err != nil {
-			http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
-			return
-		}
+	mux.HandleFunc("/api/v1/login", HandleLogin)
 
-		if req.URL == "" {
-			http.Error(w, "Missing url", http.StatusBadRequest)
-			return
-		}
-
-		websitecontent, err := GetWebsite(req.URL)
-		if err != nil {
-			http.Error(w, "Error fetching website content", http.StatusInternalServerError)
-			return
-		}
-		log.Println("Website content:", websitecontent)
-
-		log.Println("Length of website content:", len(websitecontent))
-
-		_, _ = fmt.Fprintf(w, "New recipe created successfully: %s", websitecontent)
-	})
+	mux.HandleFunc("/api/v1/recipes", HandleGetRecipes)
 
 	log.Println("Server is running on port 8080")
 	log.Fatal(http.ListenAndServe(":8080", logRequests(addCORSHeaders(mux))))
@@ -170,17 +143,6 @@ func validateEnvVars() bool {
 	return true
 }
 
-func GithubClient() *github.Client {
-	githubPAT, found := os.LookupEnv("GITHUB_PAT")
-	if !found {
-		log.Println("GITHUB_PAT not found")
-		return nil
-	}
-
-	client := github.NewClient(nil).WithAuthToken(githubPAT)
-	return client
-}
-
 func HandleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -208,7 +170,18 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = AddRecipe(req.Recipename, req.Recipe)
+	if os.Getenv("LOCAL_DEV") == "true" {
+		mockAzureAuth(r)
+	}
+
+	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
+
+	userID, err := GetUserID(oauthID)
+	if err != nil {
+		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
+		return
+	}
+	err = AddRecipe(userID, req.Recipename, req.Recipe)
 	if err != nil {
 		http.Error(w, "Error adding recipe", http.StatusInternalServerError)
 		return
@@ -508,29 +481,7 @@ func TransformRecipe(Recipe string, isGerman bool) (string, error) {
 	return response.Choices[0].Message.Content, nil
 }
 
-func CreateRef(RecipeName string) (*string, error) {
-	client := GithubClient()
-	baseRef, _, err := client.Git.GetRef(context.Background(), "ili16", "ili16.github.io", "refs/heads/main")
-	if err != nil {
-		fmt.Println("Error fetching base reference:", err)
-		return nil, err
-	}
-
-	newRef := &github.Reference{
-		Ref:    github.String("refs/heads/" + RecipeName),
-		Object: &github.GitObject{SHA: baseRef.Object.SHA},
-	}
-
-	_, _, err = client.Git.CreateRef(context.Background(), "ili16", "ili16.github.io", newRef)
-	if err != nil {
-		fmt.Println(err)
-		return nil, err
-	}
-
-	return newRef.Ref, err
-}
-
-func AddRecipe(RecipeName string, Recipe string) error {
+func AddRecipe(userID int, RecipeName string, Recipe string) error {
 	conn, err := pgx.Connect(context.Background(), os.Getenv("DB_URL"))
 	if err != nil {
 		_, err := fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
@@ -546,71 +497,14 @@ func AddRecipe(RecipeName string, Recipe string) error {
 		}
 	}(conn, context.Background())
 
-	_, err = conn.Exec(context.Background(), "insert into recipes_test(recipename, recipe) values($1, $2)", RecipeName, Recipe)
+	_, err = conn.Exec(context.Background(), "insert into recipes(user_id, title, content) values($1, $2, $3)", userID, RecipeName, Recipe)
 	if err != nil {
-		log.Printf("QueryRow failed: %v\n\n", err)
+		log.Printf("Inserting Recipe failed: %v\n\n", err)
 		return err
 	}
 
 	log.Println("added recipe to database")
 	return nil
-}
-
-func getRecipeListFile() []string {
-	client := GithubClient()
-	recipes, _, _, err := client.Repositories.GetContents(context.Background(), "ili16", "ili16.github.io", "recipes.md", nil)
-	if err != nil {
-		fmt.Println(err)
-		return nil
-	}
-
-	recipe, err := recipes.GetContent()
-	if err != nil {
-		fmt.Println(err)
-		return nil
-	}
-
-	lines := strings.Split(recipe, "\n")
-
-	return lines
-}
-
-func appendRecipeListFile(RecipeName string, newRef *string) error {
-	client := GithubClient()
-	recipeList := getRecipeListFile()
-
-	RecipeReplaced := strings.ReplaceAll(RecipeName, " ", "-")
-	newRecipe := fmt.Sprintf("- [%s](?recipe=%s)", RecipeName, RecipeReplaced)
-
-	recipeList = append(recipeList, newRecipe)
-
-	_, _, err := client.Repositories.UpdateFile(
-		context.Background(),
-		"ili16",
-		"ili16.github.io",
-		"recipes.md",
-		&github.RepositoryContentFileOptions{
-			Message: github.String("Update recipe list with " + RecipeName),
-			Content: []byte(strings.Join(recipeList, "\n")),
-			SHA:     github.String(getFileSHA("recipes.md")),
-			Branch:  newRef,
-		})
-	if err != nil {
-		fmt.Println("Error updating recipe list:", err)
-		return err
-	}
-
-	return nil
-}
-
-func getFileSHA(filepath string) string {
-	client := GithubClient()
-	file, _, _, err := client.Repositories.GetContents(context.Background(), "ili16", "ili16.github.io", filepath, nil)
-	if err != nil {
-		fmt.Println("Error fetching file SHA:", err)
-		return ""
-	}
-	return file.GetSHA()
 }
 
 func openAIclient() *openai.Client {
@@ -798,4 +692,116 @@ func GetWebsite(link string) (string, error) {
 	}
 
 	return string(content), nil
+}
+
+func mockAzureAuth(r *http.Request) {
+	r.Header.Set("X-MS-CLIENT-PRINCIPAL-ID", "8e888379-a76f-4aba-9860-183b913c0719")
+	r.Header.Set("X-MS-CLIENT-PRINCIPAL-NAME", "ilijakovac1@googlemail.com")
+	r.Header.Set("X-MS-CLIENT-PRINCIPAL-IDP", "aad")
+}
+
+func HandleLogin(w http.ResponseWriter, r *http.Request) {
+
+	if os.Getenv("LOCAL_DEV") == "true" {
+		mockAzureAuth(r)
+	}
+
+	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
+	userName := r.Header.Get("X-MS-CLIENT-PRINCIPAL-NAME")
+	provider := r.Header.Get("X-MS-CLIENT-PRINCIPAL-IDP")
+
+	if oauthID == "" || userName == "" || provider == "" {
+		http.Error(w, "Unauthorized: Missing authentication headers", http.StatusUnauthorized)
+		return
+	}
+	conn, err := pgx.Connect(context.Background(), os.Getenv("DB_URL"))
+	if err != nil {
+		http.Error(w, "Failed to connect to database", http.StatusInternalServerError)
+		return
+	}
+
+	var exists bool
+	err = conn.QueryRow(context.Background(), "select exists(SELECT 1 FROM users WHERE oauth_id = $1)", oauthID).Scan(&exists)
+
+	if !exists {
+		_, err = conn.Exec(context.Background(), "INSERT INTO users (oauth_id, name, oauth_provider) VALUES ($1, $2, $3)", oauthID, userName, provider)
+		if err != nil {
+			http.Error(w, "Database Error Failed to create user", http.StatusInternalServerError)
+			log.Println("Login: Database error Failed to create user")
+			return
+		}
+	} else {
+		log.Println("Login: User already exists")
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func GetUserID(oauthid string) (int, error) {
+	conn, err := pgx.Connect(context.Background(), os.Getenv("DB_URL"))
+	if err != nil {
+		return 0, err
+	}
+	userID := 0
+	err = conn.QueryRow(context.Background(), "SELECT id FROM users WHERE oauth_id = $1", oauthid).Scan(&userID)
+	if err != nil {
+		return 0, err
+	}
+	return userID, nil
+}
+
+func HandleGetRecipes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if os.Getenv("LOCAL_DEV") == "true" {
+		mockAzureAuth(r)
+	}
+
+	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
+
+	userID, err := GetUserID(oauthID)
+	if err != nil {
+		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
+		return
+	}
+
+	recipes, err := GetRecipes(userID)
+	if err != nil {
+		http.Error(w, "Error getting recipes", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	err = json.NewEncoder(w).Encode(recipes)
+	if err != nil {
+		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
+	}
+}
+
+func GetRecipes(userid int) ([]RecipeResponse, error) {
+	conn, err := pgx.Connect(context.Background(), os.Getenv("DB_URL"))
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := conn.Query(context.Background(), "SELECT title, content FROM recipes WHERE user_id = $1", userid)
+	if err != nil {
+		return nil, err
+	}
+
+	var recipes []RecipeResponse
+	for rows.Next() {
+		var recipe RecipeResponse
+		err := rows.Scan(&recipe.Recipename, &recipe.Recipe)
+		if err != nil {
+			return nil, err
+		}
+		recipes = append(recipes, recipe)
+	}
+	return recipes, nil
 }
