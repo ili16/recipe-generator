@@ -90,7 +90,7 @@ func main() {
 
 	mux.HandleFunc("/api/v1/login", HandleLogin)
 
-	mux.HandleFunc("/api/v1/recipes", HandleGetRecipes)
+	mux.HandleFunc("/api/v1/get-recipes", HandleGetRecipes)
 
 	log.Println("Server is running on port 8080")
 	log.Fatal(http.ListenAndServe(":8080", logRequests(addCORSHeaders(mux))))
@@ -733,6 +733,10 @@ func HandleLogin(w http.ResponseWriter, r *http.Request) {
 	} else {
 		log.Println("Login: User already exists")
 	}
+
+	w.Header().Set("X-USER-NAME", userName)
+	w.Header().Set("X-USER-ID", oauthID)
+	w.Header().Set("X-USER-PROVIDER", provider)
 
 	w.WriteHeader(http.StatusOK)
 }
