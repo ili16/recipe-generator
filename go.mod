@@ -6,7 +6,7 @@ toolchain go1.23.3
 
 require (
 	github.com/jackc/pgx/v5 v5.7.2
-	github.com/openai/openai-go v0.1.0-alpha.63
+	github.com/openai/openai-go v0.1.0-alpha.43
 	github.com/sashabaranov/go-openai v1.38.0
 )
 
