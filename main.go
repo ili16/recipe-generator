@@ -65,6 +65,7 @@ type RecipeImageRequest struct {
 type RecipeResponse struct {
 	Recipename string `json:"recipename"`
 	Recipe     string `json:"recipe"`
+	Transcript string `json:"transcript,omitempty"`
 }
 
 func main() {
@@ -90,10 +91,12 @@ func main() {
 
 	mux.HandleFunc("/api/v1/login", HandleLogin)
 
-	mux.HandleFunc("/api/v1/get-recipes", HandleGetRecipes)
+	mux.HandleFunc("GET /api/v1/get-recipes", HandleGetRecipes)
+
+	mux.HandleFunc("POST /api/v1/generate/by-voice", HandleGenerateRecipeByVoice)
 
 	log.Println("Server is running on port 8080")
-	log.Fatal(http.ListenAndServe(":8080", logRequests(addCORSHeaders(mux))))
+	log.Fatal(http.ListenAndServe(":8080", logRequests(mux)))
 }
 
 func logRequests(next http.Handler) http.Handler {
@@ -104,42 +107,19 @@ func logRequests(next http.Handler) http.Handler {
 	})
 }
 
-func addCORSHeaders(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		allowedOrigins := map[string]bool{
-			"https://recipe-generator.ili16.de": true,
-			"http://192.168.10.163:1000":        true,
-		}
-
-		origin := r.Header.Get("Origin")
-		if allowedOrigins[origin] {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-		// Handle preflight requests
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
 func validateEnvVars() bool {
 	_, found := os.LookupEnv("OPENAI_KEY")
 	if !found {
-		log.Println("OPENAI_KEY not found")
+		log.Println("OPENAI_KEY environment variable  not found")
 		return false
 	}
 
-	_, found = os.LookupEnv("GITHUB_PAT")
+	_, found = os.LookupEnv("DB_URL")
 	if !found {
-		log.Println("GITHUB_PAT not found")
+		log.Println("DB_URL environment variable missing")
 		return false
 	}
+
 	return true
 }
 
@@ -391,6 +371,78 @@ func HandleTransformRecipe(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func HandleGenerateRecipeByVoice(w http.ResponseWriter, r *http.Request) {
+	err := r.ParseMultipartForm(10 << 20)
+	if err != nil {
+		http.Error(w, "Failed to parse form data", http.StatusBadRequest)
+		return
+	}
+
+	file, _, err := r.FormFile("audio")
+	if err != nil {
+		http.Error(w, "Failed to get the audio file", http.StatusBadRequest)
+		return
+	}
+
+	defer func(file multipart.File) {
+		err := file.Close()
+		if err != nil {
+
+		}
+	}(file)
+
+	var isGerman bool
+	if risGerman := r.FormValue("isGerman"); risGerman != "" {
+		if risGerman == "true" {
+			isGerman = true
+		} else if risGerman == "false" {
+			isGerman = false
+		} else {
+			http.Error(w, "isGerman must be 'true' or 'false'", http.StatusBadRequest)
+			return
+		}
+	} else {
+		http.Error(w, "isGerman cannot be empty", http.StatusBadRequest)
+		return
+	}
+
+	transcript, err := goopenAIgenerateTranscript(file)
+	if err != nil {
+		http.Error(w, "Failed to generate recipe", http.StatusInternalServerError)
+		log.Println("Error generating recipe:", err)
+		return
+	}
+
+	recipe, err := openAIgenerateRecipe(transcript, "", isGerman)
+	if err != nil {
+		http.Error(w, "Error generating recipe", http.StatusInternalServerError)
+		log.Println("Error generating recipe:", err)
+		return
+	}
+
+	recipename, err := openAIgenerateRecipeName(recipe, isGerman)
+	if err != nil {
+		http.Error(w, "Error generating recipe", http.StatusInternalServerError)
+		log.Println("Error generating recipe name:", err)
+		return
+	}
+
+	resp := RecipeResponse{
+		Recipename: recipename,
+		Recipe:     recipe,
+		Transcript: transcript,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	err = json.NewEncoder(w).Encode(resp)
+	if err != nil {
+		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
+	}
+
+}
+
 func GenerateRecipeByLink(URL string, isGerman bool) (string, string, error) {
 	websitecontent, err := GetWebsite(URL)
 	if err != nil {
@@ -570,7 +622,7 @@ func openAIgenerateRecipeName(Recipe string, isGerman bool) (string, error) {
 		usermessage = openai.UserMessage("Generate a recipe name for: " + Recipe)
 	}
 
-	completion, err := client.Chat.Completions.New(context.TODO(), openai.ChatCompletionNewParams{
+	recipename, err := client.Chat.Completions.New(context.TODO(), openai.ChatCompletionNewParams{
 		Messages: openai.F([]openai.ChatCompletionMessageParamUnion{
 			systemmessage,
 			usermessage,
@@ -581,7 +633,7 @@ func openAIgenerateRecipeName(Recipe string, isGerman bool) (string, error) {
 		return "", err
 	}
 
-	return completion.Choices[0].Message.Content, nil
+	return recipename.Choices[0].Message.Content, nil
 }
 
 func openAIgenerateRecipeLink(Recipe string, isGerman bool) (string, error) {
@@ -650,6 +702,53 @@ func goopenAIgenerateRecipeImage(RecipeBase64 string, isGerman bool) (string, er
 		return "", err
 	}
 
+	return response.Choices[0].Message.Content, nil
+}
+
+func goopenAIgenerateTranscript(voicemessage multipart.File) (string, error) {
+	client := goopenai.NewClient(os.Getenv("OPENAI_KEY"))
+
+	req := goopenai.AudioRequest{
+		Model:    goopenai.Whisper1,
+		Reader:   voicemessage,
+		FilePath: "voicemessage.m4a",
+	}
+
+	response, err := client.CreateTranscription(context.Background(), req)
+	if err != nil {
+		return "", err
+	}
+
+	return response.Text, nil
+}
+
+func fixRecipe(recipe string) (string, error) {
+	client := goopenai.NewClient(os.Getenv("OPENAI_KEY"))
+
+	response, err := client.CreateChatCompletion(context.Background(), goopenai.ChatCompletionRequest{
+		Model: goopenai.GPT4oMini,
+		Messages: []goopenai.ChatCompletionMessage{
+			{
+				Role: goopenai.ChatMessageRoleUser,
+				MultiContent: []goopenai.ChatMessagePart{
+					{
+						Type: goopenai.ChatMessagePartTypeText,
+						Text: "Fix this recipe regarding formatting" +
+							"All ingredients need to be in metric units." +
+							"If in german do not be formally e.g. dont use Sie" +
+							"remove formatting errors e.g. ```markdown```",
+					},
+					{
+						Type: goopenai.ChatMessagePartTypeText,
+						Text: recipe,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return "Error while fixing Recipe", err
+	}
 	return response.Choices[0].Message.Content, nil
 }
 
