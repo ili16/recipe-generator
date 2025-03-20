@@ -10,8 +10,10 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/minio/minio-go/v7"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 	goopenai "github.com/sashabaranov/go-openai"
@@ -70,6 +72,10 @@ type RecipeResponse struct {
 
 func main() {
 
+	err := templateRecipesBlob("$web", 1)
+	if err != nil {
+		log.Printf("error generating template files: %v", err)
+	}
 	mux := http.NewServeMux()
 
 	if !validateEnvVars() {
@@ -161,9 +167,23 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
 		return
 	}
-	err = AddRecipe(userID, req.Recipename, req.Recipe)
+	err = AddRecipeToDB(userID, req.Recipename, req.Recipe)
 	if err != nil {
 		http.Error(w, "Error adding recipe", http.StatusInternalServerError)
+		return
+	}
+
+	recipename := strings.ReplaceAll(req.Recipename, " ", "-")
+	recipePath := "recipes/" + recipename + ".md"
+
+	err = addBlob("$web", recipePath, req.Recipe)
+	if err != nil {
+		http.Error(w, "Failed to update recipe", http.StatusInternalServerError)
+		return
+	}
+	err = templateRecipesBlob("$web", userID)
+	if err != nil {
+		http.Error(w, "Failed to template recipes", http.StatusInternalServerError)
 		return
 	}
 
@@ -533,7 +553,7 @@ func TransformRecipe(Recipe string, isGerman bool) (string, error) {
 	return response.Choices[0].Message.Content, nil
 }
 
-func AddRecipe(userID int, RecipeName string, Recipe string) error {
+func AddRecipeToDB(userID int, RecipeName string, Recipe string) error {
 	conn, err := pgx.Connect(context.Background(), os.Getenv("DB_URL"))
 	if err != nil {
 		_, err := fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
@@ -555,7 +575,7 @@ func AddRecipe(userID int, RecipeName string, Recipe string) error {
 		return err
 	}
 
-	log.Println("added recipe to database")
+	log.Printf("added recipe %s to database", RecipeName)
 	return nil
 }
 
@@ -829,6 +849,13 @@ func HandleLogin(w http.ResponseWriter, r *http.Request) {
 			log.Println("Login: Database error Failed to create user")
 			return
 		}
+
+		// go func() {
+		// 	err := createStaticWebsite(oauthID)
+		// 	if err != nil {
+		// 		log.Println("Login: Failed to create static website")
+		// 	}
+		// }()
 	} else {
 		log.Println("Login: User already exists")
 	}
@@ -907,4 +934,67 @@ func GetRecipes(userid int) ([]RecipeResponse, error) {
 		recipes = append(recipes, recipe)
 	}
 	return recipes, nil
+}
+
+func bootstrapStaticWebsite(bucketName string) error {
+	ctx := context.Background()
+	s3client, err := s3Client()
+	if err != nil {
+		log.Println("Failed to create s3 client")
+		return err
+	}
+
+	for _, object := range []string{"", "libs"} {
+		objectCh := s3client.ListObjects(ctx, "template", minio.ListObjectsOptions{
+			Prefix:    object,
+			Recursive: true,
+		})
+
+		for object := range objectCh {
+			if object.Err != nil {
+				log.Println("Failed to list objects in bucket:", object.Err)
+				return object.Err
+			}
+
+			src := minio.CopySrcOptions{Bucket: "template", Object: object.Key}
+			dst := minio.CopyDestOptions{Bucket: bucketName, Object: object.Key}
+
+			if strings.HasSuffix(object.Key, "/") {
+				break
+			}
+			_, err := s3client.CopyObject(ctx, dst, src)
+			if err != nil {
+				log.Println("Failed to copy object:", object.Key, "to bucket:", bucketName, "error:", err)
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func templateRecipesBlob(containername string, userid int) error {
+	var recipesTemplate = "# Rezepte\n\n## 🍝 Hauptgerichte"
+	var recipes []RecipeResponse
+	recipes, err := GetRecipes(userid)
+	if err != nil {
+		log.Println("Failed to get recipes")
+		return err
+	}
+
+	for _, recipe := range recipes {
+		recipesTemplate = recipesTemplate + "\n - [" + recipe.Recipename + "](/?recipe=" + strings.ReplaceAll(recipe.Recipename, " ", "-") + ")"
+	}
+
+	err = addBlob("$web", "recipes.md", recipesTemplate)
+	if err != nil {
+		log.Printf("Failed to add recipes to bucket %s, error: %s", containername, err)
+		return err
+	}
+
+	return nil
+}
+
+func uploadRecipes() {
+	
 }
