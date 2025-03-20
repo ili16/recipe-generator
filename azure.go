@@ -12,10 +12,6 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 )
 
-var (
-	containerName = "$web"
-)
-
 func listAzureStorage() {
 	url := "https://recipegeneratorili16.blob.core.windows.net/"
 
@@ -25,7 +21,7 @@ func listAzureStorage() {
 	client, err := azblob.NewClient(url, credential, nil)
 	handleError(err)
 
-	listBlobsFlat(client, containerName)
+	listBlobsFlat(client, "$web")
 }
 
 func handleError(err error) {

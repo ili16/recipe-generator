@@ -13,7 +13,6 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/minio/minio-go/v7"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 	goopenai "github.com/sashabaranov/go-openai"
@@ -71,11 +70,6 @@ type RecipeResponse struct {
 }
 
 func main() {
-
-	err := templateRecipesBlob("$web", 1)
-	if err != nil {
-		log.Printf("error generating template files: %v", err)
-	}
 	mux := http.NewServeMux()
 
 	if !validateEnvVars() {
@@ -936,43 +930,6 @@ func GetRecipes(userid int) ([]RecipeResponse, error) {
 	return recipes, nil
 }
 
-func bootstrapStaticWebsite(bucketName string) error {
-	ctx := context.Background()
-	s3client, err := s3Client()
-	if err != nil {
-		log.Println("Failed to create s3 client")
-		return err
-	}
-
-	for _, object := range []string{"", "libs"} {
-		objectCh := s3client.ListObjects(ctx, "template", minio.ListObjectsOptions{
-			Prefix:    object,
-			Recursive: true,
-		})
-
-		for object := range objectCh {
-			if object.Err != nil {
-				log.Println("Failed to list objects in bucket:", object.Err)
-				return object.Err
-			}
-
-			src := minio.CopySrcOptions{Bucket: "template", Object: object.Key}
-			dst := minio.CopyDestOptions{Bucket: bucketName, Object: object.Key}
-
-			if strings.HasSuffix(object.Key, "/") {
-				break
-			}
-			_, err := s3client.CopyObject(ctx, dst, src)
-			if err != nil {
-				log.Println("Failed to copy object:", object.Key, "to bucket:", bucketName, "error:", err)
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
 func templateRecipesBlob(containername string, userid int) error {
 	var recipesTemplate = "# Rezepte\n\n## 🍝 Hauptgerichte"
 	var recipes []RecipeResponse
@@ -993,8 +950,4 @@ func templateRecipesBlob(containername string, userid int) error {
 	}
 
 	return nil
-}
-
-func uploadRecipes() {
-	
 }
