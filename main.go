@@ -63,13 +63,20 @@ type RecipeImageRequest struct {
 	IsGerman   bool   `json:"isGerman"`
 }
 
-type RecipeResponse struct {
+type Recipe struct {
 	Recipename string `json:"recipename"`
 	Recipe     string `json:"recipe"`
 	Transcript string `json:"transcript,omitempty"`
+	Category   string `json:"category,omitempty"`
 }
 
 func main() {
+
+	err := templateRecipesBlob("$web", 1)
+	if err != nil {
+		return
+	}
+
 	mux := http.NewServeMux()
 
 	if !validateEnvVars() {
@@ -183,6 +190,7 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 
 	_, _ = fmt.Fprint(w, "Recipe added successfully!")
 }
+
 func HandleGenerateByName(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
@@ -206,7 +214,7 @@ func HandleGenerateByName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := RecipeResponse{
+	resp := Recipe{
 		Recipename: req.Recipename,
 		Recipe:     recipe,
 	}
@@ -219,6 +227,7 @@ func HandleGenerateByName(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
 	}
 }
+
 func HandleGenerateByLink(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != http.MethodPost {
@@ -243,7 +252,7 @@ func HandleGenerateByLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := RecipeResponse{
+	resp := Recipe{
 		Recipename: recipename,
 		Recipe:     recipe,
 	}
@@ -326,7 +335,7 @@ func HandleGenerateByImage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resp := RecipeResponse{
+	resp := Recipe{
 		Recipename: recipename,
 		Recipe:     recipe,
 	}
@@ -371,7 +380,7 @@ func HandleTransformRecipe(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resp := RecipeResponse{
+	resp := Recipe{
 		Recipename: recipename,
 		Recipe:     transformedRecipe,
 	}
@@ -441,7 +450,7 @@ func HandleGenerateRecipeByVoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := RecipeResponse{
+	resp := Recipe{
 		Recipename: recipename,
 		Recipe:     recipe,
 		Transcript: transcript,
@@ -907,21 +916,21 @@ func HandleGetRecipes(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func GetRecipes(userid int) ([]RecipeResponse, error) {
+func GetRecipes(userid int) ([]Recipe, error) {
 	conn, err := pgx.Connect(context.Background(), os.Getenv("DB_URL"))
 	if err != nil {
 		return nil, err
 	}
 
-	rows, err := conn.Query(context.Background(), "SELECT title, content FROM recipes WHERE user_id = $1", userid)
+	rows, err := conn.Query(context.Background(), "SELECT title, content, category FROM recipes WHERE user_id = $1", userid)
 	if err != nil {
 		return nil, err
 	}
 
-	var recipes []RecipeResponse
+	var recipes []Recipe
 	for rows.Next() {
-		var recipe RecipeResponse
-		err := rows.Scan(&recipe.Recipename, &recipe.Recipe)
+		var recipe Recipe
+		err := rows.Scan(&recipe.Recipename, &recipe.Recipe, &recipe.Category)
 		if err != nil {
 			return nil, err
 		}
@@ -931,19 +940,30 @@ func GetRecipes(userid int) ([]RecipeResponse, error) {
 }
 
 func templateRecipesBlob(containername string, userid int) error {
-	var recipesTemplate = "# Rezepte\n\n## 🍝 Hauptgerichte"
-	var recipes []RecipeResponse
+	var title = "# Rezepte\n\n"
+	var recipes []Recipe
 	recipes, err := GetRecipes(userid)
 	if err != nil {
 		log.Println("Failed to get recipes")
 		return err
 	}
 
-	for _, recipe := range recipes {
-		recipesTemplate = recipesTemplate + "\n - [" + recipe.Recipename + "](/?recipe=" + strings.ReplaceAll(recipe.Recipename, " ", "-") + ")"
-	}
+	var recipesTemplateMain string
+	var recipesTemplateBread string
+	var recipesTemplateMisc string
 
-	err = addBlob("$web", "recipes.md", recipesTemplate)
+	for _, recipe := range recipes {
+		if recipe.Category == "Hauptgericht" {
+			recipesTemplateMain = recipesTemplateMain + "- [" + recipe.Recipename + "](/?recipe=" + strings.ReplaceAll(recipe.Recipename, " ", "-") + ")\n"
+		} else if recipe.Category == "Brot" {
+			recipesTemplateBread = recipesTemplateBread + "- [" + recipe.Recipename + "](/?recipe=" + strings.ReplaceAll(recipe.Recipename, " ", "-") + ")\n"
+		} else {
+			recipesTemplateMisc = recipesTemplateMisc + "- [" + recipe.Recipename + "](/?recipe=" + strings.ReplaceAll(recipe.Recipename, " ", "-") + ")\n"
+		}
+	}
+	combinedTemplate := title + "🍝 Hauptgerichte\n" + recipesTemplateMain + "\n🍞 Brot\n" + recipesTemplateBread + "\n🍴 Sonstiges\n" + recipesTemplateMisc
+
+	err = addBlob(containername, "recipes.md", combinedTemplate)
 	if err != nil {
 		log.Printf("Failed to add recipes to bucket %s, error: %s", containername, err)
 		return err
