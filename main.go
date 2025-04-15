@@ -944,7 +944,7 @@ func templateRecipesBlob(containername string, userid int) error {
 	var recipes []Recipe
 	recipes, err := GetRecipes(userid)
 	if err != nil {
-		log.Println("Failed to get recipes")
+		log.Printf("Failed to get recipes from database, error: %s", err)
 		return err
 	}
 
