@@ -71,12 +71,6 @@ type Recipe struct {
 }
 
 func main() {
-
-	err := templateRecipesBlob("$web", 1)
-	if err != nil {
-		return
-	}
-
 	mux := http.NewServeMux()
 
 	if !validateEnvVars() {
