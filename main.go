@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 	goopenai "github.com/sashabaranov/go-openai"
@@ -41,6 +42,8 @@ const (
 		"All ingredients need to be in metric units."
 )
 
+var pool *pgxpool.Pool
+
 type RecipeRequest struct {
 	Recipename string `json:"recipename"`
 	Recipe     string `json:"recipe"`
@@ -66,6 +69,7 @@ type RecipeImageRequest struct {
 type Recipe struct {
 	Recipename string `json:"recipename"`
 	Recipe     string `json:"recipe"`
+	ID         int    `json:"id"`
 	Transcript string `json:"transcript,omitempty"`
 	Category   string `json:"category,omitempty"`
 }
@@ -77,6 +81,8 @@ func main() {
 		log.Fatal("Missing environment variables")
 		return
 	}
+
+	initDBPool()
 
 	mux.HandleFunc("/health", HandleHealth)
 
@@ -96,8 +102,18 @@ func main() {
 
 	mux.HandleFunc("POST /api/v1/generate/by-voice", HandleGenerateRecipeByVoice)
 
+	mux.HandleFunc("DELETE /api/v1/delete-recipe", HandleDeleteRecipe)
+
 	log.Println("Server is running on port 8080")
 	log.Fatal(http.ListenAndServe(":8080", logRequests(mux)))
+}
+
+func initDBPool() {
+	var err error
+	pool, err = pgxpool.New(context.Background(), os.Getenv("DB_URL"))
+	if err != nil {
+		log.Fatalf("Unable to initialize DB pool connection: %v\n", err)
+	}
 }
 
 func logRequests(next http.Handler) http.Handler {
@@ -130,6 +146,39 @@ func HandleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, err := fmt.Fprintf(w, `{"status": "Healthy"}`)
 	if err != nil {
 		log.Println("Error writing response:", err)
+	}
+}
+
+func HandleGetRecipes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if os.Getenv("LOCAL_DEV") == "true" {
+		mockAzureAuth(r)
+	}
+
+	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
+
+	userID, err := GetUserID(oauthID)
+	if err != nil {
+		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
+		return
+	}
+
+	recipes, err := GetRecipes(userID)
+	if err != nil {
+		http.Error(w, "Error getting recipes", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	err = json.NewEncoder(w).Encode(recipes)
+	if err != nil {
+		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
 	}
 }
 
@@ -168,6 +217,11 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if os.Getenv("LOCAL_DEV") == "true" {
+		_, _ = fmt.Fprint(w, "Recipe added successfully!")
+		return
+	}
+
 	recipename := strings.ReplaceAll(req.Recipename, " ", "-")
 	recipePath := "recipes/" + recipename + ".md"
 
@@ -183,6 +237,46 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, _ = fmt.Fprint(w, "Recipe added successfully!")
+}
+
+func HandleDeleteRecipe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if os.Getenv("LOCAL_DEV") == "true" {
+		mockAzureAuth(r)
+	}
+
+	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
+
+	userID, err := GetUserID(oauthID)
+	if err != nil {
+		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
+		return
+	}
+
+	var req map[string]int
+	err = json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	recipeID, ok := req["recipeID"]
+	if !ok || recipeID == 0 {
+		http.Error(w, "Missing or invalid recipeID", http.StatusBadRequest)
+		return
+	}
+
+	err = RemoveRecipeFromDB(userID, recipeID)
+	if err != nil {
+		http.Error(w, "Error removing recipe", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
 
 func HandleGenerateByName(w http.ResponseWriter, r *http.Request) {
@@ -551,28 +645,24 @@ func TransformRecipe(Recipe string, isGerman bool) (string, error) {
 }
 
 func AddRecipeToDB(userID int, RecipeName string, Recipe string) error {
-	conn, err := pgx.Connect(context.Background(), os.Getenv("DB_URL"))
-	if err != nil {
-		_, err := fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
-		if err != nil {
-			return err
-		}
-		os.Exit(1)
-	}
-	defer func(conn *pgx.Conn, ctx context.Context) {
-		err := conn.Close(ctx)
-		if err != nil {
-
-		}
-	}(conn, context.Background())
-
-	_, err = conn.Exec(context.Background(), "insert into recipes(user_id, title, content) values($1, $2, $3)", userID, RecipeName, Recipe)
+	_, err := pool.Exec(context.Background(), "insert into recipes(user_id, title, content) values($1, $2, $3)", userID, RecipeName, Recipe)
 	if err != nil {
 		log.Printf("Inserting Recipe failed: %v\n\n", err)
 		return err
 	}
 
 	log.Printf("added recipe %s to database", RecipeName)
+	return nil
+}
+
+func RemoveRecipeFromDB(userID int, recipeID int) error {
+	_, err := pool.Exec(context.Background(), "delete from recipes where user_id = $1 and id = $2", userID, recipeID)
+	if err != nil {
+		log.Printf("Deleting recipe failed: %v\n\n", err)
+		return err
+	}
+
+	log.Printf("deleted recipe with id %v from database", recipeID)
 	return nil
 }
 
@@ -728,7 +818,7 @@ func goopenAIgenerateTranscript(voicemessage multipart.File) (string, error) {
 	req := goopenai.AudioRequest{
 		Model:    goopenai.Whisper1,
 		Reader:   voicemessage,
-		FilePath: "voicemessage.m4a",
+		FilePath: "voicemessage.m4a", // fake name necessary for the request
 	}
 
 	response, err := client.CreateTranscription(context.Background(), req)
@@ -877,55 +967,20 @@ func GetUserID(oauthid string) (int, error) {
 	return userID, nil
 }
 
-func HandleGetRecipes(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if os.Getenv("LOCAL_DEV") == "true" {
-		mockAzureAuth(r)
-	}
-
-	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
-
-	userID, err := GetUserID(oauthID)
-	if err != nil {
-		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
-		return
-	}
-
-	recipes, err := GetRecipes(userID)
-	if err != nil {
-		http.Error(w, "Error getting recipes", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	err = json.NewEncoder(w).Encode(recipes)
-	if err != nil {
-		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
-	}
-}
-
 func GetRecipes(userid int) ([]Recipe, error) {
-	conn, err := pgx.Connect(context.Background(), os.Getenv("DB_URL"))
+	rows, err := pool.Query(context.Background(), "SELECT id, title, content, category FROM recipes WHERE user_id = $1", userid)
 	if err != nil {
+		log.Printf("Failed to query recipes: %v", err)
 		return nil, err
 	}
-
-	rows, err := conn.Query(context.Background(), "SELECT title, content, category FROM recipes WHERE user_id = $1", userid)
-	if err != nil {
-		return nil, err
-	}
+	defer rows.Close()
 
 	var recipes []Recipe
 	for rows.Next() {
 		var recipe Recipe
-		err := rows.Scan(&recipe.Recipename, &recipe.Recipe, &recipe.Category)
+		err := rows.Scan(&recipe.ID, &recipe.Recipename, &recipe.Recipe, &recipe.Category)
 		if err != nil {
+			log.Printf("Failed to scan recipe: %v", err)
 			return nil, err
 		}
 		recipes = append(recipes, recipe)
