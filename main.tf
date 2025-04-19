@@ -196,6 +196,13 @@ resource "azurerm_container_app" "recipe-generator-backend" {
     }
   }
 
+  lifecycle {
+    ignore_changes = [
+      secret,
+      template,
+      registry
+    ]
+  }
 }
 
 resource "azurerm_container_app" "recipe-generator-frontend" {
@@ -228,7 +235,11 @@ resource "azurerm_container_app" "recipe-generator-frontend" {
     }
   }
   lifecycle {
-    ignore_changes = [secret]
+    ignore_changes = [
+      secret,
+      template,
+      registry
+    ]
   }
 }
 
@@ -238,10 +249,14 @@ resource "azurerm_storage_account" "rg" {
   location                 = "North Europe"
   account_tier             = "Standard"
   account_replication_type = "LRS"
+  custom_domain {
+    name = "recipes.ili16.de"
+    use_subdomain = false
+  }
 }
 
 resource "azurerm_storage_container" "rg" {
   name                  = "static-websites"
   storage_account_id   = azurerm_storage_account.rg.id
-  container_access_type = "private"
+  container_access_type = "blob"
 }
