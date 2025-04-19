@@ -45,9 +45,10 @@ const (
 var pool *pgxpool.Pool
 
 type RecipeRequest struct {
-	Recipename string `json:"recipename"`
-	Recipe     string `json:"recipe"`
-	IsGerman   bool   `json:"isGerman"`
+	Recipename     string `json:"recipename"`
+	Recipe         string `json:"recipe"`
+	IsGerman       bool   `json:"isGerman"`
+	RecipeCategory string `json:"recipecategory,omitempty"`
 }
 
 type RecipeGenerateRequest struct {
@@ -200,6 +201,10 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.RecipeCategory == "" {
+		req.RecipeCategory = goopenAIgenerateRecipeCategory(req.Recipe)
+	}
+
 	if os.Getenv("LOCAL_DEV") == "true" {
 		mockAzureAuth(r)
 	}
@@ -211,7 +216,7 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
 		return
 	}
-	err = AddRecipeToDB(userID, req.Recipename, req.Recipe)
+	err = AddRecipeToDB(userID, req.Recipename, req.Recipe, req.RecipeCategory)
 	if err != nil {
 		http.Error(w, "Error adding recipe", http.StatusInternalServerError)
 		return
@@ -644,8 +649,8 @@ func TransformRecipe(Recipe string, isGerman bool) (string, error) {
 	return response.Choices[0].Message.Content, nil
 }
 
-func AddRecipeToDB(userID int, RecipeName string, Recipe string) error {
-	_, err := pool.Exec(context.Background(), "insert into recipes(user_id, title, content) values($1, $2, $3)", userID, RecipeName, Recipe)
+func AddRecipeToDB(userID int, RecipeName string, Recipe string, RecipeCategory string) error {
+	_, err := pool.Exec(context.Background(), "insert into recipes(user_id, title, content, category) values($1, $2, $3, $4)", userID, RecipeName, Recipe, RecipeCategory)
 	if err != nil {
 		log.Printf("Inserting Recipe failed: %v\n\n", err)
 		return err
@@ -829,6 +834,43 @@ func goopenAIgenerateTranscript(voicemessage multipart.File) (string, error) {
 	return response.Text, nil
 }
 
+func goopenAIgenerateRecipeCategory(Recipe string) string {
+	client := goopenai.NewClient(os.Getenv("OPENAI_KEY"))
+
+	response, err := client.CreateChatCompletion(context.Background(), goopenai.ChatCompletionRequest{
+		Model: goopenai.GPT4oMini,
+		Messages: []goopenai.ChatCompletionMessage{
+			{
+				Role: goopenai.ChatMessageRoleUser,
+				MultiContent: []goopenai.ChatMessagePart{
+					{
+						Type: goopenai.ChatMessagePartTypeText,
+						Text: "What is the category of this recipe? Currently only Hauptgericht, Vorspeise, Brot, Dessert are supported. Answer with a single word nothing else",
+					},
+					{
+						Type: goopenai.ChatMessagePartTypeText,
+						Text: Recipe,
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		log.Println("Error generating recipe category:", err)
+		return ""
+	}
+
+	categories := []string{"Hauptgericht", "Vorspeise", "Brot", "Dessert"}
+	category := response.Choices[0].Message.Content
+	for _, c := range categories {
+		if strings.Contains(category, c) {
+			return c
+		}
+	}
+	log.Println("Recipe category not found, defaulting to Sonstiges")
+	return "Sonstiges"
+}
+
 func fixRecipe(recipe string) (string, error) {
 	client := goopenai.NewClient(os.Getenv("OPENAI_KEY"))
 
@@ -860,13 +902,11 @@ func fixRecipe(recipe string) (string, error) {
 }
 
 func EncodeImageToBase64(imageData io.Reader) (string, error) {
-	// Read all the data from the image
 	data, err := io.ReadAll(imageData)
 	if err != nil {
 		return "", fmt.Errorf("failed to read image data: %w", err)
 	}
 
-	// Encode the data to a base64 string
 	base64Data := base64.StdEncoding.EncodeToString(data)
 	return base64Data, nil
 }
@@ -999,18 +1039,31 @@ func templateRecipesBlob(containername string, userid int) error {
 
 	var recipesTemplateMain string
 	var recipesTemplateBread string
+	var recipesTemplateStarter string
+	var recipesTemplateDessert string
 	var recipesTemplateMisc string
 
 	for _, recipe := range recipes {
-		if recipe.Category == "Hauptgericht" {
-			recipesTemplateMain = recipesTemplateMain + "- [" + recipe.Recipename + "](/?recipe=" + strings.ReplaceAll(recipe.Recipename, " ", "-") + ")\n"
-		} else if recipe.Category == "Brot" {
-			recipesTemplateBread = recipesTemplateBread + "- [" + recipe.Recipename + "](/?recipe=" + strings.ReplaceAll(recipe.Recipename, " ", "-") + ")\n"
-		} else {
-			recipesTemplateMisc = recipesTemplateMisc + "- [" + recipe.Recipename + "](/?recipe=" + strings.ReplaceAll(recipe.Recipename, " ", "-") + ")\n"
+		linkFormat := "- [" + recipe.Recipename + "](/?recipe=" + strings.ReplaceAll(recipe.Recipename, " ", "-") + ")\n"
+		switch recipe.Category {
+		case "Hauptgericht":
+			recipesTemplateMain += linkFormat
+		case "Brot":
+			recipesTemplateBread += linkFormat
+		case "Vorspeise":
+			recipesTemplateStarter += linkFormat
+		case "Dessert":
+			recipesTemplateDessert += linkFormat
+		default:
+			recipesTemplateMisc += linkFormat
 		}
 	}
-	combinedTemplate := title + "🍝 Hauptgerichte\n" + recipesTemplateMain + "\n🍞 Brot\n" + recipesTemplateBread + "\n🍴 Sonstiges\n" + recipesTemplateMisc
+
+	combinedTemplate := title + "🍝 Hauptgerichte\n" + recipesTemplateMain +
+		"\n🥗 Vorspeisen\n" + recipesTemplateStarter +
+		"\n🧁 Desserts\n" + recipesTemplateDessert +
+		"\n🍞 Brot\n" + recipesTemplateBread +
+		"\n🍴 Sonstiges\n" + recipesTemplateMisc
 
 	err = addBlob(containername, "recipes.md", combinedTemplate)
 	if err != nil {
