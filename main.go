@@ -956,7 +956,7 @@ func HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	suffix, err := randomString()
+	randomString, err := randomString()
 	if err != nil {
 		log.Printf("Failed to generate random string: %v\n", err)
 		http.Error(w, "Failed to generate random string", http.StatusInternalServerError)
@@ -967,14 +967,14 @@ func HandleLogin(w http.ResponseWriter, r *http.Request) {
 	err = conn.QueryRow(context.Background(), "select exists(SELECT 1 FROM users WHERE oauth_id = $1)", oauthID).Scan(&exists)
 
 	if !exists {
-		_, err = conn.Exec(context.Background(), "INSERT INTO users (oauth_id, name, oauth_provider, subdomain) VALUES ($1, $2, $3, $4)", oauthID, userName, provider, "recipes-"+suffix)
+		_, err = conn.Exec(context.Background(), "INSERT INTO users (oauth_id, name, oauth_provider, subdomain) VALUES ($1, $2, $3, $4)", oauthID, userName, provider, randomString)
 		if err != nil {
 			http.Error(w, "Database Error Failed to create user", http.StatusInternalServerError)
 			log.Printf("Failed to create user %s with error: %v\n", userName, err)
 			return
 		}
 
-		err = bootstrapStorageAccount("recipes-"+suffix, oauthID)
+		err = bootstrapStorageAccount(randomString, oauthID)
 		if err != nil {
 			http.Error(w, "Failed to bootstrap static website", http.StatusInternalServerError)
 			log.Printf("Failed to bootstrap static website for user %s with error: %v\n", userName, err)
