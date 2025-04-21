@@ -228,11 +228,6 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if os.Getenv("LOCAL_DEV") == "true" {
-		_, _ = fmt.Fprint(w, "Recipe added successfully!")
-		return
-	}
-
 	recipename := strings.ReplaceAll(req.Recipename, " ", "-")
 	recipePath := "recipes/" + recipename + ".md"
 
@@ -241,8 +236,9 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to update recipe", http.StatusInternalServerError)
 		return
 	}
-	err = templateRecipesBlob("$web", userID)
+	err = templateRecipesBlob(storageaccount, userID)
 	if err != nil {
+		log.Printf("Error updating recipe template: %v\n", err)
 		http.Error(w, "Failed to template recipes", http.StatusInternalServerError)
 		return
 	}
@@ -262,7 +258,7 @@ func HandleDeleteRecipe(w http.ResponseWriter, r *http.Request) {
 
 	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
 
-	userID, _, err := GetUserInformation(oauthID)
+	userID, storageAccountName, err := GetUserInformation(oauthID)
 	if err != nil {
 		log.Println("Error getting user ID:", err)
 		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
@@ -291,12 +287,7 @@ func HandleDeleteRecipe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if os.Getenv("LOCAL_DEV") == "true" {
-		_, _ = fmt.Fprint(w, "Recipe deleted successfully!")
-		return
-	}
-
-	err = templateRecipesBlob("$web", userID)
+	err = templateRecipesBlob(storageAccountName, userID)
 	if err != nil {
 		log.Printf("Error updating recipe template: %v\n", err)
 		http.Error(w, "Error updating recipe template", http.StatusInternalServerError)
@@ -931,7 +922,8 @@ func GetWebsite(link string) (string, error) {
 }
 
 func mockAzureAuth(r *http.Request) {
-	r.Header.Set("X-MS-CLIENT-PRINCIPAL-ID", "8e888379-a76f-4aba-9860-183b913c0719")
+	// r.Header.Set("X-MS-CLIENT-PRINCIPAL-ID", "8e888379-a76f-4aba-9860-183b913c0719")
+	r.Header.Set("X-MS-CLIENT-PRINCIPAL-ID", "8e888379-a76f-4aba-1234-183b913c0719")
 	r.Header.Set("X-MS-CLIENT-PRINCIPAL-NAME", "ilijakovac1@googlemail.com")
 	r.Header.Set("X-MS-CLIENT-PRINCIPAL-IDP", "aad")
 }

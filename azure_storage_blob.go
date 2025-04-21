@@ -86,11 +86,37 @@ func enableStaticWebsite(accountName string) error {
 
 	_, err = serviceClient.SetProperties(context.TODO(), &service.SetPropertiesOptions{
 		StaticWebsite: &service.StaticWebsite{
-			Enabled: to.Ptr(true),
+			Enabled:       to.Ptr(true),
+			IndexDocument: to.Ptr("index.html"),
 		},
 	})
 	if err != nil {
 		log.Printf("Failed to set static website properties: %v", err)
+		return err
+	}
+
+	return nil
+}
+
+func copyDefaultBlobs(destinationStorageAccountName string, blobpath string) error {
+	sourceClient, err := blobstorageClient("recipegeneratorili16")
+	if err != nil {
+		log.Printf("Failed to create blob storage client: %v", err)
+		return err
+	}
+
+	destClient, err := blobstorageClient(destinationStorageAccountName)
+	if err != nil {
+		log.Printf("Failed to create blob storage client: %v", err)
+		return err
+	}
+	ctx := context.Background()
+
+	sourceBlob := sourceClient.ServiceClient().NewContainerClient("static-websites").NewBlockBlobClient(blobpath)
+	destBlob := destClient.ServiceClient().NewContainerClient("$web").NewBlockBlobClient(blobpath)
+	_, err = destBlob.StartCopyFromURL(ctx, sourceBlob.URL(), nil)
+	if err != nil {
+		log.Printf("Failed to copy blob: %v", err)
 		return err
 	}
 

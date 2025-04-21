@@ -117,6 +117,21 @@ func bootstrapStorageAccount(storageAccountName string, userid string) error {
 		return err
 	}
 
+	filesToCopy := []string{
+		"index.html",
+		"libs/markdown-it.min.js",
+		"libs/modern-normalize.min.css",
+		"libs/water.light.min.css",
+	}
+
+	for _, file := range filesToCopy {
+		err := copyDefaultBlobs(storageAccountName, file)
+		if err != nil {
+			log.Printf("Error copying %s: %v", file, err)
+			return err
+		}
+	}
+
 	return nil
 }
 
