@@ -67,6 +67,11 @@ type RecipeImageRequest struct {
 	IsGerman   bool   `json:"isGerman"`
 }
 
+type RecipeChangeRequest struct {
+	Recipe       string `json:"recipe"`
+	ChangePrompt string `json:"changePrompt"`
+}
+
 type Recipe struct {
 	Recipename string `json:"recipename"`
 	Recipe     string `json:"recipe"`
@@ -95,8 +100,6 @@ func main() {
 
 	mux.HandleFunc("/api/v1/generate/by-image", HandleGenerateByImage)
 
-	mux.HandleFunc("/api/v1/transform", HandleTransformRecipe)
-
 	mux.HandleFunc("/api/v1/login", HandleLogin)
 
 	mux.HandleFunc("GET /api/v1/get-recipes", HandleGetRecipes)
@@ -104,6 +107,8 @@ func main() {
 	mux.HandleFunc("POST /api/v1/generate/by-voice", HandleGenerateRecipeByVoice)
 
 	mux.HandleFunc("DELETE /api/v1/delete-recipe", HandleDeleteRecipe)
+
+	mux.HandleFunc("POST /api/v1/update-recipe", HandleUpdateRecipe)
 
 	log.Println("Server is running on port 8080")
 	log.Fatal(http.ListenAndServe(":8080", logRequests(mux)))
@@ -258,6 +263,7 @@ func HandleDeleteRecipe(w http.ResponseWriter, r *http.Request) {
 
 	userID, err := GetUserID(oauthID)
 	if err != nil {
+		log.Println("Error getting user ID:", err)
 		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
 		return
 	}
@@ -265,19 +271,34 @@ func HandleDeleteRecipe(w http.ResponseWriter, r *http.Request) {
 	var req map[string]int
 	err = json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
+		log.Println("Error decoding JSON:", err)
 		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
 		return
 	}
 
 	recipeID, ok := req["recipeID"]
 	if !ok || recipeID == 0 {
+		log.Println("Missing or invalid recipeID")
 		http.Error(w, "Missing or invalid recipeID", http.StatusBadRequest)
 		return
 	}
 
 	err = RemoveRecipeFromDB(userID, recipeID)
 	if err != nil {
+		log.Printf("Error removing recipe: %v\n", err)
 		http.Error(w, "Error removing recipe", http.StatusInternalServerError)
+		return
+	}
+
+	if os.Getenv("LOCAL_DEV") == "true" {
+		_, _ = fmt.Fprint(w, "Recipe deleted successfully!")
+		return
+	}
+
+	err = templateRecipesBlob("$web", userID)
+	if err != nil {
+		log.Printf("Error updating recipe template: %v\n", err)
+		http.Error(w, "Error updating recipe template", http.StatusInternalServerError)
 		return
 	}
 
@@ -442,51 +463,6 @@ func HandleGenerateByImage(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func HandleTransformRecipe(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
-		return
-	}
-	var req RecipeRequest
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
-		return
-	}
-
-	transformedRecipe, err := TransformRecipe(req.Recipe, req.IsGerman)
-	if err != nil {
-		http.Error(w, "Error generating recipe", http.StatusInternalServerError)
-		return
-	}
-
-	var recipename string
-
-	if req.Recipename != "" {
-		recipename = req.Recipename
-	} else {
-		recipename, err = openAIgenerateRecipeName(transformedRecipe, req.IsGerman)
-		if err != nil {
-			http.Error(w, "Error generating recipe", http.StatusInternalServerError)
-			log.Println("Error generating recipe name:", err)
-			return
-		}
-	}
-
-	resp := Recipe{
-		Recipename: recipename,
-		Recipe:     transformedRecipe,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	err = json.NewEncoder(w).Encode(resp)
-	if err != nil {
-		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
-	}
-}
-
 func HandleGenerateRecipeByVoice(w http.ResponseWriter, r *http.Request) {
 	err := r.ParseMultipartForm(10 << 20)
 	if err != nil {
@@ -559,6 +535,38 @@ func HandleGenerateRecipeByVoice(w http.ResponseWriter, r *http.Request) {
 
 }
 
+func HandleUpdateRecipe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
+	}
+	var req RecipeChangeRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	updatedRecipe, err := goopenaiUpdateRecipe(req.Recipe, req.ChangePrompt)
+	if err != nil {
+		http.Error(w, "Error generating recipe", http.StatusInternalServerError)
+		return
+	}
+
+	resp := Recipe{
+		Recipe: updatedRecipe,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	err = json.NewEncoder(w).Encode(resp)
+	if err != nil {
+		log.Printf("Error encoding JSON response: %v\n\n", err)
+		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
+	}
+}
+
 func GenerateRecipeByLink(URL string, isGerman bool) (string, string, error) {
 	websitecontent, err := GetWebsite(URL)
 	if err != nil {
@@ -601,52 +609,6 @@ func GenerateRecipeByImage(Image string, isGerman bool) (string, error) {
 	}
 
 	return recipe, nil
-}
-
-func TransformRecipe(Recipe string, isGerman bool) (string, error) {
-	client := goopenai.NewClient(os.Getenv("OPENAI_KEY"))
-
-	var SystemMessage string
-
-	if isGerman {
-		SystemMessage = "Du bist ein Agent, der das Format von Rezepten ändert." +
-			"Das Rezept muss im Markdown-Format sein: " +
-			"# <Rezeptname>\n" +
-			"## Zutaten\n" +
-			"- **<MENGE>** Zutat \n" +
-			"## Anweisung 1\n" +
-			"## Anweisung 2" +
-			"Alle Zutaten müssen in metrischen Einheiten angegeben werden."
-	} else {
-		SystemMessage = "You are an agent that changes the format recipes" +
-			"The recipe needs to be in markdown format: " +
-			"# <Recipe Name>\n" + "## Ingredients\n" + "- **<UNIT>** Ingredient \n" + "## Instructionset 1\n" + "## Instructionset 2" +
-			"All ingredients need to be in metric units."
-	}
-
-	response, err := client.CreateChatCompletion(context.Background(), goopenai.ChatCompletionRequest{
-		Model: goopenai.GPT4oMini,
-		Messages: []goopenai.ChatCompletionMessage{
-			{
-				Role: goopenai.ChatMessageRoleUser,
-				MultiContent: []goopenai.ChatMessagePart{
-					{
-						Type: goopenai.ChatMessagePartTypeText,
-						Text: SystemMessage,
-					},
-					{
-						Type: goopenai.ChatMessagePartTypeText,
-						Text: Recipe,
-					},
-				},
-			},
-		},
-	})
-	if err != nil {
-		return "", err
-	}
-
-	return response.Choices[0].Message.Content, nil
 }
 
 func AddRecipeToDB(userID int, RecipeName string, Recipe string, RecipeCategory string) error {
@@ -869,6 +831,33 @@ func goopenAIgenerateRecipeCategory(Recipe string) string {
 	}
 	log.Println("Recipe category not found, defaulting to Sonstiges")
 	return "Sonstiges"
+}
+
+func goopenaiUpdateRecipe(Recipe string, Prompt string) (string, error) {
+	client := goopenai.NewClient(os.Getenv("OPENAI_KEY"))
+
+	response, err := client.CreateChatCompletion(context.Background(), goopenai.ChatCompletionRequest{
+		Model: goopenai.GPT4oMini,
+		Messages: []goopenai.ChatCompletionMessage{
+			{
+				Role: goopenai.ChatMessageRoleUser,
+				MultiContent: []goopenai.ChatMessagePart{
+					{
+						Type: goopenai.ChatMessagePartTypeText,
+						Text: "The user requested that you change the following recipe: " +
+							Recipe + " according to the following prompt: " + Prompt +
+							" keep the recipe in the same format and language" +
+							" only respond with the recipe and nothing else",
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		log.Printf("Error updating recipe: %v\n", err)
+		return "Error while updating Recipe", err
+	}
+	return response.Choices[0].Message.Content, nil
 }
 
 func fixRecipe(recipe string) (string, error) {
