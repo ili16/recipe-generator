@@ -110,6 +110,13 @@ func bootstrapStorageAccount(storageAccountName string, userid string) error {
 		log.Printf("error updating storage account: %v for user: %v", err, userid)
 		return err
 	}
+
+	err = enableStaticWebsite(storageAccountName)
+	if err != nil {
+		log.Printf("error enabling static website: %v", err)
+		return err
+	}
+
 	return nil
 }
 

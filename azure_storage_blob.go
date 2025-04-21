@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 )
 
 func listAzureStorage() {
@@ -46,8 +48,8 @@ func listBlobsFlat(client *azblob.Client, containerName string) {
 	}
 }
 
-func blobstorageClient() (*azblob.Client, error) {
-	url := "https://recipegeneratorili16.blob.core.windows.net/"
+func blobstorageClient(storageAccountName string) (*azblob.Client, error) {
+	url := fmt.Sprintf("https://%s.blob.core.windows.net/", storageAccountName)
 
 	credential, err := azidentity.NewDefaultAzureCredential(nil)
 	handleError(err)
@@ -58,16 +60,38 @@ func blobstorageClient() (*azblob.Client, error) {
 	return client, nil
 }
 
-func addBlob(containername string, blob string, content string) error {
-	client, err := blobstorageClient()
+func addBlob(storageAccountName string, blob string, content string) error {
+	client, err := blobstorageClient(storageAccountName)
 	if err != nil {
 		log.Printf("Failed to create blob storage client: %v", err)
 	}
 	ctx := context.Background()
 
-	_, err = client.UploadBuffer(ctx, containername, blob, []byte(content), nil)
+	_, err = client.UploadBuffer(ctx, "$web", blob, []byte(content), nil)
 	if err != nil {
 		log.Printf("Failed to upload blob: %v", err)
+	}
+
+	return nil
+}
+
+func enableStaticWebsite(accountName string) error {
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	serviceURL := fmt.Sprintf("https://%s.blob.core.windows.net/", accountName)
+	serviceClient, err := service.NewClient(serviceURL, cred, nil)
+	if err != nil {
+		log.Printf("Failed to create blob storage service client: %v", err)
+		return err
+	}
+
+	_, err = serviceClient.SetProperties(context.TODO(), &service.SetPropertiesOptions{
+		StaticWebsite: &service.StaticWebsite{
+			Enabled: to.Ptr(true),
+		},
+	})
+	if err != nil {
+		log.Printf("Failed to set static website properties: %v", err)
+		return err
 	}
 
 	return nil

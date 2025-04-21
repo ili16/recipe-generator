@@ -168,7 +168,7 @@ func HandleGetRecipes(w http.ResponseWriter, r *http.Request) {
 
 	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
 
-	userID, err := GetUserID(oauthID)
+	userID, _, err := GetUserInformation(oauthID)
 	if err != nil {
 		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
 		return
@@ -217,7 +217,7 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 
 	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
 
-	userID, err := GetUserID(oauthID)
+	userID, storageaccount, err := GetUserInformation(oauthID)
 	if err != nil {
 		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
 		return
@@ -236,7 +236,7 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 	recipename := strings.ReplaceAll(req.Recipename, " ", "-")
 	recipePath := "recipes/" + recipename + ".md"
 
-	err = addBlob("$web", recipePath, req.Recipe)
+	err = addBlob(storageaccount, recipePath, req.Recipe)
 	if err != nil {
 		http.Error(w, "Failed to update recipe", http.StatusInternalServerError)
 		return
@@ -262,7 +262,7 @@ func HandleDeleteRecipe(w http.ResponseWriter, r *http.Request) {
 
 	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
 
-	userID, err := GetUserID(oauthID)
+	userID, _, err := GetUserInformation(oauthID)
 	if err != nil {
 		log.Println("Error getting user ID:", err)
 		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
@@ -1008,17 +1008,14 @@ func randomString() (string, error) {
 	return string(result), nil
 }
 
-func GetUserID(oauthid string) (int, error) {
-	conn, err := pgx.Connect(context.Background(), os.Getenv("DB_URL"))
+func GetUserInformation(oauthid string) (int, string, error) {
+	var userID int
+	var subdomain string
+	err := pool.QueryRow(context.Background(), "SELECT id, subdomain FROM users WHERE oauth_id = $1", oauthid).Scan(&userID, &subdomain)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	userID := 0
-	err = conn.QueryRow(context.Background(), "SELECT id FROM users WHERE oauth_id = $1", oauthid).Scan(&userID)
-	if err != nil {
-		return 0, err
-	}
-	return userID, nil
+	return userID, subdomain, nil
 }
 
 func GetRecipes(userid int) ([]Recipe, error) {
@@ -1042,7 +1039,7 @@ func GetRecipes(userid int) ([]Recipe, error) {
 	return recipes, nil
 }
 
-func templateRecipesBlob(containername string, userid int) error {
+func templateRecipesBlob(storageAccountName string, userid int) error {
 	var title = "# Rezepte\n\n"
 	var recipes []Recipe
 	recipes, err := GetRecipes(userid)
@@ -1079,9 +1076,9 @@ func templateRecipesBlob(containername string, userid int) error {
 		"\n🍞 Brot\n" + recipesTemplateBread +
 		"\n🍴 Sonstiges\n" + recipesTemplateMisc
 
-	err = addBlob(containername, "recipes.md", combinedTemplate)
+	err = addBlob(storageAccountName, "recipes.md", combinedTemplate)
 	if err != nil {
-		log.Printf("Failed to add recipes to bucket %s, error: %s", containername, err)
+		log.Printf("Failed to add recipes to $web container of storage account  %s, error: %s", storageAccountName, err)
 		return err
 	}
 
