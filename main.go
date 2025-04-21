@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -955,23 +956,31 @@ func HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	suffix, err := randomString()
+	if err != nil {
+		log.Printf("Failed to generate random string: %v\n", err)
+		http.Error(w, "Failed to generate random string", http.StatusInternalServerError)
+		return
+	}
+
 	var exists bool
 	err = conn.QueryRow(context.Background(), "select exists(SELECT 1 FROM users WHERE oauth_id = $1)", oauthID).Scan(&exists)
 
 	if !exists {
-		_, err = conn.Exec(context.Background(), "INSERT INTO users (oauth_id, name, oauth_provider) VALUES ($1, $2, $3)", oauthID, userName, provider)
+		_, err = conn.Exec(context.Background(), "INSERT INTO users (oauth_id, name, oauth_provider, subdomain) VALUES ($1, $2, $3, $4)", oauthID, userName, provider, "recipes-"+suffix)
 		if err != nil {
 			http.Error(w, "Database Error Failed to create user", http.StatusInternalServerError)
 			log.Println("Login: Database error Failed to create user")
 			return
 		}
 
-		// go func() {
-		// 	err := createStaticWebsite(oauthID)
-		// 	if err != nil {
-		// 		log.Println("Login: Failed to create static website")
-		// 	}
-		// }()
+		err = bootstrapStorageAccount("recipes-"+suffix, oauthID)
+		if err != nil {
+			http.Error(w, "Failed to bootstrap static website", http.StatusInternalServerError)
+			log.Println("Login: Failed to bootstrap static website")
+			return
+		}
+
 	} else {
 		log.Println("Login: User already exists")
 	}
@@ -981,6 +990,22 @@ func HandleLogin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-USER-PROVIDER", provider)
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func randomString() (string, error) {
+	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 8)
+	_, err := rand.Read(b)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate random bytes: %v", err)
+	}
+
+	result := make([]byte, 8)
+	for i := range b {
+		result[i] = charset[int(b[i])%len(charset)]
+	}
+
+	return string(result), nil
 }
 
 func GetUserID(oauthid string) (int, error) {
