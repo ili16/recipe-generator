@@ -970,14 +970,14 @@ func HandleLogin(w http.ResponseWriter, r *http.Request) {
 		_, err = conn.Exec(context.Background(), "INSERT INTO users (oauth_id, name, oauth_provider, subdomain) VALUES ($1, $2, $3, $4)", oauthID, userName, provider, "recipes-"+suffix)
 		if err != nil {
 			http.Error(w, "Database Error Failed to create user", http.StatusInternalServerError)
-			log.Println("Login: Database error Failed to create user")
+			log.Printf("Failed to create user %s with error: %v\n", userName, err)
 			return
 		}
 
 		err = bootstrapStorageAccount("recipes-"+suffix, oauthID)
 		if err != nil {
 			http.Error(w, "Failed to bootstrap static website", http.StatusInternalServerError)
-			log.Println("Login: Failed to bootstrap static website")
+			log.Printf("Failed to bootstrap static website for user %s with error: %v\n", userName, err)
 			return
 		}
 
