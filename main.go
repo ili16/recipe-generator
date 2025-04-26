@@ -494,14 +494,15 @@ func HandleGenerateRecipeByVoice(w http.ResponseWriter, r *http.Request) {
 	transcript, err := goopenAIgenerateTranscript(file)
 	if err != nil {
 		http.Error(w, "Failed to generate recipe", http.StatusInternalServerError)
-		log.Println("Error generating recipe:", err)
+		log.Println("Error transcribing recipe:", err)
 		return
 	}
+	log.Printf("Transcript: %s\n", transcript)
 
 	recipe, err := openAIgenerateRecipe(transcript, "", isGerman)
 	if err != nil {
 		http.Error(w, "Error generating recipe", http.StatusInternalServerError)
-		log.Println("Error generating recipe:", err)
+		log.Println("Error generating recipe via voice:", err)
 		return
 	}
 
