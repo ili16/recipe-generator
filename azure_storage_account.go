@@ -9,10 +9,13 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization/v3"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/storage/armstorage"
+	"github.com/google/uuid"
 )
 
 var (
@@ -67,42 +70,16 @@ func bootstrapStorageAccount(storageAccountName string, userid string) error {
 	}
 	log.Println("storage account:", *storageAccount.ID)
 
-	properties, err := storageAccountProperties(ctx, storageAccountName)
+	err = assignBlobDataContributorRole(storageAccountName)
+	if err != nil {
+		log.Printf("error assigning role: %v", err)
+		return err
+	}
+
+	_, err = storageAccountProperties(ctx, storageAccountName)
 	if err != nil {
 		log.Printf("error getting storage account properties: %v", err)
 		return err
-	}
-	log.Println(*properties.ID)
-
-	list, err := listStorageAccount(ctx)
-	if err != nil {
-		log.Printf("error listing storage accounts: %v", err)
-		return err
-	}
-	log.Println("Storage Accounts:")
-	for _, sa := range list {
-		log.Println("\t" + *sa.ID)
-	}
-
-	keys, err := regenerateKeyStorageAccount(ctx, storageAccountName)
-	if err != nil {
-		log.Printf("error regenerating storage account key: %v", err)
-		return err
-	}
-	for _, v := range keys {
-		if *v.KeyName == "key1" {
-			log.Println("regenerate key:", *v.KeyName, *v.Value, *v.CreationTime, *v.Permissions)
-		}
-	}
-
-	keys2, err := listKeysStorageAccount(ctx, storageAccountName)
-	if err != nil {
-		log.Printf("error listing storage account keys: %v", err)
-		return err
-	}
-	log.Println("list keys:")
-	for i, v := range keys2 {
-		log.Println("\t", i, *v.KeyName, *v.Value, *v.CreationTime, *v.Permissions)
 	}
 
 	_, err = updateStorageAccount(ctx, storageAccountName, userid)
@@ -124,10 +101,28 @@ func bootstrapStorageAccount(storageAccountName string, userid string) error {
 		"libs/water.light.min.css",
 	}
 
+	const (
+		maxRetries = 5
+		retryDelay = 5 * time.Second
+	)
+
 	for _, file := range filesToCopy {
-		err := copyDefaultBlobs(storageAccountName, file)
+		var err error
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			err = copyDefaultBlobs(storageAccountName, file)
+			if err == nil {
+				break
+			}
+
+			log.Printf("Attempt %d/%d: Error copying %s: %v", attempt, maxRetries, file, err)
+			if attempt < maxRetries {
+				log.Printf("Waiting %v before next retry...", retryDelay)
+				time.Sleep(retryDelay)
+			}
+		}
+
 		if err != nil {
-			log.Printf("Error copying %s: %v", file, err)
+			log.Printf("Failed to copy %s after %d attempts: %v", file, maxRetries, err)
 			return err
 		}
 	}
@@ -304,4 +299,56 @@ func checkStorageAccountExists(ctx context.Context, resourceGroup, accountName s
 		return false
 	}
 	return true
+}
+
+func assignBlobDataContributorRole(storageAccountName string) error {
+	ctx := context.Background()
+	subscriptionID := os.Getenv("AZURE_SUBSCRIPTION_ID")
+	principalID := os.Getenv("AZURE_OBJECT_ID")
+
+	if subscriptionID == "" || principalID == "" {
+		return fmt.Errorf("missing AZURE_SUBSCRIPTION_ID or AZURE_OBJECT_ID")
+	}
+
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	if err != nil {
+		return fmt.Errorf("failed to get credentials: %v", err)
+	}
+
+	clientFactory, err := armauthorization.NewClientFactory(subscriptionID, cred, nil)
+	if err != nil {
+		log.Printf("failed to create client factory: %v", err)
+		return err
+	}
+
+	roleAssignmentsClient := clientFactory.NewRoleAssignmentsClient()
+
+	roleDefinitionID := fmt.Sprintf("/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe", subscriptionID)
+
+	scope := fmt.Sprintf(
+		"/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Storage/storageAccounts/%s",
+		subscriptionID,
+		"recipe-generator",
+		storageAccountName,
+	)
+
+	roleAssignmentID := uuid.New().String()
+
+	_, err = roleAssignmentsClient.Create(
+		ctx,
+		scope,
+		roleAssignmentID,
+		armauthorization.RoleAssignmentCreateParameters{
+			Properties: &armauthorization.RoleAssignmentProperties{
+				RoleDefinitionID: to.Ptr(roleDefinitionID),
+				PrincipalID:      to.Ptr(principalID),
+			},
+		},
+		nil)
+
+	if err != nil {
+		return fmt.Errorf("failed to assign role: %v", err)
+	}
+
+	return nil
 }

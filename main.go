@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -923,64 +924,59 @@ func GetWebsite(link string) (string, error) {
 
 func mockAzureAuth(r *http.Request) {
 	// r.Header.Set("X-MS-CLIENT-PRINCIPAL-ID", "8e888379-a76f-4aba-9860-183b913c0719")
-	r.Header.Set("X-MS-CLIENT-PRINCIPAL-ID", "8e888379-a76f-4aba-1234-183b913c0719")
+	r.Header.Set("X-MS-CLIENT-PRINCIPAL-ID", "8e888379-a76f-4aba-5678-183b913c0719")
 	r.Header.Set("X-MS-CLIENT-PRINCIPAL-NAME", "ilijakovac1@googlemail.com")
 	r.Header.Set("X-MS-CLIENT-PRINCIPAL-IDP", "aad")
 }
 
 func HandleLogin(w http.ResponseWriter, r *http.Request) {
-
 	if os.Getenv("LOCAL_DEV") == "true" {
 		mockAzureAuth(r)
 	}
-
 	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
 	userName := r.Header.Get("X-MS-CLIENT-PRINCIPAL-NAME")
 	provider := r.Header.Get("X-MS-CLIENT-PRINCIPAL-IDP")
-
 	if oauthID == "" || userName == "" || provider == "" {
 		http.Error(w, "Unauthorized: Missing authentication headers", http.StatusUnauthorized)
 		return
 	}
-	conn, err := pgx.Connect(context.Background(), os.Getenv("DB_URL"))
+
+	var storageAccountName string
+	err := pool.QueryRow(context.Background(), "SELECT subdomain FROM users WHERE oauth_id = $1", oauthID).Scan(&storageAccountName)
 	if err != nil {
-		http.Error(w, "Failed to connect to database", http.StatusInternalServerError)
-		return
-	}
+		if errors.Is(err, pgx.ErrNoRows) {
+			// User doesn't exist, create new user
+			storageAccountName, err = randomString()
+			if err != nil {
+				log.Printf("Failed to generate random string: %v\n", err)
+				http.Error(w, "Failed to generate random string", http.StatusInternalServerError)
+				return
+			}
 
-	randomString, err := randomString()
-	if err != nil {
-		log.Printf("Failed to generate random string: %v\n", err)
-		http.Error(w, "Failed to generate random string", http.StatusInternalServerError)
-		return
-	}
+			_, err = pool.Exec(context.Background(), "INSERT INTO users (oauth_id, name, oauth_provider, subdomain) VALUES ($1, $2, $3, $4)", oauthID, userName, provider, storageAccountName)
+			if err != nil {
+				http.Error(w, "Database Error Failed to create user", http.StatusInternalServerError)
+				log.Printf("Failed to create user %s with error: %v\n", userName, err)
+				return
+			}
 
-	var exists bool
-	err = conn.QueryRow(context.Background(), "select exists(SELECT 1 FROM users WHERE oauth_id = $1)", oauthID).Scan(&exists)
-
-	if !exists {
-		_, err = conn.Exec(context.Background(), "INSERT INTO users (oauth_id, name, oauth_provider, subdomain) VALUES ($1, $2, $3, $4)", oauthID, userName, provider, randomString)
-		if err != nil {
-			http.Error(w, "Database Error Failed to create user", http.StatusInternalServerError)
-			log.Printf("Failed to create user %s with error: %v\n", userName, err)
+			err = bootstrapStorageAccount(storageAccountName, oauthID)
+			if err != nil {
+				http.Error(w, "Failed to bootstrap static website", http.StatusInternalServerError)
+				log.Printf("Failed to bootstrap static website for user %s with error: %v\n", userName, err)
+				return
+			}
+		} else {
+			log.Printf("Database error: %v\n", err)
+			http.Error(w, "Database Error", http.StatusInternalServerError)
 			return
 		}
-
-		err = bootstrapStorageAccount(randomString, oauthID)
-		if err != nil {
-			http.Error(w, "Failed to bootstrap static website", http.StatusInternalServerError)
-			log.Printf("Failed to bootstrap static website for user %s with error: %v\n", userName, err)
-			return
-		}
-
-	} else {
-		log.Println("Login: User already exists")
 	}
 
 	w.Header().Set("X-USER-NAME", userName)
 	w.Header().Set("X-USER-ID", oauthID)
 	w.Header().Set("X-USER-PROVIDER", provider)
-
+	w.Header().Set("X-USER-STORAGEACCOUNT", storageAccountName)
 	w.WriteHeader(http.StatusOK)
 }
 
