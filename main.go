@@ -110,7 +110,9 @@ func main() {
 
 	mux.HandleFunc("DELETE /api/v1/delete-recipe", HandleDeleteRecipe)
 
-	mux.HandleFunc("POST /api/v1/update-recipe", HandleUpdateRecipe)
+	mux.HandleFunc("POST /api/v1/update-recipe", HandleReprompt)
+
+	mux.HandleFunc("PATCH /api/v1/update-recipe", HandleUpdateRecipe)
 
 	log.Println("Server is running on port 8080")
 	log.Fatal(http.ListenAndServe(":8080", logRequests(mux)))
@@ -296,6 +298,92 @@ func HandleDeleteRecipe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func HandleUpdateRecipe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if os.Getenv("LOCAL_DEV") == "true" {
+		mockAzureAuth(r)
+	}
+
+	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
+	userID, storageAccountName, err := GetUserInformation(oauthID)
+	if err != nil {
+		log.Println("Error getting user ID:", err)
+		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
+		return
+	}
+
+	var updateReq struct {
+		ID             int    `json:"id"`
+		Recipename     string `json:"recipename"`
+		Recipe         string `json:"recipe"`
+		RecipeCategory string `json:"recipecategory"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&updateReq); err != nil {
+		log.Println("Error decoding request body:", err)
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	if updateReq.ID == 0 || updateReq.Recipename == "" || updateReq.Recipe == "" {
+		http.Error(w, "Missing required fields", http.StatusBadRequest)
+		return
+	}
+
+	query := `
+        UPDATE recipes 
+        SET title = $1, content = $2, category = $3
+        WHERE id = $4 AND user_id = $5
+        RETURNING id`
+
+	var recipeID int
+	err = pool.QueryRow(context.Background(), query,
+		updateReq.Recipename,
+		updateReq.Recipe,
+		updateReq.RecipeCategory,
+		updateReq.ID,
+		userID,
+	).Scan(&recipeID)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "Recipe not found or unauthorized", http.StatusNotFound)
+			return
+		}
+		log.Printf("Error updating recipe: %v\n", err)
+		http.Error(w, "Error updating recipe", http.StatusInternalServerError)
+		return
+	}
+
+	recipename := strings.ReplaceAll(updateReq.Recipename, " ", "-")
+	recipePath := "recipes/" + recipename + ".md"
+
+	if err := addBlob(storageAccountName, recipePath, updateReq.Recipe); err != nil {
+		log.Printf("Error updating recipe in blob storage: %v\n", err)
+		http.Error(w, "Failed to update recipe in storage", http.StatusInternalServerError)
+		return
+	}
+
+	if err := templateRecipesBlob(storageAccountName, userID); err != nil {
+		log.Printf("Error updating recipe template: %v\n", err)
+		http.Error(w, "Failed to update recipe template", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	err = json.NewEncoder(w).Encode(map[string]string{
+		"message": "Recipe updated successfully",
+	})
+	if err != nil {
+		return
+	}
 }
 
 func HandleGenerateByName(w http.ResponseWriter, r *http.Request) {
@@ -529,7 +617,7 @@ func HandleGenerateRecipeByVoice(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func HandleUpdateRecipe(w http.ResponseWriter, r *http.Request) {
+func HandleReprompt(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
 		return
