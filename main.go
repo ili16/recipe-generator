@@ -867,7 +867,7 @@ func goopenAIgenerateTranscript(voicemessage multipart.File) (string, error) {
 	req := goopenai.AudioRequest{
 		Model:    goopenai.Whisper1,
 		Reader:   voicemessage,
-		FilePath: "voicemessage.m4a", // fake name necessary for the request
+		FilePath: "voicemessage.mp3", // fake name necessary for the request
 	}
 
 	response, err := client.CreateTranscription(context.Background(), req)
