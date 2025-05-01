@@ -1055,6 +1055,14 @@ func HandleLogin(w http.ResponseWriter, r *http.Request) {
 				log.Printf("Failed to bootstrap static website for user %s with error: %v\n", userName, err)
 				return
 			}
+
+			userID, _, _ := GetUserInformation(oauthID)
+			err = templateRecipesBlob(storageAccountName, userID)
+			if err != nil {
+				log.Printf("Failed to template recipes for user %s with error: %v\n", userName, err)
+				http.Error(w, "Failed to template recipes", http.StatusInternalServerError)
+				return
+			}
 		} else {
 			log.Printf("Database error: %v\n", err)
 			http.Error(w, "Database Error", http.StatusInternalServerError)
