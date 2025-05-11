@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -42,6 +43,8 @@ const (
 		"### Instructionset 2" +
 		"- Steps\n" +
 		"All ingredients need to be in metric units."
+
+	judgeSystemMessage = "You are a judge AI agent that decides whether input is related to a recipe or not."
 )
 
 var pool *pgxpool.Pool
@@ -54,9 +57,8 @@ type RecipeRequest struct {
 }
 
 type RecipeGenerateRequest struct {
-	Recipename string `json:"recipename"`
-	Details    string `json:"details"`
-	IsGerman   bool   `json:"isGerman"`
+	RecipeDescription string `json:"recipedescription"`
+	IsGerman          bool   `json:"isGerman"`
 }
 
 type RecipeLinkRequest struct {
@@ -96,7 +98,7 @@ func main() {
 
 	mux.HandleFunc("/api/v1/add-recipe", HandleAddRecipe)
 
-	mux.HandleFunc("/api/v1/generate/by-name", HandleGenerateByName)
+	mux.HandleFunc("/api/v1/generate/by-description", HandlerJudgeMiddleware(HandleGenerateByDescription))
 
 	mux.HandleFunc("/api/v1/generate/by-link", HandleGenerateByLink)
 
@@ -386,7 +388,7 @@ func HandleUpdateRecipe(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func HandleGenerateByName(w http.ResponseWriter, r *http.Request) {
+func HandleGenerateByDescription(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
 		return
@@ -398,19 +400,27 @@ func HandleGenerateByName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Recipename == "" {
+	if req.RecipeDescription == "" {
+		log.Printf("missing recipe description")
 		http.Error(w, "Missing recipename", http.StatusBadRequest)
 		return
 	}
 
-	recipe, err := GenerateRecipeByName(req.Recipename, req.Details, req.IsGerman)
+	recipe, err := GenerateRecipeByName(req.RecipeDescription, req.IsGerman)
 	if err != nil {
 		http.Error(w, "Error generating recipe", http.StatusInternalServerError)
 		return
 	}
 
+	recipename, err := openAIgenerateRecipeName(recipe, req.IsGerman)
+	if err != nil {
+		log.Printf("Error generating recipe name: %v\n", err)
+		http.Error(w, "Error generating recipe name", http.StatusInternalServerError)
+		return
+	}
+
 	resp := Recipe{
-		Recipename: req.Recipename,
+		Recipename: recipename,
 		Recipe:     recipe,
 	}
 
@@ -587,7 +597,13 @@ func HandleGenerateRecipeByVoice(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("Transcript: %s\n", transcript)
 
-	recipe, err := openAIgenerateRecipe(transcript, "", isGerman)
+	if !isRecipeRelated(transcript) {
+		log.Printf("Input rejected by LLM judge")
+		http.Error(w, "Input rejected by LLM judge", http.StatusBadRequest)
+		return
+	}
+
+	recipe, err := openAIgenerateRecipe(transcript, isGerman)
 	if err != nil {
 		http.Error(w, "Error generating recipe", http.StatusInternalServerError)
 		log.Println("Error generating recipe via voice:", err)
@@ -671,8 +687,8 @@ func GenerateRecipeByLink(URL string, isGerman bool) (string, string, error) {
 	return recipename, recipe, nil
 }
 
-func GenerateRecipeByName(RecipeName string, Details string, isGerman bool) (string, error) {
-	recipe, err := openAIgenerateRecipe(RecipeName, Details, isGerman)
+func GenerateRecipeByName(RecipeName string, isGerman bool) (string, error) {
+	recipe, err := openAIgenerateRecipe(RecipeName, isGerman)
 	if err != nil {
 		fmt.Println("Error generating recipe:", err)
 		return "", err
@@ -729,25 +745,18 @@ func openAIclient() *openai.Client {
 	return client
 }
 
-func openAIgenerateRecipe(Recipename string, Details string, isGerman bool) (string, error) {
+func openAIgenerateRecipe(recipeDescription string, isGerman bool) (string, error) {
 	client := openAIclient()
 
 	var systemmessage openai.ChatCompletionMessageParamUnion
-	var usermessageString string
+	var usermessage openai.ChatCompletionMessageParamUnion
 
 	if isGerman {
 		systemmessage = openai.SystemMessage(germanSystemMessage)
-		usermessageString = "Erstelle ein Rezept für " + Recipename
+		usermessage = openai.UserMessage("Erstelle ein Rezept für folgende Beschreibung: " + recipeDescription)
 	} else {
 		systemmessage = openai.SystemMessage(englishSystemMessage)
-		usermessageString = "Generate a recipe for " + Recipename
-	}
-
-	var usermessage openai.ChatCompletionMessageParamUnion
-	if Details != "" {
-		usermessage = openai.UserMessage(usermessageString + " details: " + Details)
-	} else {
-		usermessage = openai.UserMessage(usermessageString + Recipename)
+		usermessage = openai.UserMessage("Generate a recipe for the following description: " + recipeDescription)
 	}
 
 	completion, err := client.Chat.Completions.New(context.TODO(), openai.ChatCompletionNewParams{
@@ -915,6 +924,30 @@ func goopenAIgenerateRecipeCategory(Recipe string) string {
 	return "Sonstiges"
 }
 
+func goopenAIChatCompletion(ctx context.Context, systemPrompt, userPrompt string, model string) (string, error) {
+	client := openAIclient()
+
+	messages := []openai.ChatCompletionMessageParamUnion{
+		openai.SystemMessage(systemPrompt),
+		openai.UserMessage(userPrompt),
+	}
+
+	completion, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+		Messages: openai.F(messages),
+		Model:    openai.F(model),
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("chat completion error: %w", err)
+	}
+
+	if len(completion.Choices) == 0 {
+		return "", errors.New("no completion choices returned")
+	}
+
+	return completion.Choices[0].Message.Content, nil
+}
+
 func goopenaiUpdateRecipe(Recipe string, Prompt string) (string, error) {
 	client := goopenai.NewClient(os.Getenv("OPENAI_KEY"))
 
@@ -942,6 +975,75 @@ func goopenaiUpdateRecipe(Recipe string, Prompt string) (string, error) {
 	return response.Choices[0].Message.Content, nil
 }
 
+func HandlerJudgeMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !HandlerIsRecipeRelated(r) {
+			log.Printf("Input rejected by LLM judge")
+			http.Error(w, "Input rejected by LLM judge", http.StatusBadRequest)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func HandlerIsRecipeRelated(r *http.Request) bool {
+	client := openAIclient()
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("Error reading request body: %v\n", err)
+		return false
+	}
+
+	log.Printf("Raw body: %s\n", string(bodyBytes))
+
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	var req RecipeGenerateRequest
+	err = json.Unmarshal(bodyBytes, &req)
+	if err != nil {
+		log.Printf("Error decoding request: %v\n", err)
+		return false
+	}
+
+	var systemmessage openai.ChatCompletionMessageParamUnion
+	systemmessage = openai.SystemMessage(judgeSystemMessage)
+
+	var usermessage openai.ChatCompletionMessageParamUnion
+	usermessage = openai.UserMessage("Is this input related to a recipe? Only answer with 'yes' or 'no'" + req.RecipeDescription)
+
+	completion, err := client.Chat.Completions.New(context.TODO(), openai.ChatCompletionNewParams{
+		Messages: openai.F([]openai.ChatCompletionMessageParamUnion{
+			systemmessage,
+			usermessage,
+		}),
+		Model: openai.F(openai.ChatModelGPT4oMini),
+	})
+	if err != nil {
+		log.Println("Error judging input:", err)
+		return false
+	}
+
+	log.Printf("Completion response: %s\n", completion.Choices[0].Message.Content)
+	return strings.Contains(completion.Choices[0].Message.Content, "yes")
+}
+
+func isRecipeRelated(recipe string) bool {
+	result, err := goopenAIChatCompletion(
+		context.TODO(),
+		judgeSystemMessage,
+		"Is this input related to a recipe? Only answer with 'yes' or 'no'"+recipe,
+		openai.ChatModelGPT4oMini,
+	)
+
+	if err != nil {
+		log.Println("Error judging input:", err)
+		return false
+	}
+
+	return strings.Contains(strings.ToLower(result), "yes")
+}
+
 func fixRecipe(recipe string) (string, error) {
 	client := goopenai.NewClient(os.Getenv("OPENAI_KEY"))
 
@@ -955,7 +1057,7 @@ func fixRecipe(recipe string) (string, error) {
 						Type: goopenai.ChatMessagePartTypeText,
 						Text: "Fix this recipe regarding formatting" +
 							"All ingredients need to be in metric units." +
-							"If in german do not be formally e.g. dont use Sie" +
+							"If in german do not be formal e.g. dont use Sie" +
 							"remove formatting errors e.g. ```markdown```",
 					},
 					{

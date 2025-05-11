@@ -102,7 +102,7 @@ func bootstrapStorageAccount(storageAccountName string, userid string) error {
 	}
 
 	const (
-		maxRetries = 5
+		maxRetries = 10
 		retryDelay = 5 * time.Second
 	)
 
