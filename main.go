@@ -14,7 +14,10 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/MicahParks/keyfunc"
+	"github.com/golang-jwt/jwt/v4"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/openai/openai-go"
@@ -44,10 +47,14 @@ const (
 		"- Steps\n" +
 		"All ingredients need to be in metric units."
 
-	judgeSystemMessage = "You are a judge AI agent that decides whether input is related to a recipe or not."
+	judgeSystemMessage = "You are a judge AI agent that decides whether input is related to cooking or not."
 )
 
-var pool *pgxpool.Pool
+var (
+	pool        *pgxpool.Pool
+	keycloakURL = os.Getenv("KEYCLOAK_URL")
+	jwks        *keyfunc.JWKS
+)
 
 type RecipeRequest struct {
 	Recipename     string `json:"recipename"`
@@ -84,6 +91,22 @@ type Recipe struct {
 	Category   string `json:"category,omitempty"`
 }
 
+type AuthContext struct {
+	OauthID  string
+	Email    string
+	Name     string
+	Provider string
+}
+
+type UserContext struct {
+	oauthID   string
+	UserID    int
+	Email     string
+	FullName  string
+	Provider  string
+	Subdomain string
+}
+
 func main() {
 	mux := http.NewServeMux()
 
@@ -92,11 +115,10 @@ func main() {
 		return
 	}
 
+	initJWKS()
 	initDBPool()
 
 	mux.HandleFunc("/health", HandleHealth)
-
-	mux.HandleFunc("/api/v1/add-recipe", HandleAddRecipe)
 
 	mux.HandleFunc("/api/v1/generate/by-description", HandlerJudgeMiddleware(HandleGenerateByDescription))
 
@@ -104,20 +126,22 @@ func main() {
 
 	mux.HandleFunc("/api/v1/generate/by-image", HandleGenerateByImage)
 
-	mux.HandleFunc("/api/v1/login", HandleLogin)
-
-	mux.HandleFunc("GET /api/v1/get-recipes", HandleGetRecipes)
-
 	mux.HandleFunc("POST /api/v1/generate/by-voice", HandleGenerateRecipeByVoice)
 
-	mux.HandleFunc("DELETE /api/v1/delete-recipe", HandleDeleteRecipe)
+	mux.HandleFunc("GET /api/v1/user-info", RequireAuth(LoginMiddleware(HandleGetUserInfo)))
 
-	mux.HandleFunc("POST /api/v1/update-recipe", HandleReprompt)
+	mux.HandleFunc("GET /api/v1/get-recipes", RequireAuth(LoginMiddleware(HandleGetRecipes)))
 
-	mux.HandleFunc("PATCH /api/v1/update-recipe", HandleUpdateRecipe)
+	mux.HandleFunc("POST /api/v1/add-recipe", RequireAuth(LoginMiddleware(HandleAddRecipe)))
+
+	mux.HandleFunc("DELETE /api/v1/delete-recipe", RequireAuth(LoginMiddleware(HandleDeleteRecipe)))
+
+	mux.HandleFunc("PATCH /api/v1/update-recipe", RequireAuth(LoginMiddleware(HandleUpdateRecipe)))
+
+	mux.HandleFunc("POST /api/v1/update-recipe", RequireAuth(LoginMiddleware(HandleReprompt)))
 
 	log.Println("Server is running on port 8080")
-	log.Fatal(http.ListenAndServe(":8080", logRequests(mux)))
+	log.Fatal(http.ListenAndServe(":8080", withCORS(logRequests(mux))))
 }
 
 func initDBPool() {
@@ -128,12 +152,166 @@ func initDBPool() {
 	}
 }
 
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", os.Getenv("CORS_ORIGIN"))
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Received request: Method=%s, URL=%s, Headers=%v, RemoteAddr=%s",
 			r.Method, r.URL.String(), r.Header, r.RemoteAddr)
 		next.ServeHTTP(w, r)
 	})
+}
+
+func RequireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			log.Printf("Missing or invalid Authorization header")
+			http.Error(w, "Missing bearer token", http.StatusUnauthorized)
+			return
+		}
+
+		tokenStr := strings.TrimPrefix(auth, "Bearer ")
+
+		token, err := jwt.Parse(tokenStr, jwks.Keyfunc)
+		if err != nil || !token.Valid {
+			log.Printf("Invalid token: %v", err)
+			http.Error(w, "Invalid token", http.StatusUnauthorized)
+			return
+		}
+
+		active, err := introspectToken(tokenStr)
+		if err != nil {
+			log.Printf("Introspection failed: %v", err)
+			http.Error(w, "Introspection failed", http.StatusUnauthorized)
+			return
+		}
+		if !active {
+			log.Printf("Inactive token")
+			http.Error(w, "Inactive token", http.StatusUnauthorized)
+			return
+		}
+
+		claims, ok := token.Claims.(jwt.MapClaims)
+		if !ok {
+			http.Error(w, "Invalid claims", http.StatusUnauthorized)
+			return
+		}
+
+		oauthID := fmt.Sprintf("%v", claims["sub"])
+		userName := fmt.Sprintf("%v", claims["name"])
+
+		ctx := context.WithValue(r.Context(), "auth", AuthContext{
+			OauthID: oauthID,
+			Email:   fmt.Sprintf("%v", claims["email"]),
+			Name:    userName,
+		})
+
+		next(w, r.WithContext(ctx))
+	}
+}
+
+func LoginMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		authCtx, ok := r.Context().Value("auth").(AuthContext)
+		if !ok {
+			http.Error(w, "Auth context missing", http.StatusInternalServerError)
+			return
+		}
+
+		userID, subdomain, err := Login(r.Context(), authCtx.OauthID, authCtx.Name, authCtx.Email, authCtx.Provider)
+		if err != nil {
+			http.Error(w, "Failed to initialize user: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		userCtx := UserContext{
+			oauthID:   authCtx.OauthID,
+			UserID:    userID,
+			Email:     authCtx.Email,
+			FullName:  authCtx.Name,
+			Provider:  authCtx.Provider,
+			Subdomain: subdomain,
+		}
+
+		ctx := context.WithValue(r.Context(), "user", userCtx)
+		next(w, r.WithContext(ctx))
+	}
+}
+
+func introspectToken(token string) (bool, error) {
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	introspectURL := keycloakURL + "/protocol/openid-connect/token/introspect"
+
+	clientID := "backend"
+	clientSecret := os.Getenv("KEYCLOAK_CLIENT_SECRET")
+
+	req, err := http.NewRequest("POST", introspectURL, strings.NewReader("token="+token))
+	if err != nil {
+		return false, err
+	}
+
+	req.SetBasicAuth(clientID, clientSecret)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return false, fmt.Errorf("introspection endpoint returned status %d", resp.StatusCode)
+	}
+
+	var introspectResp struct {
+		Active bool `json:"active"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&introspectResp)
+	if err != nil {
+		return false, err
+	}
+
+	return introspectResp.Active, nil
+}
+
+func HandleGetUserInfo(w http.ResponseWriter, r *http.Request) {
+	userCtx, ok := r.Context().Value("user").(UserContext)
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+
+	userInfo := map[string]interface{}{
+		"oauthID":   userCtx.oauthID,
+		"userID":    userCtx.UserID,
+		"email":     userCtx.Email,
+		"fullName":  userCtx.FullName,
+		"provider":  userCtx.Provider,
+		"subdomain": userCtx.Subdomain,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	err := json.NewEncoder(w).Encode(userInfo)
+	if err != nil {
+		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
+	}
 }
 
 func validateEnvVars() bool {
@@ -152,6 +330,14 @@ func validateEnvVars() bool {
 	return true
 }
 
+func initJWKS() {
+	var err error
+	jwks, err = keyfunc.Get(keycloakURL+"/protocol/openid-connect/certs", keyfunc.Options{})
+	if err != nil {
+		log.Fatalf("Failed to fetch JWKS: %v", err)
+	}
+}
+
 func HandleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -167,20 +353,25 @@ func HandleGetRecipes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if os.Getenv("LOCAL_DEV") == "true" {
-		mockAzureAuth(r)
+	userCtx, ok := r.Context().Value("user").(UserContext)
+	if !ok {
+		log.Println("User context missing in request")
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
 	}
 
-	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
+	oauthID := userCtx.oauthID
 
 	userID, _, err := GetUserInformation(oauthID)
 	if err != nil {
+		log.Printf("Error getting user ID from database: %v", err)
 		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
 		return
 	}
 
 	recipes, err := GetRecipes(userID)
 	if err != nil {
+		log.Printf("Error getting recipes: %v", err)
 		http.Error(w, "Error getting recipes", http.StatusInternalServerError)
 		return
 	}
@@ -190,13 +381,15 @@ func HandleGetRecipes(w http.ResponseWriter, r *http.Request) {
 
 	err = json.NewEncoder(w).Encode(recipes)
 	if err != nil {
+		log.Printf("Error encoding JSON response: %v", err)
 		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
 	}
 }
 
 func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+	userCtx, ok := r.Context().Value("user").(UserContext)
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
 		return
 	}
 
@@ -216,13 +409,7 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 		req.RecipeCategory = goopenAIgenerateRecipeCategory(req.Recipe)
 	}
 
-	if os.Getenv("LOCAL_DEV") == "true" {
-		mockAzureAuth(r)
-	}
-
-	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
-
-	userID, storageaccount, err := GetUserInformation(oauthID)
+	userID, storageaccount, err := GetUserInformation(userCtx.oauthID)
 	if err != nil {
 		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
 		return
@@ -252,26 +439,14 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 }
 
 func HandleDeleteRecipe(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
-		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if os.Getenv("LOCAL_DEV") == "true" {
-		mockAzureAuth(r)
-	}
-
-	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
-
-	userID, storageAccountName, err := GetUserInformation(oauthID)
-	if err != nil {
-		log.Println("Error getting user ID:", err)
-		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
+	userCtx, ok := r.Context().Value("user").(UserContext)
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
 		return
 	}
 
 	var req map[string]int
-	err = json.NewDecoder(r.Body).Decode(&req)
+	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
 		log.Println("Error decoding JSON:", err)
 		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
@@ -285,14 +460,14 @@ func HandleDeleteRecipe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = RemoveRecipeFromDB(userID, recipeID)
+	err = RemoveRecipeFromDB(userCtx.UserID, recipeID)
 	if err != nil {
 		log.Printf("Error removing recipe: %v\n", err)
 		http.Error(w, "Error removing recipe", http.StatusInternalServerError)
 		return
 	}
 
-	err = templateRecipesBlob(storageAccountName, userID)
+	err = templateRecipesBlob(userCtx.Subdomain, userCtx.UserID)
 	if err != nil {
 		log.Printf("Error updating recipe template: %v\n", err)
 		http.Error(w, "Error updating recipe template", http.StatusInternalServerError)
@@ -307,16 +482,9 @@ func HandleUpdateRecipe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
 		return
 	}
-
-	if os.Getenv("LOCAL_DEV") == "true" {
-		mockAzureAuth(r)
-	}
-
-	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
-	userID, storageAccountName, err := GetUserInformation(oauthID)
-	if err != nil {
-		log.Println("Error getting user ID:", err)
-		http.Error(w, "Error getting user ID", http.StatusInternalServerError)
+	userCtx, ok := r.Context().Value("user").(UserContext)
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
 		return
 	}
 
@@ -345,12 +513,12 @@ func HandleUpdateRecipe(w http.ResponseWriter, r *http.Request) {
         RETURNING id`
 
 	var recipeID int
-	err = pool.QueryRow(context.Background(), query,
+	err := pool.QueryRow(context.Background(), query,
 		updateReq.Recipename,
 		updateReq.Recipe,
 		updateReq.RecipeCategory,
 		updateReq.ID,
-		userID,
+		userCtx.UserID,
 	).Scan(&recipeID)
 
 	if err != nil {
@@ -366,13 +534,13 @@ func HandleUpdateRecipe(w http.ResponseWriter, r *http.Request) {
 	recipename := strings.ReplaceAll(updateReq.Recipename, " ", "-")
 	recipePath := "recipes/" + recipename + ".md"
 
-	if err := addBlob(storageAccountName, recipePath, updateReq.Recipe); err != nil {
+	if err := addBlob(userCtx.Subdomain, recipePath, updateReq.Recipe); err != nil {
 		log.Printf("Error updating recipe in blob storage: %v\n", err)
 		http.Error(w, "Failed to update recipe in storage", http.StatusInternalServerError)
 		return
 	}
 
-	if err := templateRecipesBlob(storageAccountName, userID); err != nil {
+	if err := templateRecipesBlob(userCtx.Subdomain, userCtx.UserID); err != nil {
 		log.Printf("Error updating recipe template: %v\n", err)
 		http.Error(w, "Failed to update recipe template", http.StatusInternalServerError)
 		return
@@ -1024,8 +1192,8 @@ func HandlerIsRecipeRelated(r *http.Request) bool {
 		return false
 	}
 
-	log.Printf("Completion response: %s\n", completion.Choices[0].Message.Content)
-	return strings.Contains(completion.Choices[0].Message.Content, "yes")
+	log.Printf("Completion response: %s\n", strings.ToLower(completion.Choices[0].Message.Content))
+	return strings.Contains(strings.ToLower(completion.Choices[0].Message.Content), "yes")
 }
 
 func isRecipeRelated(recipe string) bool {
@@ -1042,36 +1210,6 @@ func isRecipeRelated(recipe string) bool {
 	}
 
 	return strings.Contains(strings.ToLower(result), "yes")
-}
-
-func fixRecipe(recipe string) (string, error) {
-	client := goopenai.NewClient(os.Getenv("OPENAI_KEY"))
-
-	response, err := client.CreateChatCompletion(context.Background(), goopenai.ChatCompletionRequest{
-		Model: goopenai.GPT4oMini,
-		Messages: []goopenai.ChatCompletionMessage{
-			{
-				Role: goopenai.ChatMessageRoleUser,
-				MultiContent: []goopenai.ChatMessagePart{
-					{
-						Type: goopenai.ChatMessagePartTypeText,
-						Text: "Fix this recipe regarding formatting" +
-							"All ingredients need to be in metric units." +
-							"If in german do not be formal e.g. dont use Sie" +
-							"remove formatting errors e.g. ```markdown```",
-					},
-					{
-						Type: goopenai.ChatMessagePartTypeText,
-						Text: recipe,
-					},
-				},
-			},
-		},
-	})
-	if err != nil {
-		return "Error while fixing Recipe", err
-	}
-	return response.Choices[0].Message.Content, nil
 }
 
 func EncodeImageToBase64(imageData io.Reader) (string, error) {
@@ -1113,70 +1251,37 @@ func GetWebsite(link string) (string, error) {
 	return string(content), nil
 }
 
-func mockAzureAuth(r *http.Request) {
-	// r.Header.Set("X-MS-CLIENT-PRINCIPAL-ID", "8e888379-a76f-4aba-9860-183b913c0719")
-	r.Header.Set("X-MS-CLIENT-PRINCIPAL-ID", "8e888379-a76f-4aba-5678-183b913c0719")
-	r.Header.Set("X-MS-CLIENT-PRINCIPAL-NAME", "ilijakovac1@googlemail.com")
-	r.Header.Set("X-MS-CLIENT-PRINCIPAL-IDP", "aad")
-}
-
-func HandleLogin(w http.ResponseWriter, r *http.Request) {
-	if os.Getenv("LOCAL_DEV") == "true" {
-		mockAzureAuth(r)
-	}
-	oauthID := r.Header.Get("X-MS-CLIENT-PRINCIPAL-ID")
-	userName := r.Header.Get("X-MS-CLIENT-PRINCIPAL-NAME")
-	provider := r.Header.Get("X-MS-CLIENT-PRINCIPAL-IDP")
-	if oauthID == "" || userName == "" || provider == "" {
-		http.Error(w, "Unauthorized: Missing authentication headers", http.StatusUnauthorized)
-		return
-	}
-
+func Login(ctx context.Context, oauthID, userName, email, provider string) (int, string, error) {
 	var storageAccountName string
-	err := pool.QueryRow(context.Background(), "SELECT subdomain FROM users WHERE oauth_id = $1", oauthID).Scan(&storageAccountName)
+	var userID int
+
+	err := pool.QueryRow(ctx, "SELECT subdomain, id FROM users WHERE oauth_id = $1", oauthID).Scan(&storageAccountName, &userID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// User doesn't exist, create new user
 			storageAccountName, err = randomString()
 			if err != nil {
-				log.Printf("Failed to generate random string: %v\n", err)
-				http.Error(w, "Failed to generate random string", http.StatusInternalServerError)
-				return
+				return 0, "", fmt.Errorf("failed to generate random string: %w", err)
 			}
 
-			_, err = pool.Exec(context.Background(), "INSERT INTO users (oauth_id, name, oauth_provider, subdomain) VALUES ($1, $2, $3, $4)", oauthID, userName, provider, storageAccountName)
+			err = pool.QueryRow(ctx, "INSERT INTO users (oauth_id, name, email, oauth_provider, subdomain) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+				oauthID, userName, email, provider, storageAccountName).Scan(&userID)
 			if err != nil {
-				http.Error(w, "Database Error Failed to create user", http.StatusInternalServerError)
-				log.Printf("Failed to create user %s with error: %v\n", userName, err)
-				return
+				return 0, "", fmt.Errorf("failed to create user: %w", err)
 			}
 
-			err = bootstrapStorageAccount(storageAccountName, oauthID)
-			if err != nil {
-				http.Error(w, "Failed to bootstrap static website", http.StatusInternalServerError)
-				log.Printf("Failed to bootstrap static website for user %s with error: %v\n", userName, err)
-				return
+			if err = bootstrapStorageAccount(storageAccountName, oauthID); err != nil {
+				return 0, "", fmt.Errorf("failed to bootstrap storage account: %w", err)
 			}
 
-			userID, _, _ := GetUserInformation(oauthID)
-			err = templateRecipesBlob(storageAccountName, userID)
-			if err != nil {
-				log.Printf("Failed to template recipes for user %s with error: %v\n", userName, err)
-				http.Error(w, "Failed to template recipes", http.StatusInternalServerError)
-				return
+			if err = templateRecipesBlob(storageAccountName, userID); err != nil {
+				return 0, "", fmt.Errorf("failed to template recipes: %w", err)
 			}
 		} else {
-			log.Printf("Database error: %v\n", err)
-			http.Error(w, "Database Error", http.StatusInternalServerError)
-			return
+			return 0, "", fmt.Errorf("database error: %w", err)
 		}
 	}
 
-	w.Header().Set("X-USER-NAME", userName)
-	w.Header().Set("X-USER-ID", oauthID)
-	w.Header().Set("X-USER-PROVIDER", provider)
-	w.Header().Set("X-USER-STORAGEACCOUNT", storageAccountName)
-	w.WriteHeader(http.StatusOK)
+	return userID, storageAccountName, nil
 }
 
 func randomString() (string, error) {
