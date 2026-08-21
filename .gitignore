@@ -6,3 +6,5 @@
 terraform*
 /.terraform.tfstate.lock.info
 *.pem
+.env
+main
