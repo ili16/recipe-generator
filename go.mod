@@ -6,7 +6,7 @@ require (
 	github.com/MicahParks/keyfunc v1.9.0
 	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/jackc/pgx/v5 v5.8.0
-	github.com/openai/openai-go v0.1.0-alpha.43
+	github.com/openai/openai-go v1.12.0
 	github.com/pemistahl/lingua-go v1.4.0
 	github.com/pressly/goose/v3 v3.27.0
 	github.com/sashabaranov/go-openai v1.38.0

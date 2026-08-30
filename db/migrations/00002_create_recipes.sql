@@ -7,7 +7,7 @@ CREATE TABLE recipes
     user_id               INT            NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     title                 TEXT           NOT NULL,
     summary               TEXT,
-    category              TEXT           NOT NULL DEFAULT 'Sonstiges',
+    category              TEXT           NOT NULL DEFAULT 'other',
     language              TEXT           NOT NULL DEFAULT 'en',
     servings              INT,
     prep_minutes          INT,

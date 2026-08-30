@@ -2,6 +2,63 @@
 
 This file provides working guidance for the Go backend in this folder.
 
+## Flows
+
+### User journey
+
+```mermaid
+flowchart TD
+    INPUT[User input\ntext · URL · image] --> GEN[POST /generate]
+    GEN --> REVIEW[Review Screen\nStructured recipe]
+
+    REVIEW -->|global change\ne.g. make it vegan| REFINE[POST /refine-recipe\noptional auth]
+    REFINE --> REVIEW
+
+    REVIEW -->|per-item note| VALIDATE[POST /validate-changes]
+    VALIDATE -->|clean| UPDATE_ITEM[POST /update-item ×N]
+    VALIDATE -->|flags| MODAL[Warning modal]
+    MODAL -->|proceed anyway| UPDATE_ITEM
+    UPDATE_ITEM --> REVIEW
+
+    REVIEW -->|step question| ASK[POST /ask-step\nanswered inline]
+    ASK --> REVIEW
+
+    REVIEW -->|save| AUTH{Logged in?}
+    AUTH -->|yes| SAVE[POST /add-recipe]
+    AUTH -->|no| LOGIN[Sign-in → Keycloak OIDC]
+    SAVE --> MYRECIPES[My Recipes]
+
+    MYRECIPES -->|refine saved recipe| REFINE
+    MYRECIPES -->|delete| DEL[DELETE /delete-recipe/:id]
+    MYRECIPES -->|rename / manual edit| PATCH[PATCH /update-recipe]
+```
+
+### API endpoints by auth requirement
+
+```mermaid
+graph LR
+    subgraph anon["No auth"]
+        G[POST /generate]
+        S[POST /suggest]
+        SP[POST /suggest-prefs]
+        UI[POST /update-item]
+        VC[POST /validate-changes]
+        AS[POST /ask-step]
+    end
+    subgraph optional["Optional auth\nidentified if token present"]
+        RR[POST /refine-recipe]
+    end
+    subgraph required["Auth required"]
+        AR[POST /add-recipe]
+        GR[GET /get-recipes]
+        DR[DELETE /delete-recipe/:id]
+        UR[PATCH /update-recipe]
+        UF[GET /user-info]
+    end
+```
+
+> **Rate limiting hook**: `auth.FromContext(r.Context())` on `/refine-recipe` returns the user if authenticated (limit by user ID) or empty (limit by IP). All other expensive endpoints are either free-tier anonymous or gated behind auth.
+
 ## What This Service Does
 
 Recipe API with:

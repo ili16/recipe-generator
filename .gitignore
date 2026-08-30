@@ -8,3 +8,4 @@ terraform*
 *.pem
 .env
 main
+.DS_Store

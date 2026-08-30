@@ -221,3 +221,45 @@ func bearerToken(r *http.Request) string {
 func unauthorized(w http.ResponseWriter, msg string) {
 	http.Error(w, msg, http.StatusUnauthorized)
 }
+
+// Optional enriches the context with the authenticated user if a valid token is present, but never rejects the request.
+func (a *Authenticator) Optional(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		raw := bearerToken(r)
+		if raw == "" {
+			next(w, r)
+			return
+		}
+		claims, err := a.parse(raw)
+		if err != nil {
+			next(w, r)
+			return
+		}
+		if a.cfg.Introspect {
+			active, err := a.introspect(r.Context(), raw)
+			if err != nil || !active {
+				next(w, r)
+				return
+			}
+		}
+		subject := claims.stringClaim("sub")
+		if subject == "" {
+			next(w, r)
+			return
+		}
+		user := User{
+			Subject:  subject,
+			Email:    claims.stringClaim("email"),
+			Name:     claims.displayName(),
+			Provider: claims.provider(),
+		}
+		id, err := a.provisioner.EnsureUser(r.Context(), user.Subject, user.Email, user.Name, user.Provider)
+		if err != nil {
+			slog.Warn("auth: optional provision failed, continuing as anonymous", "error", err)
+			next(w, r)
+			return
+		}
+		user.ID = id
+		next(w, r.WithContext(withUser(r.Context(), user)))
+	}
+}

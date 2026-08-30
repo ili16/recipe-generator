@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -15,13 +14,7 @@ import (
 	"github.com/ili16/recipe-generator/internal/service"
 	"github.com/ili16/recipe-generator/internal/storage"
 	"github.com/jackc/pgx/v5"
-	goopenai "github.com/sashabaranov/go-openai"
 )
-
-type RecipeChangeRequest struct {
-	Recipe       string `json:"recipe"`
-	ChangePrompt string `json:"changePrompt"`
-}
 
 func main() {
 	if os.Getenv("LOG_LEVEL") == "debug" {
@@ -46,13 +39,22 @@ func main() {
 	mux.HandleFunc("GET /health", HandleHealth)
 
 	mux.HandleFunc("POST /api/v1/generate", service.HandleGenerateRecipe)
+	mux.HandleFunc("POST /api/v1/transcribe", service.HandleTranscribeAudio)
+	mux.HandleFunc("POST /api/v1/suggest", service.HandleSuggestInput)
+	mux.HandleFunc("POST /api/v1/suggest-prefs", service.HandleSuggestPrefs)
+	mux.HandleFunc("POST /api/v1/update-item", service.HandleUpdateItem)
+	mux.HandleFunc("POST /api/v1/validate-changes", service.HandleValidateChanges)
+	mux.HandleFunc("POST /api/v1/ask-step", service.HandleAskStep)
+	mux.HandleFunc("POST /api/v1/cooking-chat", service.HandleCookingChat)
+	mux.HandleFunc("POST /api/v1/refine-recipe", authenticator.Optional(service.HandleRefineRecipe))
+
+	mux.HandleFunc("GET /api/v1/recipes/{id}", authenticator.Require(HandleGetRecipeByID))
 
 	mux.HandleFunc("GET /api/v1/user-info", authenticator.Require(HandleGetUserInfo))
 	mux.HandleFunc("GET /api/v1/get-recipes", authenticator.Require(HandleGetRecipes))
 	mux.HandleFunc("POST /api/v1/add-recipe", authenticator.Require(service.HandleAddRecipe))
 	mux.HandleFunc("DELETE /api/v1/delete-recipe/{id}", authenticator.Require(HandleDeleteRecipe))
 	mux.HandleFunc("PATCH /api/v1/update-recipe", authenticator.Require(HandleUpdateRecipe))
-	mux.HandleFunc("POST /api/v1/update-recipe", authenticator.Require(HandleReprompt))
 
 	addr := ":" + envOrDefault("PORT", "8080")
 	slog.Info("Server is running", "addr", addr)
@@ -117,6 +119,7 @@ func (r *statusRecorder) WriteHeader(code int) {
 }
 
 func HandleGetUserInfo(w http.ResponseWriter, r *http.Request) {
+	slog.Debug("handler: get user info")
 	user, ok := auth.FromContext(r.Context())
 	if !ok {
 		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
@@ -146,7 +149,32 @@ func HandleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "Healthy"})
 }
 
+func HandleGetRecipeByID(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	recipeID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || recipeID <= 0 {
+		http.Error(w, "invalid recipe id", http.StatusBadRequest)
+		return
+	}
+	recipe, err := storage.GetRecipeByID(r.Context(), user.ID, recipeID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("Error getting recipe by id", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, recipe)
+}
+
 func HandleGetRecipes(w http.ResponseWriter, r *http.Request) {
+	slog.Debug("handler: get recipes")
 	user, ok := auth.FromContext(r.Context())
 	if !ok {
 		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
@@ -167,6 +195,7 @@ func HandleGetRecipes(w http.ResponseWriter, r *http.Request) {
 }
 
 func HandleDeleteRecipe(w http.ResponseWriter, r *http.Request) {
+	slog.Debug("handler: delete recipe", "id", r.PathValue("id"))
 	user, ok := auth.FromContext(r.Context())
 	if !ok {
 		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
@@ -189,6 +218,7 @@ func HandleDeleteRecipe(w http.ResponseWriter, r *http.Request) {
 }
 
 func HandleUpdateRecipe(w http.ResponseWriter, r *http.Request) {
+	slog.Debug("handler: update recipe")
 	user, ok := auth.FromContext(r.Context())
 	if !ok {
 		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
@@ -225,49 +255,6 @@ func HandleUpdateRecipe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, updated)
-}
-
-func HandleReprompt(w http.ResponseWriter, r *http.Request) {
-	var req RecipeChangeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
-		return
-	}
-
-	if req.Recipe == "" || req.ChangePrompt == "" {
-		http.Error(w, "Missing recipe or changePrompt", http.StatusBadRequest)
-		return
-	}
-
-	updatedRecipe, err := goopenaiUpdateRecipe(r.Context(), req.Recipe, req.ChangePrompt)
-	if err != nil {
-		http.Error(w, "Error generating recipe", http.StatusInternalServerError)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, model.Recipe{Recipe: updatedRecipe})
-}
-
-func goopenaiUpdateRecipe(ctx context.Context, recipe string, prompt string) (string, error) {
-	client := goopenai.NewClient(os.Getenv("OPENAI_KEY"))
-
-	response, err := client.CreateChatCompletion(ctx, goopenai.ChatCompletionRequest{
-		Model: goopenai.GPT4oMini,
-		Messages: []goopenai.ChatCompletionMessage{
-			{
-				Role: goopenai.ChatMessageRoleUser,
-				Content: "The user requested that you change the following recipe: " +
-					recipe + " according to the following prompt: " + prompt +
-					" keep the recipe in the same format and language" +
-					" only respond with the recipe and nothing else",
-			},
-		},
-	})
-	if err != nil {
-		slog.Error("Error updating recipe", "error", err)
-		return "", err
-	}
-	return response.Choices[0].Message.Content, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

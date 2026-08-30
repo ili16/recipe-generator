@@ -1,9 +1,9 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -16,7 +16,50 @@ import (
 	"github.com/openai/openai-go"
 )
 
+// namedReader wraps an io.Reader with a filename so the OpenAI SDK sends the correct Content-Disposition.
+type namedReader struct {
+	io.Reader
+	name string
+}
+
+func (n namedReader) Name() string { return n.name }
+
+func HandleTranscribeAudio(w http.ResponseWriter, r *http.Request) {
+	slog.Debug("handler: transcribe audio")
+	if r.Method != http.MethodPost {
+		http.Error(w, "invalid method", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseMultipartForm(25 << 20); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	file, header, err := r.FormFile("audio")
+	if err != nil {
+		http.Error(w, "audio file required", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	client := OpenAIclient()
+	transcription, err := client.Audio.Transcriptions.New(r.Context(), openai.AudioTranscriptionNewParams{
+		File:  namedReader{Reader: file, name: header.Filename},
+		Model: openai.AudioModelWhisper1,
+	})
+	if err != nil {
+		slog.Error("transcription failed", "error", err)
+		http.Error(w, "transcription failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]string{"text": transcription.Text}); err != nil {
+		slog.Error("Error encoding JSON response", "error", err)
+	}
+}
+
 func HandleGenerateRecipe(w http.ResponseWriter, r *http.Request) {
+	slog.Debug("handler: generate recipe")
 	if r.Method != http.MethodPost {
 		http.Error(w, "invalid method", http.StatusMethodNotAllowed)
 		return
@@ -38,22 +81,40 @@ func HandleGenerateRecipe(w http.ResponseWriter, r *http.Request) {
 		image = file
 	}
 
+	source := "text"
+	if image != nil {
+		source = "image"
+	} else if url != "" {
+		source = "url"
+	}
+	slog.Debug("handler: generate recipe source", "source", source)
+
+	if prompt != "" && !isRecipeRelated(r.Context(), prompt) {
+		http.Error(w, "Not a cooking-related request", http.StatusUnprocessableEntity)
+		return
+	}
+
 	input := model.GenerateRecipeInput{
 		Prompt: prompt,
 		URL:    url,
 		Image:  image,
 	}
 
-	generatedRecipe, name, err := GenerateRecipe(input)
+	doc, err := GenerateRecipe(input)
+	if err != nil {
+		slog.Error("Error generating recipe", "error", err)
+		http.Error(w, "Error generating recipe", http.StatusInternalServerError)
+		return
+	}
 
 	resp := model.Recipe{
-		Recipename: name,
-		Recipe:     generatedRecipe,
+		Recipename: doc.Title,
+		Recipe:     RenderMarkdown(doc),
+		Structured: &doc,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w).Encode(resp)
-	if err != nil {
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		slog.Error("Error encoding JSON response", "error", err)
 		return
@@ -61,6 +122,7 @@ func HandleGenerateRecipe(w http.ResponseWriter, r *http.Request) {
 }
 
 func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
+	slog.Debug("handler: add recipe")
 	user, ok := auth.FromContext(r.Context())
 	if !ok {
 		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
@@ -68,8 +130,7 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req model.Recipe
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
 		return
 	}
@@ -79,11 +140,18 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Category == "" {
-		req.Category = goopenAIgenerateRecipeCategory(req.Recipe)
+	slog.Debug("handler: add recipe saving", "user_id", user.ID, "structured", req.Structured != nil)
+	var created model.Recipe
+	var err error
+	if req.Structured != nil {
+		content := RenderMarkdown(*req.Structured)
+		created, err = storage.AddRecipeStructured(r.Context(), user.ID, *req.Structured, content)
+	} else {
+		if req.Category == "" {
+			req.Category = classifyCategory(r.Context(), req.Recipe)
+		}
+		created, err = storage.AddRecipe(r.Context(), user.ID, req.Recipename, req.Recipe, req.Category)
 	}
-
-	created, err := storage.AddRecipe(r.Context(), user.ID, req.Recipename, req.Recipe, req.Category)
 	if err != nil {
 		http.Error(w, "Error adding recipe", http.StatusInternalServerError)
 		return
@@ -96,44 +164,345 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func HandlerIsRecipeRelated(r *http.Request) bool {
-	client := OpenAIclient()
-
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		slog.Error("Error reading request body", "error", err)
-		return false
+// HandleSuggestInput returns a short LLM-generated sentence completion for the input box.
+func HandleSuggestInput(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Input string `json:"input"`
 	}
-
-	slog.Debug("Raw request body", "body", string(bodyBytes))
-
-	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-
-	var req model.GenerateRecipeInput
-	err = json.Unmarshal(bodyBytes, &req)
-	if err != nil {
-		slog.Error("Error decoding request", "error", err)
-		return false
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Input) == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
 	}
-
-	var systemmessage openai.ChatCompletionMessageParamUnion
-	systemmessage = openai.SystemMessage(judgeSystemMessage)
-
-	var usermessage openai.ChatCompletionMessageParamUnion
-	usermessage = openai.UserMessage("Is this input related to a service? Only answer with 'yes' or 'no'" + req.Prompt)
-
-	completion, err := client.Chat.Completions.New(context.TODO(), openai.ChatCompletionNewParams{
-		Messages: openai.F([]openai.ChatCompletionMessageParamUnion{
-			systemmessage,
-			usermessage,
-		}),
-		Model: openai.F(openai.ChatModelGPT4oMini),
-	})
-	if err != nil {
-		slog.Error("Error judging input", "error", err)
-		return false
+	if len(req.Input) > 300 {
+		req.Input = req.Input[:300]
 	}
+	if !isRecipeRelated(r.Context(), req.Input) {
+		http.Error(w, "Not a cooking-related request", http.StatusUnprocessableEntity)
+		return
+	}
+	suggestion, err := suggestCompletion(r.Context(), req.Input)
+	if err != nil {
+		slog.Warn("suggest completion failed", "error", err)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(struct {
+		Suggestion string `json:"suggestion"`
+	}{Suggestion: suggestion})
+}
 
-	slog.Debug("Completion response", "content", strings.ToLower(completion.Choices[0].Message.Content))
-	return strings.Contains(strings.ToLower(completion.Choices[0].Message.Content), "yes")
+func suggestCompletion(ctx context.Context, input string) (string, error) {
+	return goopenAIChatCompletion(ctx,
+		"You are a recipe assistant. Complete the user's dish description naturally in 3-8 words. Output only the completion — not the original text, no quotes, no punctuation at the start.",
+		input,
+		string(openai.ChatModelGPT4oMini),
+	)
+}
+
+// PrefQuestion is a single contextual clarifying question returned by /suggest-prefs.
+type PrefQuestion struct {
+	ID      string   `json:"id"`
+	Label   string   `json:"label"`
+	Type    string   `json:"type"`
+	Options []string `json:"options"`
+}
+
+const suggestPrefsSystemPrompt = `You are a recipe assistant. Given a partial dish description, suggest 2–3 short clarifying questions to personalise the recipe.
+
+Return ONLY a JSON array (no markdown, no explanation):
+[{"id":"snake_case","label":"Short label","type":"either-or","options":["A","B","C"]}]
+
+Rules:
+- "type" is "either-or" (pick one) or "add-on" (pick many)
+- 2-3 questions max, 2-4 options each, option text ≤ 3 words
+- Never ask about something already stated in the input
+- If input contains "vegan", omit vegetarian/dairy options (already implied)
+- Always include a servings question unless the user stated a quantity
+- Focus on what actually changes this specific dish (cut of meat, cooking method, sauce style…)
+
+Examples
+Input: steak with bearnaise
+Output: [{"id":"servings","label":"Servings","type":"either-or","options":["1-2","3-4","5+"]},{"id":"cut","label":"Which cut?","type":"either-or","options":["Ribeye","Filet mignon","NY strip"]},{"id":"doneness","label":"Doneness","type":"either-or","options":["Rare","Medium-rare","Well done"]}]
+
+Input: vegan cheesecake
+Output: [{"id":"servings","label":"Servings","type":"either-or","options":["1-2","3-4","5+"]},{"id":"crust","label":"Crust type","type":"either-or","options":["Graham cracker","Oreo","Nut-based"]}]
+
+Input: quick pasta for 4
+Output: [{"id":"protein","label":"Protein","type":"either-or","options":["Chicken","Shrimp","Vegetarian"]},{"id":"sauce","label":"Sauce style","type":"either-or","options":["Tomato","Cream","Olive oil"]}]`
+
+// HandleSuggestPrefs returns contextual clarifying questions for the current input.
+func HandleSuggestPrefs(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Input string `json:"input"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Input) == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if len(req.Input) > 300 {
+		req.Input = req.Input[:300]
+	}
+	if !isRecipeRelated(r.Context(), req.Input) {
+		http.Error(w, "Not a cooking-related request", http.StatusUnprocessableEntity)
+		return
+	}
+	raw, err := goopenAIChatCompletion(r.Context(), suggestPrefsSystemPrompt, req.Input, string(openai.ChatModelGPT4oMini))
+	if err != nil {
+		slog.Warn("suggest-prefs failed", "error", err)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	// Strip markdown code fences if model wraps the JSON
+	raw = strings.TrimSpace(raw)
+	if idx := strings.Index(raw, "["); idx >= 0 {
+		raw = raw[idx:]
+	}
+	if idx := strings.LastIndex(raw, "]"); idx >= 0 {
+		raw = raw[:idx+1]
+	}
+	var questions []PrefQuestion
+	if err := json.Unmarshal([]byte(raw), &questions); err != nil {
+		slog.Warn("suggest-prefs parse failed", "error", err, "raw", raw)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(struct {
+		Questions []PrefQuestion `json:"questions"`
+	}{Questions: questions})
+}
+
+// HandleUpdateItem updates a single ingredient or step text in-place via LLM.
+func HandleUpdateItem(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Current     string `json:"current"`
+		Instruction string `json:"instruction"`
+		Context     string `json:"context"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Current) == "" || strings.TrimSpace(req.Instruction) == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if !isRecipeRelated(r.Context(), req.Instruction) {
+		http.Error(w, "Not a cooking-related request", http.StatusUnprocessableEntity)
+		return
+	}
+	sys := "You are updating a single ingredient or step in a recipe. Return ONLY the updated text. Be concise. No explanation, no quotes, no punctuation prefix."
+	if c := strings.TrimSpace(req.Context); c != "" {
+		sys += " Recipe context: " + c
+	}
+	updated, err := goopenAIChatCompletion(r.Context(), sys,
+		fmt.Sprintf("Current: %s\nInstruction: %s", req.Current, req.Instruction),
+		string(openai.ChatModelGPT4oMini))
+	if err != nil {
+		slog.Warn("update-item failed", "error", err)
+		http.Error(w, "update failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(struct {
+		Updated string `json:"updated"`
+	}{Updated: strings.TrimSpace(updated)})
+}
+
+const validateChangesSystemPrompt = `You are an expert chef reviewing proposed recipe changes.
+Analyze each change marked with [USER WANTS TO REMOVE] or [USER NOTE: ...] and flag only those that are:
+1. Culinarily impossible (removes an essential structural ingredient)
+2. Would produce an inedible or unsafe result
+3. Fundamentally contradict the core cooking technique
+
+Return ONLY a JSON array. Empty array [] if no issues:
+[{"type":"ingredient","idx":0,"item":"eggs","message":"Short explanation why this is problematic (1-2 sentences)","suggestion":"What the user could do instead (1 sentence)"}]
+
+Do NOT flag: optional ingredients, reasonable substitutions, portion changes, timing tweaks, or style preferences.`
+
+type ChangeValidationReq struct {
+	RecipeName         string               `json:"recipe_name"`
+	Structured         model.RecipeDocument `json:"structured"`
+	IngredientRemovals []int                `json:"ingredient_removals"`
+	IngredientComments map[string]string    `json:"ingredient_comments"`
+	StepComments       map[string]string    `json:"step_comments"`
+}
+
+type RecipeChangeFlag struct {
+	Type       string `json:"type"`
+	Idx        int    `json:"idx"`
+	Item       string `json:"item"`
+	Message    string `json:"message"`
+	Suggestion string `json:"suggestion"`
+}
+
+// HandleValidateChanges validates proposed recipe changes for culinary feasibility.
+func HandleValidateChanges(w http.ResponseWriter, r *http.Request) {
+	var req ChangeValidationReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	type validationResp struct {
+		Flags      []RecipeChangeFlag `json:"flags"`
+		CanProceed bool               `json:"can_proceed"`
+	}
+	if len(req.Structured.Ingredients) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(validationResp{Flags: []RecipeChangeFlag{}, CanProceed: true})
+		return
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Recipe: %s\n\nIngredients:\n", req.RecipeName)
+	for i, ing := range req.Structured.Ingredients {
+		marker := ""
+		for _, ri := range req.IngredientRemovals {
+			if ri == i {
+				marker = " [USER WANTS TO REMOVE]"
+				break
+			}
+		}
+		if marker == "" {
+			if note, ok := req.IngredientComments[fmt.Sprintf("%d", i)]; ok && note != "" {
+				marker = fmt.Sprintf(" [USER NOTE: %s]", note)
+			}
+		}
+		fmt.Fprintf(&b, "  %d. %s%s\n", i, ing.Item, marker)
+	}
+	fmt.Fprintf(&b, "\nSteps:\n")
+	for i, step := range req.Structured.Steps {
+		marker := ""
+		if note, ok := req.StepComments[fmt.Sprintf("%d", i)]; ok && note != "" {
+			marker = fmt.Sprintf(" [USER NOTE: %s]", note)
+		}
+		fmt.Fprintf(&b, "  %d. %s%s\n", i, step.StepText, marker)
+	}
+	raw, err := goopenAIChatCompletion(r.Context(), validateChangesSystemPrompt, b.String(), string(openai.ChatModelGPT4oMini))
+	flags := []RecipeChangeFlag{}
+	if err == nil {
+		raw = strings.TrimSpace(raw)
+		if idx := strings.Index(raw, "["); idx >= 0 {
+			raw = raw[idx:]
+		}
+		if idx := strings.LastIndex(raw, "]"); idx >= 0 {
+			raw = raw[:idx+1]
+		}
+		var parsed []RecipeChangeFlag
+		if jsonErr := json.Unmarshal([]byte(raw), &parsed); jsonErr == nil && parsed != nil {
+			flags = parsed
+		}
+	} else {
+		slog.Warn("validate-changes llm failed", "error", err)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(validationResp{Flags: flags, CanProceed: true})
+}
+
+// HandleAskStep answers a user's question about a specific recipe step immediately.
+func HandleAskStep(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RecipeName string `json:"recipe_name"`
+		StepText   string `json:"step_text"`
+		Question   string `json:"question"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.StepText) == "" || strings.TrimSpace(req.Question) == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if len(req.Question) > 500 {
+		req.Question = req.Question[:500]
+	}
+	if !isRecipeRelated(r.Context(), req.Question) {
+		http.Error(w, "Not a cooking-related request", http.StatusUnprocessableEntity)
+		return
+	}
+	sys := fmt.Sprintf(`You are a cooking assistant. Answer the user's question about a recipe step. Be concise and practical (2-4 sentences). Recipe: "%s". Step: "%s"`, req.RecipeName, req.StepText)
+	answer, err := goopenAIChatCompletion(r.Context(), sys, req.Question, string(openai.ChatModelGPT4oMini))
+	if err != nil {
+		slog.Warn("ask-step llm failed", "error", err)
+		http.Error(w, "failed to answer", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(struct {
+		Answer string `json:"answer"`
+	}{Answer: strings.TrimSpace(answer)})
+}
+
+// HandleCookingChat answers cooking questions with full recipe context — handles both step-specific
+// and general questions (e.g. "what if I forgot the eggs?").
+func HandleCookingChat(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RecipeName string `json:"recipe_name"`
+		Recipe     string `json:"recipe"`
+		Question   string `json:"question"`
+		StepText   string `json:"step_text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Question) == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if len(req.Question) > 500 {
+		req.Question = req.Question[:500]
+	}
+	if !isRecipeRelated(r.Context(), req.Question) {
+		http.Error(w, "Not a cooking-related request", http.StatusUnprocessableEntity)
+		return
+	}
+	recipeCtx := req.Recipe
+	if len(recipeCtx) > 2000 {
+		recipeCtx = recipeCtx[:2000]
+	}
+	sys := fmt.Sprintf("You are a helpful cooking assistant. The user is currently cooking \"%s\". Answer their question concisely and practically (2-4 sentences).", req.RecipeName)
+	if recipeCtx != "" {
+		sys += "\n\nRecipe:\n" + recipeCtx
+	}
+	if step := strings.TrimSpace(req.StepText); step != "" {
+		sys += "\n\nCurrent step: " + step
+	}
+	answer, err := goopenAIChatCompletion(r.Context(), sys, req.Question, string(openai.ChatModelGPT4oMini))
+	if err != nil {
+		slog.Warn("cooking-chat llm failed", "error", err)
+		http.Error(w, "failed to answer", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(struct {
+		Answer string `json:"answer"`
+	}{Answer: strings.TrimSpace(answer)})
+}
+
+// HandleRefineRecipe applies a global natural-language instruction to a recipe and returns a new structured document.
+func HandleRefineRecipe(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Recipe       string                `json:"recipe"`
+		Structured   *model.RecipeDocument `json:"structured"`
+		ChangePrompt string                `json:"change_prompt"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.ChangePrompt) == "" || strings.TrimSpace(req.Recipe) == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if len(req.ChangePrompt) > 500 {
+		req.ChangePrompt = req.ChangePrompt[:500]
+	}
+	if !isRecipeRelated(r.Context(), req.ChangePrompt) {
+		http.Error(w, "Not a cooking-related request", http.StatusUnprocessableEntity)
+		return
+	}
+	var lang string
+	if req.Structured != nil {
+		lang = req.Structured.Language
+	}
+	prompt := fmt.Sprintf("Modify this recipe according to the instruction: %q\n\nCurrent recipe:\n%s", req.ChangePrompt, req.Recipe)
+	doc, err := generateStructured(r.Context(), lang, openai.TextContentPart(prompt))
+	if err != nil {
+		slog.Error("refine-recipe failed", "error", err)
+		http.Error(w, "failed to refine recipe", http.StatusInternalServerError)
+		return
+	}
+	resp := model.Recipe{
+		Recipename: doc.Title,
+		Recipe:     RenderMarkdown(doc),
+		Structured: &doc,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }

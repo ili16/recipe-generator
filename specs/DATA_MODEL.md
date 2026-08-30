@@ -63,7 +63,7 @@ public_id             UUID UNIQUE            -- external/shareable id
 user_id               INT FK users
 title                 TEXT NOT NULL
 summary               TEXT
-category              TEXT NOT NULL DEFAULT 'Sonstiges'
+category              TEXT NOT NULL DEFAULT 'other'
 language              TEXT NOT NULL DEFAULT 'en'
 servings              INT
 prep_minutes          INT

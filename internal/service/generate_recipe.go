@@ -3,11 +3,12 @@ package service
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"mime/multipart"
-	_ "mime/multipart"
 	"net/http"
 	"os"
 	"strings"
@@ -17,253 +18,312 @@ import (
 	"github.com/ili16/recipe-generator/internal/utils"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
-	goopenai "github.com/sashabaranov/go-openai"
+	"github.com/openai/openai-go/packages/param"
 )
 
-const (
-	englishSystemMessage = "You are an agent that creates recipes for users" +
-		"keep roughly the following markdown format:" +
-		"# <Recipe Name>\n" + "## Ingredients/Zutaten\n" + "- **<UNIT>** Ingredient \n" + "## Preparation/Zubereitung" +
-		"### (preparation, mise en place, etc.) \n" +
-		"- Steps\n" +
-		"### (cooking, sauteeing, etc.) " +
-		"- Steps\n" +
-		"All ingredients need to be in metric units."
+const structuredSystemPromptBase = "You are a culinary AI. Extract and structure the provided recipe or recipe description. " +
+	"If a field cannot be determined from the input, use null.\n\n" +
+	"Unit rules — follow strictly:\n" +
+	"- Liquids (oil, soy sauce, vinegar, stock, juice): use ml or g, never tablespoons/teaspoons/cups.\n" +
+	"- Dry solids (flour, sugar, spices, cheese, vegetables, meat): use g or kg.\n" +
+	"- Small spice amounts under 5 g: still use g (e.g. '2 g salt', '1 g pepper').\n" +
+	"- Genuinely countable whole items where weight is impractical: use a plain integer with no unit (e.g. '2 eggs', '4 chicken thighs', '30 gyoza wrappers'). Set unit to null.\n" +
+	"- Never use 'pieces', 'cloves', 'tablespoons', 'teaspoons', 'cups', 'oz', 'lb', 'fl oz'.\n" +
+	"- Garlic: convert cloves to grams (1 clove ≈ 5 g).\n" +
+	"- Non-numeric amounts like 'to taste' or 'for garnish': set quantity and unit to null, put the phrase in quantity_text.\n\n" +
+	"ingredient_indices rule: for each step, set ingredient_indices to the list of 0-based indices (into the ingredients array) of every ingredient directly used in that step. Use an empty array if none apply."
 
-	judgeSystemMessage = "You are a judge AI agent that decides whether input is related to cooking or not."
-)
-
-func OpenAIclient() *openai.Client {
-	client := openai.NewClient(
-		option.WithAPIKey(os.Getenv("OPENAI_KEY")),
-	)
-
-	return client
+func buildSystemPrompt(language string) string {
+	if language == "" {
+		return structuredSystemPromptBase +
+			" Detect the language of the input, set the language field to its ISO 639-1 code, and use only that language for all text fields."
+	}
+	return structuredSystemPromptBase +
+		fmt.Sprintf(" Respond entirely in the language with ISO 639-1 code '%s'. Set the language field to '%s'. Do not mix in any other language, do not add translations in parentheses.", language, language)
 }
 
-func GenerateRecipe(input model.GenerateRecipeInput) (generatedRecipe string, recipeName string, err error) {
-	source := "text"
+const judgeSystemMessage = "You are a judge AI agent that decides whether input is related to cooking or not."
+
+// recipeModel is the model used for all recipe generation and classification calls.
+const recipeModel openai.ChatModel = "gpt-4.1-mini"
+
+func OpenAIclient() openai.Client {
+	return openai.NewClient(option.WithAPIKey(os.Getenv("OPENAI_KEY")))
+}
+
+func recipeJSONSchema() map[string]any {
+	nullable := func(typ string) map[string]any {
+		return map[string]any{
+			"anyOf": []any{map[string]any{"type": typ}, map[string]any{"type": "null"}},
+		}
+	}
+	ingredientSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"section":       nullable("string"),
+			"item":          map[string]any{"type": "string"},
+			"quantity":      nullable("number"),
+			"quantity_text": nullable("string"),
+			"unit":          nullable("string"),
+			"optional":      map[string]any{"type": "boolean"},
+		},
+		"required":             []string{"section", "item", "quantity", "quantity_text", "unit", "optional"},
+		"additionalProperties": false,
+	}
+	stepSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"sort_order":         map[string]any{"type": "integer"},
+			"step_text":          map[string]any{"type": "string"},
+			"timer_seconds":      nullable("integer"),
+			"temperature_c":      nullable("integer"),
+			"ingredient_indices": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}},
+		},
+		"required":             []string{"sort_order", "step_text", "timer_seconds", "temperature_c", "ingredient_indices"},
+		"additionalProperties": false,
+	}
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"title":    map[string]any{"type": "string"},
+			"summary":  nullable("string"),
+			"language": map[string]any{"type": "string"},
+			"category": map[string]any{
+				"type": "string",
+				"enum": []string{"main", "starter", "bread", "dessert", "other"},
+			},
+			"servings":     nullable("integer"),
+			"prep_minutes": nullable("integer"),
+			"cook_minutes": nullable("integer"),
+			"difficulty": map[string]any{
+				"anyOf": []any{
+					map[string]any{"type": "string", "enum": []string{"easy", "medium", "hard"}},
+					map[string]any{"type": "null"},
+				},
+			},
+			"ingredients": map[string]any{"type": "array", "items": ingredientSchema},
+			"steps":       map[string]any{"type": "array", "items": stepSchema},
+		},
+		"required": []string{
+			"title", "summary", "language", "category",
+			"servings", "prep_minutes", "cook_minutes", "difficulty",
+			"ingredients", "steps",
+		},
+		"additionalProperties": false,
+	}
+}
+
+func generateStructured(ctx context.Context, language string, parts ...openai.ChatCompletionContentPartUnionParam) (model.RecipeDocument, error) {
+	client := OpenAIclient()
+
+	slog.Debug("llm: structured completion start", "model", recipeModel, "parts", len(parts), "language", language)
+	t := time.Now()
+	completion, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			openai.SystemMessage(buildSystemPrompt(language)),
+			openai.UserMessage(parts),
+		},
+		Model: recipeModel,
+		ResponseFormat: openai.ChatCompletionNewParamsResponseFormatUnion{
+			OfJSONSchema: &openai.ResponseFormatJSONSchemaParam{
+				JSONSchema: openai.ResponseFormatJSONSchemaJSONSchemaParam{
+					Name:   "recipe",
+					Schema: recipeJSONSchema(),
+					Strict: param.NewOpt(true),
+				},
+			},
+		},
+	})
+	if err != nil {
+		return model.RecipeDocument{}, fmt.Errorf("structured completion: %w", err)
+	}
+	if len(completion.Choices) == 0 {
+		return model.RecipeDocument{}, errors.New("no choices returned")
+	}
+
+	raw := completion.Choices[0].Message.Content
+	slog.Debug("llm: structured raw output", "json", raw)
+
+	var doc model.RecipeDocument
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		return model.RecipeDocument{}, fmt.Errorf("parse structured response: %w", err)
+	}
+	if doc.Title == "" && len(doc.Ingredients) == 0 && len(doc.Steps) == 0 {
+		return model.RecipeDocument{}, errors.New("no recipe found in the provided content")
+	}
+	slog.Debug("llm: structured recipe", "model", recipeModel,
+		"dur_ms", time.Since(t).Milliseconds(),
+		"tokens", completion.Usage.TotalTokens,
+		"title", doc.Title)
+	return doc, nil
+}
+
+func GenerateRecipe(input model.GenerateRecipeInput) (model.RecipeDocument, error) {
 	if input.Image != nil {
-		source = "image"
-		generatedRecipe, err = GenerateRecipeByImage(input.Image, input.Prompt)
-	} else if input.URL != "" {
-		source = "url"
-		generatedRecipe, err = GenerateRecipeByLink(input.URL, input.Prompt)
-	} else {
-		language, _ := utils.GetLanguage(input.Prompt)
-		slog.Debug("generate: detected language", "language", language)
-		generatedRecipe, err = openAIgenerateRecipe(input.Prompt, language)
+		return generateFromImage(input.Image, input.Prompt)
 	}
-
-	if err != nil {
-		return "", "", err
+	if input.URL != "" {
+		return generateFromURL(input.URL, input.Prompt)
 	}
-
-	slog.Debug("generate: recipe body ready", "source", source, "chars", len(generatedRecipe))
-
-	generateRecipeName, err := OpenAIgenerateRecipeName(generatedRecipe)
-	if err != nil {
-		return "", "", err
-	}
-
-	slog.Debug("generate: name ready", "name", generateRecipeName)
-	return generatedRecipe, generateRecipeName, nil
+	return generateFromText(input.Prompt)
 }
 
-func GenerateRecipeByLink(URL string, prompt string) (generatedRecipe string, err error) {
-	slog.Debug("generate/url: fetching page", "url", URL)
-	websiteContent, err := utils.GetWebsite(URL)
+func generateFromText(prompt string) (model.RecipeDocument, error) {
+	language, err := utils.GetLanguage(prompt)
 	if err != nil {
-		slog.Error("Error getting website", "error", err)
-		return "", err
+		language = ""
 	}
-	slog.Debug("generate/url: page fetched", "bytes", len(websiteContent))
-
-	t := time.Now()
-	generatedRecipe, err = openAIgenerateRecipeLink(websiteContent, prompt)
-	if err != nil {
-		slog.Error("Error generating generatedRecipe", "error", err)
-		return "", err
-	}
-	slog.Debug("generate/url: LLM done", "dur_ms", time.Since(t).Milliseconds(), "chars", len(generatedRecipe))
-	return generatedRecipe, nil
+	slog.Debug("generate: text", "prompt_len", len(prompt), "language", language)
+	return generateStructured(context.TODO(), language, openai.TextContentPart("Generate a recipe for: "+prompt))
 }
 
-func openAIgenerateRecipeLink(Recipe string, prompt string) (string, error) {
-	client := OpenAIclient()
-
-	var systemmessage openai.ChatCompletionMessageParamUnion
-	systemmessage = openai.SystemMessage(englishSystemMessage)
-
-	var usermessage openai.ChatCompletionMessageParamUnion
+func generateFromURL(url, prompt string) (model.RecipeDocument, error) {
+	slog.Debug("generate/url: fetching page", "url", url)
+	content, err := utils.GetWebsiteContent(url)
+	if err != nil {
+		return model.RecipeDocument{}, fmt.Errorf("fetch url: %w", err)
+	}
+	slog.Debug("generate/url: page fetched", "bytes", len(content))
+	userText := "Extract and structure this recipe from the webpage content."
 	if prompt != "" {
-		usermessage = openai.UserMessage("Change to markdown format: " + Recipe + " and take the additional prompt into account: " + prompt)
-	} else {
-		usermessage = openai.UserMessage("Change to markdown format: " + Recipe)
+		userText += " Additional instructions: " + prompt
 	}
-
-	t := time.Now()
-	completion, err := client.Chat.Completions.New(context.TODO(), openai.ChatCompletionNewParams{
-		Messages: openai.F([]openai.ChatCompletionMessageParamUnion{systemmessage, usermessage}),
-		Model:    openai.F(openai.ChatModelGPT4oMini),
-	})
-	if err != nil {
-		return "", err
-	}
-	result := completion.Choices[0].Message.Content
-	slog.Debug("llm: link recipe", "model", string(openai.ChatModelGPT4oMini), "dur_ms", time.Since(t).Milliseconds(), "tokens", completion.Usage.TotalTokens)
-	return result, nil
+	return generateStructured(context.TODO(), "", openai.TextContentPart(userText+"\n\n"+content))
 }
 
-func OpenAIgenerateRecipeName(Recipe string) (string, error) {
-	client := OpenAIclient()
-
-	t := time.Now()
-	recipename, err := client.Chat.Completions.New(context.TODO(), openai.ChatCompletionNewParams{
-		Messages: openai.F([]openai.ChatCompletionMessageParamUnion{
-			openai.SystemMessage("You only respond with a recipe name. 3 words max."),
-			openai.UserMessage("Generate a recipe name for: " + Recipe + "keep the name short and precise, no adjectives, no 'recipe' in the name"),
-		}),
-		Model: openai.F(openai.ChatModelGPT4oMini),
-	})
-	if err != nil {
-		return "", err
-	}
-	result := recipename.Choices[0].Message.Content
-	slog.Debug("llm: recipe name", "model", string(openai.ChatModelGPT4oMini), "dur_ms", time.Since(t).Milliseconds(), "tokens", recipename.Usage.TotalTokens, "name", result)
-	return result, nil
-}
-
-func GenerateRecipeByImage(file multipart.File, prompt string) (recipe string, err error) {
+func generateFromImage(file multipart.File, prompt string) (model.RecipeDocument, error) {
 	data, err := io.ReadAll(file)
 	if err != nil {
-		return "", fmt.Errorf("failed to read image: %w", err)
+		return model.RecipeDocument{}, fmt.Errorf("read image: %w", err)
 	}
-
 	mime := http.DetectContentType(data)
 	if mime == "application/octet-stream" {
 		mime = "image/jpeg"
 	}
 	slog.Debug("generate/image: read", "bytes", len(data), "mime", mime)
-
-	image := base64.StdEncoding.EncodeToString(data)
-	t := time.Now()
-	recipe, err = goopenAIgenerateRecipeImage(image, mime, prompt)
-	if err != nil {
-		fmt.Println("Error generating service:", err)
-		return "", err
-	}
-	slog.Debug("generate/image: LLM done", "dur_ms", time.Since(t).Milliseconds(), "chars", len(recipe))
-	return recipe, nil
-}
-
-func goopenAIgenerateRecipeImage(RecipeBase64 string, mime string, prompt string) (recipe string, err error) {
-	client := goopenai.NewClient(os.Getenv("OPENAI_KEY"))
-
-	var SystemMessage string
+	userText := "Extract and structure the recipe shown in this image."
 	if prompt != "" {
-		SystemMessage = englishSystemMessage + " Also take the following prompt into account: " + prompt
-	} else {
-		SystemMessage = englishSystemMessage
+		userText += " Additional instructions: " + prompt
 	}
-
-	t := time.Now()
-	response, err := client.CreateChatCompletion(context.Background(), goopenai.ChatCompletionRequest{
-		Model: goopenai.GPT4oMini,
-		Messages: []goopenai.ChatCompletionMessage{
-			{
-				Role: goopenai.ChatMessageRoleUser,
-				MultiContent: []goopenai.ChatMessagePart{
-					{
-						Type: goopenai.ChatMessagePartTypeText,
-						Text: SystemMessage,
-					},
-					{
-						Type: goopenai.ChatMessagePartTypeImageURL,
-						ImageURL: &goopenai.ChatMessageImageURL{
-							URL: "data:" + mime + ";base64," + RecipeBase64,
-						},
-					},
-				},
-			},
-		},
-	})
-	if err != nil {
-		return "", err
-	}
-	result := response.Choices[0].Message.Content
-	slog.Debug("llm: image recipe", "model", string(goopenai.GPT4oMini), "dur_ms", time.Since(t).Milliseconds())
-	return result, nil
-}
-
-func openAIgenerateRecipe(recipeDescription string, language string) (string, error) {
-	client := OpenAIclient()
-
-	t := time.Now()
-	completion, err := client.Chat.Completions.New(context.TODO(), openai.ChatCompletionNewParams{
-		Messages: openai.F([]openai.ChatCompletionMessageParamUnion{
-			openai.SystemMessage(englishSystemMessage),
-			openai.UserMessage("Generate a recipe for the following description (" + language + "): " + recipeDescription),
-		}),
-		Model: openai.F(openai.ChatModelGPT4oMini),
-	})
-	if err != nil {
-		return "", err
-	}
-	result := completion.Choices[0].Message.Content
-	slog.Debug("llm: text recipe", "model", string(openai.ChatModelGPT4oMini), "dur_ms", time.Since(t).Milliseconds(), "tokens", completion.Usage.TotalTokens, "language", language)
-	return result, nil
-}
-
-func isRecipeRelated(recipe string) bool {
-	result, err := goopenAIChatCompletion(
-		context.TODO(),
-		judgeSystemMessage,
-		"Is this input related to a service? Only answer with 'yes' or 'no'"+recipe,
-		openai.ChatModelGPT4oMini,
+	dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)
+	return generateStructured(context.TODO(), "",
+		openai.TextContentPart(userText),
+		openai.ImageContentPart(openai.ChatCompletionContentPartImageImageURLParam{URL: dataURL}),
 	)
-
-	if err != nil {
-		slog.Error("Error judging input", "error", err)
-		return false
-	}
-
-	return strings.Contains(strings.ToLower(result), "yes")
 }
 
-func goopenAIgenerateRecipeCategory(Recipe string) string {
-	client := goopenai.NewClient(os.Getenv("OPENAI_KEY"))
+var sectionHeadings = map[string][2]string{
+	"de": {"Zutaten", "Zubereitung"},
+	"fr": {"Ingrédients", "Préparation"},
+	"es": {"Ingredientes", "Preparación"},
+	"it": {"Ingredienti", "Preparazione"},
+}
 
-	response, err := client.CreateChatCompletion(context.Background(), goopenai.ChatCompletionRequest{
-		Model: goopenai.GPT4oMini,
-		Messages: []goopenai.ChatCompletionMessage{
-			{
-				Role: goopenai.ChatMessageRoleUser,
-				MultiContent: []goopenai.ChatMessagePart{
-					{
-						Type: goopenai.ChatMessagePartTypeText,
-						Text: "What is the category of this service? Currently only Hauptgericht, Vorspeise, Brot, Dessert are supported. Answer with a single word nothing else",
-					},
-					{
-						Type: goopenai.ChatMessagePartTypeText,
-						Text: Recipe,
-					},
-				},
-			},
-		},
-	})
-	if err != nil {
-		slog.Error("Error generating service category", "error", err)
-		return ""
+func headings(language string) (ingredients, preparation string) {
+	if h, ok := sectionHeadings[strings.ToLower(language)]; ok {
+		return h[0], h[1]
+	}
+	return "Ingredients", "Preparation"
+}
+
+// RenderMarkdown produces a markdown string from a RecipeDocument for the mobile client.
+func RenderMarkdown(doc model.RecipeDocument) string {
+	var b strings.Builder
+	b.WriteString("# " + doc.Title + "\n\n")
+	if doc.Summary != nil && *doc.Summary != "" {
+		b.WriteString(*doc.Summary + "\n\n")
+	}
+	var meta []string
+	if doc.Servings != nil {
+		meta = append(meta, fmt.Sprintf("Servings: %d", *doc.Servings))
+	}
+	if doc.PrepMinutes != nil {
+		meta = append(meta, fmt.Sprintf("Prep: %d min", *doc.PrepMinutes))
+	}
+	if doc.CookMinutes != nil {
+		meta = append(meta, fmt.Sprintf("Cook: %d min", *doc.CookMinutes))
+	}
+	if len(meta) > 0 {
+		b.WriteString("*" + strings.Join(meta, " · ") + "*\n\n")
 	}
 
-	categories := []string{"Hauptgericht", "Vorspeise", "Brot", "Dessert"}
-	category := response.Choices[0].Message.Content
-	for _, c := range categories {
-		if strings.Contains(category, c) {
+	ingHeading, prepHeading := headings(doc.Language)
+
+	b.WriteString("## " + ingHeading + "\n\n")
+	currentSection := ""
+	for _, ing := range doc.Ingredients {
+		sec := ""
+		if ing.Section != nil {
+			sec = *ing.Section
+		}
+		if sec != currentSection {
+			currentSection = sec
+			if sec != "" {
+				b.WriteString("\n### " + sec + "\n\n")
+			}
+		}
+		qty := ""
+		hasUnit := ing.Unit != nil && *ing.Unit != "" && *ing.Unit != "null"
+		if ing.Quantity != nil && *ing.Quantity > 0 {
+			if *ing.Quantity == float64(int(*ing.Quantity)) {
+				qty = fmt.Sprintf("%d ", int(*ing.Quantity))
+			} else {
+				qty = fmt.Sprintf("%.1f ", *ing.Quantity)
+			}
+			if hasUnit {
+				qty += *ing.Unit + " "
+			}
+		} else if ing.QuantityText != nil && *ing.QuantityText != "" {
+			// non-numeric amounts like "a pinch", "to taste", "for dusting"
+			qty = *ing.QuantityText + " "
+		}
+		line := "- " + qty + ing.Item
+		if ing.Optional {
+			line += " *(optional)*"
+		}
+		b.WriteString(line + "\n")
+	}
+
+	b.WriteString("\n## " + prepHeading + "\n\n")
+	for _, step := range doc.Steps {
+		b.WriteString(fmt.Sprintf("%d. %s\n", step.SortOrder, step.StepText))
+		if step.TimerSeconds != nil && *step.TimerSeconds > 0 {
+			b.WriteString(fmt.Sprintf("   *⏱ %d min*\n", *step.TimerSeconds/60))
+		}
+	}
+	return b.String()
+}
+
+func classifyCategory(ctx context.Context, content string) string {
+	slog.Debug("llm: classify category start")
+	result, err := goopenAIChatCompletion(ctx,
+		"What is the category of this recipe? Only answer with one of: main, starter, bread, dessert, other. Single word only.",
+		content,
+		recipeModel,
+	)
+	if err != nil {
+		slog.Warn("category classification failed, defaulting to other", "error", err)
+		return "other"
+	}
+	for _, c := range []string{"main", "starter", "bread", "dessert"} {
+		if strings.Contains(result, c) {
 			return c
 		}
 	}
-	slog.Warn("Recipe category not found, defaulting to Sonstiges")
-	return "Sonstiges"
+	return "other"
+}
+
+func isRecipeRelated(ctx context.Context, recipe string) bool {
+	slog.Debug("llm: judge relevance start", "input_len", len(recipe))
+	result, err := goopenAIChatCompletion(
+		ctx,
+		judgeSystemMessage,
+		"Is this input related to cooking? Only answer with 'yes' or 'no': "+recipe,
+		recipeModel,
+	)
+	if err != nil {
+		slog.Error("Error judging input", "error", err)
+		return true // fail open to avoid blocking on judge errors
+	}
+	return strings.Contains(strings.ToLower(result), "yes")
 }
