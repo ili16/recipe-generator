@@ -112,6 +112,7 @@ func (a *Authenticator) Require(next http.HandlerFunc) http.HandlerFunc {
 			Email:    claims.stringClaim("email"),
 			Name:     claims.displayName(),
 			Provider: claims.provider(),
+			IsAdmin:  claims.isAdmin(),
 		}
 
 		id, err := a.provisioner.EnsureUser(r.Context(), user.Subject, user.Email, user.Name, user.Provider)
@@ -125,6 +126,18 @@ func (a *Authenticator) Require(next http.HandlerFunc) http.HandlerFunc {
 
 		next(w, r.WithContext(withUser(r.Context(), user)))
 	}
+}
+
+// RequireAdmin behaves like Require, additionally rejecting non-admin users with 403.
+func (a *Authenticator) RequireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return a.Require(func(w http.ResponseWriter, r *http.Request) {
+		user, _ := FromContext(r.Context())
+		if !user.IsAdmin {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	})
 }
 
 type mapClaims jwt.MapClaims
@@ -210,6 +223,24 @@ func (c mapClaims) provider() string {
 	return "keycloak"
 }
 
+// isAdmin reports whether the token's realm_access.roles includes "admin".
+func (c mapClaims) isAdmin() bool {
+	realmAccess, ok := c["realm_access"].(map[string]any)
+	if !ok {
+		return false
+	}
+	roles, ok := realmAccess["roles"].([]any)
+	if !ok {
+		return false
+	}
+	for _, role := range roles {
+		if s, ok := role.(string); ok && s == "admin" {
+			return true
+		}
+	}
+	return false
+}
+
 func bearerToken(r *http.Request) string {
 	auth := r.Header.Get("Authorization")
 	if len(auth) < 7 || !strings.EqualFold(auth[:7], "bearer ") {
@@ -252,6 +283,7 @@ func (a *Authenticator) Optional(next http.HandlerFunc) http.HandlerFunc {
 			Email:    claims.stringClaim("email"),
 			Name:     claims.displayName(),
 			Provider: claims.provider(),
+			IsAdmin:  claims.isAdmin(),
 		}
 		id, err := a.provisioner.EnsureUser(r.Context(), user.Subject, user.Email, user.Name, user.Provider)
 		if err != nil {

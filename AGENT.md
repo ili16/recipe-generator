@@ -28,12 +28,12 @@ flowchart TD
 
 ```mermaid
 graph LR
-    subgraph anon["No auth"]
+    subgraph llm["LLM-calling — optional auth, rate-limited + budget-capped"]
         G[POST /generate]
+        T[POST /transcribe]
         S[POST /suggest]
         SP[POST /suggest-prefs]
-    end
-    subgraph optional["Optional auth\nidentified if token present"]
+        CC[POST /cooking-chat]
         RR[POST /refine-recipe]
     end
     subgraph required["Auth required"]
@@ -42,10 +42,23 @@ graph LR
         DR[DELETE /delete-recipe/:id]
         UR[PATCH /update-recipe]
         UF[GET /user-info]
+        US[GET /usage]
+    end
+    subgraph admin["Auth required + admin realm role"]
+        AU[GET /admin/users]
+        AB[PATCH /admin/users/:id/budget]
     end
 ```
 
-> **Rate limiting hook**: `auth.FromContext(r.Context())` on `/refine-recipe` returns the user if authenticated (limit by user ID) or empty (limit by IP). All other expensive endpoints are either free-tier anonymous or gated behind auth.
+> **Rate limiting + budget**: all 6 LLM-calling endpoints go through `authenticator.Optional`
+> first, so `auth.FromContext(r.Context())` returns the caller if a valid token was sent
+> (limit/cap by user ID) or nothing for anonymous callers (limit by client IP, no cost
+> tracked at all). Each is wrapped `Optional(rl.Guard(billing.Guard(handler)))` in
+> `cmd/main.go`: `internal/ratelimit` enforces `RATE_LIMIT_ANON_PER_HOUR` /
+> `RATE_LIMIT_AUTH_PER_HOUR` (429 `rate_limited`), then `internal/billing` enforces the
+> caller's monthly spend cap (429 `budget_exceeded`) for authenticated callers only —
+> anonymous requests have no cost tracked, so nothing to cap. No other `/api/v1` routes
+> are rate-limited or budget-capped.
 
 ## What This Service Does
 
@@ -107,6 +120,15 @@ Optional auth tuning:
 - CORS_ORIGIN (must match the browser origin exactly, e.g. http://localhost:8081)
 - PORT (default: 8080)
 
+Optional rate limiting + budget tuning (internal/ratelimit, internal/billing):
+- RATE_LIMIT_ANON_PER_HOUR (default: 5) — anonymous request cap per client IP, LLM
+  endpoints only.
+- RATE_LIMIT_AUTH_PER_HOUR (default: 60) — authenticated request cap per user ID.
+- LLM_BUDGET_DEFAULT_USD (default: 2.00) — monthly per-user spend cap; overridable per
+  user via `users.monthly_budget_usd_override` (`PATCH /admin/users/{id}/budget`).
+- LLM_TRANSCRIBE_COST_USD (default: 0.003) — flat per-call cost estimate for
+  `/transcribe`; the OpenAI SDK call doesn't return audio duration to price it exactly.
+
 Optional OpenTelemetry metrics (internal/telemetry):
 - OTEL_ENABLED — must be `true` to turn metrics on at all; unset/false = no-op, safe default
   for local dev. When true, OTEL_EXPORTER_OTLP_ENDPOINT must also be set (Init errors otherwise).
@@ -126,7 +148,10 @@ Optional OpenTelemetry metrics (internal/telemetry):
 Server pipeline in cmd/main.go:
 - withCORS
 - logRequests
-- per-route: authenticator.Require(handler)
+- per-route: authenticator.Require(handler) / authenticator.Optional(handler) /
+  authenticator.RequireAdmin(handler); the 6 LLM-calling routes additionally wrap with
+  `rl.Guard` (internal/ratelimit) and `billing.Guard` (internal/billing), in that order,
+  inside the `Optional` call so both see the identified caller.
 
 Auth behavior (internal/auth):
 - Bearer token parsed and verified against Keycloak JWKS (RS256 family only).
@@ -135,6 +160,9 @@ Auth behavior (internal/auth):
 - Just-in-time provisioning: on every authenticated request the `sub` claim is upserted into
   `users.oauth_id` (storage.Users.EnsureUser) and the resulting user id is bound to the request
   context via auth.FromContext. No cloud provisioning, no separate login route.
+- `IsAdmin` is set from the token's `realm_access.roles` claim (Keycloak realm role
+  `admin`, see `../keycloak/terraform/realm.tf`); `RequireAdmin` wraps `Require` with a
+  403 for non-admins.
 
 ## API Contract (Current)
 
@@ -142,13 +170,15 @@ Base prefix: /api/v1
 
 Public:
 - GET /health
+
+LLM-calling — optional auth (identified if a Bearer token is present, anonymous
+otherwise), rate-limited and budget-capped per the "Rate limiting + budget" note above:
 - POST /generate
 	- multipart form
 	- fields: description (text), url, image, language (optional, ISO 639-1, e.g. "en" —
 	  client's browser/device locale, used as the default output language when the prompt
 	  doesn't carry a clear language signal of its own; see "Language detection" below)
-
-Optional auth (identified if a Bearer token is present, anonymous otherwise):
+- POST /transcribe, POST /suggest, POST /suggest-prefs, POST /cooking-chat
 - POST /refine-recipe
 	- JSON: `{"origin":{"prompt":"...","source_type":"text|url|image","source_url":"..."},`
 	  `"initial":<RecipeDocument>,"history":[{"change_prompt":"...","structured":<RecipeDocument>}],`
@@ -194,8 +224,26 @@ Authenticated (Bearer token required):
 	  entries with no note. A recipe that's never had a structured save (markdown-only
 	  `add-recipe`, no `structured` field) returns `[]`. 404 if the recipe doesn't exist or
 	  isn't owned by the caller.
+- GET /usage
+	- 200 with `{"spent_usd":...,"cap_usd":...,"period_start":"2026-09-01T00:00:00Z","pct_used":...}`
+	  — the caller's own current-calendar-month LLM spend and effective budget cap (their
+	  `monthly_budget_usd_override` if set, else `LLM_BUDGET_DEFAULT_USD`). Poll this to
+	  show an 80%/100% warning before the caller hits the `budget_exceeded` 429 below.
+
+Admin (Bearer token required + `admin` realm role — `internal/auth.RequireAdmin`, 403 for
+non-admins):
+- GET /admin/users
+	- 200 with `[{"id":...,"email":"...","name":"...","spent_usd":...,"cap_usd":...,`
+	  `"override_usd":...,"last_seen_at":"..."}, ...]` for every user, most-spent first.
+	  `override_usd` is omitted when the user has no override (effective cap is the default).
+- PATCH /admin/users/{id}/budget
+	- JSON: `{"monthly_budget_usd": 10.0}` (or `null` to clear the override and fall back
+	  to the default cap) → 204. 404 if the user doesn't exist.
 
 Notes:
+- LLM-calling endpoints return `429` with `{"error":"rate_limited"}` (request cap hit —
+  `Retry-After` header included) or `{"error":"budget_exceeded"}` (authenticated caller
+  hit their monthly cap) — distinct `error` values so the frontend can tell them apart.
 - The historical "service" payload key is gone; the field is "recipe" everywhere.
 - Refining/saving an already-saved recipe (CookingModeScreen, "cooking notes" flow) does
   not use `origin`/`history` — that path stays a single-turn refine with no persisted
@@ -209,13 +257,16 @@ Migrations `00001`–`00006` create it from scratch; there is no legacy database
 
 ## Code Map
 
-- cmd/main.go: route registration, handlers for user info/recipes/reprompt
-- internal/auth: JWKS validation, introspection, JIT user provisioning, typed request context
+- cmd/main.go: route registration, handlers for user info/recipes/usage/admin
+- internal/auth: JWKS validation, introspection, JIT user provisioning, admin role, typed request context
+- internal/ratelimit: in-memory per-IP/per-user token-bucket request limiter
+- internal/billing: LLM cost estimation (pricing.go) and monthly budget enforcement (guard.go)
 - internal/service/generate_recipe.go: recipe generation logic (text/url/image), tags and naming
 - internal/service/tags.go: fixed recipe tagging vocabulary (`AllTagSlugs`), see specs/RECIPE_TAGS.md
-- internal/service/handlers.go: generate + add handlers
+- internal/service/handlers.go: generate + add handlers, shared LLM cost-recording helper
 - internal/storage/db.go: pgx pool and recipe queries
 - internal/storage/users.go: EnsureUser upsert keyed by OIDC subject
+- internal/storage/usage.go: LLM usage recording, spend lookup, admin usage listing, budget overrides
 - internal/model/models.go: request/response structs
 
 ## Known Constraints and Pitfalls

@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/ili16/recipe-generator/internal/auth"
+	"github.com/ili16/recipe-generator/internal/billing"
 	"github.com/ili16/recipe-generator/internal/model"
+	"github.com/ili16/recipe-generator/internal/ratelimit"
 	"github.com/ili16/recipe-generator/internal/service"
 	"github.com/ili16/recipe-generator/internal/storage"
 	"github.com/ili16/recipe-generator/internal/telemetry"
@@ -44,16 +46,26 @@ func main() {
 		os.Exit(1)
 	}
 
+	rl := ratelimit.New(
+		envIntOrDefault("RATE_LIMIT_ANON_PER_HOUR", 5),
+		envIntOrDefault("RATE_LIMIT_AUTH_PER_HOUR", 60),
+	)
+	// llm wraps an LLM-calling handler with rate limiting and budget enforcement, seeing
+	// the caller's identity (if any) via authenticator.Optional first.
+	llm := func(h http.HandlerFunc) http.HandlerFunc {
+		return authenticator.Optional(rl.Guard(billing.Guard(h)))
+	}
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /health", HandleHealth)
 
-	mux.HandleFunc("POST /api/v1/generate", service.HandleGenerateRecipe)
-	mux.HandleFunc("POST /api/v1/transcribe", service.HandleTranscribeAudio)
-	mux.HandleFunc("POST /api/v1/suggest", service.HandleSuggestInput)
-	mux.HandleFunc("POST /api/v1/suggest-prefs", service.HandleSuggestPrefs)
-	mux.HandleFunc("POST /api/v1/cooking-chat", service.HandleCookingChat)
-	mux.HandleFunc("POST /api/v1/refine-recipe", authenticator.Optional(service.HandleRefineRecipe))
+	mux.HandleFunc("POST /api/v1/generate", llm(service.HandleGenerateRecipe))
+	mux.HandleFunc("POST /api/v1/transcribe", llm(service.HandleTranscribeAudio))
+	mux.HandleFunc("POST /api/v1/suggest", llm(service.HandleSuggestInput))
+	mux.HandleFunc("POST /api/v1/suggest-prefs", llm(service.HandleSuggestPrefs))
+	mux.HandleFunc("POST /api/v1/cooking-chat", llm(service.HandleCookingChat))
+	mux.HandleFunc("POST /api/v1/refine-recipe", llm(service.HandleRefineRecipe))
 
 	mux.HandleFunc("GET /api/v1/recipes/{id}", authenticator.Require(HandleGetRecipeByID))
 	mux.HandleFunc("GET /api/v1/recipes/{id}/history", authenticator.Require(HandleGetRecipeHistory))
@@ -63,6 +75,10 @@ func main() {
 	mux.HandleFunc("POST /api/v1/add-recipe", authenticator.Require(service.HandleAddRecipe))
 	mux.HandleFunc("DELETE /api/v1/delete-recipe/{id}", authenticator.Require(HandleDeleteRecipe))
 	mux.HandleFunc("PATCH /api/v1/update-recipe", authenticator.Require(HandleUpdateRecipe))
+	mux.HandleFunc("GET /api/v1/usage", authenticator.Require(HandleGetUsage))
+
+	mux.HandleFunc("GET /api/v1/admin/users", authenticator.RequireAdmin(HandleAdminListUsers))
+	mux.HandleFunc("PATCH /api/v1/admin/users/{id}/budget", authenticator.RequireAdmin(HandleAdminSetBudget))
 
 	addr := ":" + envOrDefault("PORT", "8080")
 	slog.Info("Server is running", "addr", addr)
@@ -76,6 +92,15 @@ func main() {
 func envOrDefault(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func envIntOrDefault(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return fallback
 }
@@ -142,6 +167,76 @@ func HandleGetUserInfo(w http.ResponseWriter, r *http.Request) {
 		"fullName": user.Name,
 		"provider": user.Provider,
 	})
+}
+
+// HandleGetUsage returns the caller's own current-month LLM spend and budget cap, so the
+// frontend can render an 80%/100% warning before the caller hits the enforced 429.
+func HandleGetUsage(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+	spent, cap, err := billing.CurrentUsage(r.Context(), user.ID)
+	if err != nil {
+		slog.Error("Error getting usage", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	pct := 0.0
+	if cap > 0 {
+		pct = spent / cap
+	}
+	now := time.Now().UTC()
+	periodStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"spent_usd":    spent,
+		"cap_usd":      cap,
+		"period_start": periodStart.Format(time.RFC3339),
+		"pct_used":     pct,
+	})
+}
+
+// HandleAdminListUsers returns every user with their current-month spend and effective
+// budget cap. Admin-only (authenticator.RequireAdmin).
+func HandleAdminListUsers(w http.ResponseWriter, r *http.Request) {
+	users, err := storage.ListUsersWithUsage(r.Context(), billing.DefaultCapUSD())
+	if err != nil {
+		slog.Error("Error listing users with usage", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, users)
+}
+
+// HandleAdminSetBudget sets or clears a user's monthly budget override. Admin-only.
+func HandleAdminSetBudget(w http.ResponseWriter, r *http.Request) {
+	userID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || userID <= 0 {
+		http.Error(w, "invalid user id", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		MonthlyBudgetUSD *float64 `json:"monthly_budget_usd"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	found, err := storage.SetBudgetOverride(r.Context(), userID, req.MonthlyBudgetUSD)
+	if err != nil {
+		slog.Error("Error setting budget override", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !found {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func validateEnvVars() bool {

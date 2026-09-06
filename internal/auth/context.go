@@ -13,6 +13,7 @@ type User struct {
 	Email    string `json:"email"`
 	Name     string `json:"name"`
 	Provider string `json:"provider"`
+	IsAdmin  bool   `json:"isAdmin"`
 }
 
 func withUser(ctx context.Context, u User) context.Context {

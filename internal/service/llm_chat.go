@@ -43,6 +43,7 @@ func goopenAIChatCompletion(ctx context.Context, systemPrompt, userPrompt string
 	slog.DebugContext(ctx, "llm: chat completion done", "model", model, "dur_ms", time.Since(t).Milliseconds(), "tokens", completion.Usage.TotalTokens)
 	telemetry.RecordLLMCall(ctx, callType, model, time.Since(t).Milliseconds(), true)
 	telemetry.RecordLLMUsage(ctx, callType, model, completion.Usage.PromptTokens, completion.Usage.CompletionTokens)
+	recordCost(ctx, callType, model, completion.Usage.PromptTokens, completion.Usage.CompletionTokens)
 
 	if len(completion.Choices) == 0 {
 		return "", errors.New("no completion choices returned")

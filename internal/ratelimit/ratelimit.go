@@ -1,0 +1,102 @@
+// Package ratelimit provides an in-process, per-key token-bucket request limiter.
+package ratelimit
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/ili16/recipe-generator/internal/auth"
+	"golang.org/x/time/rate"
+)
+
+// Limiter rate-limits requests by authenticated user ID (higher budget) or client IP
+// (lower budget) for anonymous callers.
+//
+// ponytail: single-process map, swap for a shared store (Redis etc.) only if this
+// backend is ever run on more than one instance — deploy/README.md shows it isn't.
+type Limiter struct {
+	mu      sync.Mutex
+	buckets map[string]*rate.Limiter
+	seen    map[string]time.Time
+
+	anon, authed   rate.Limit
+	anonB, authedB int
+}
+
+// New creates a Limiter. anonPerHour/authPerHour are request caps per rolling hour;
+// burst is set to the full hourly cap so a caller can use their whole budget at once.
+func New(anonPerHour, authPerHour int) *Limiter {
+	l := &Limiter{
+		buckets: make(map[string]*rate.Limiter),
+		seen:    make(map[string]time.Time),
+		anon:    rate.Limit(float64(anonPerHour) / 3600),
+		anonB:   anonPerHour,
+		authed:  rate.Limit(float64(authPerHour) / 3600),
+		authedB: authPerHour,
+	}
+	go l.sweep()
+	return l
+}
+
+// sweep evicts buckets idle for more than 10 minutes so the map doesn't grow unbounded.
+func (l *Limiter) sweep() {
+	for range time.Tick(10 * time.Minute) {
+		cutoff := time.Now().Add(-10 * time.Minute)
+		l.mu.Lock()
+		for k, t := range l.seen {
+			if t.Before(cutoff) {
+				delete(l.seen, k)
+				delete(l.buckets, k)
+			}
+		}
+		l.mu.Unlock()
+	}
+}
+
+// clientIP reads the caller's IP, preferring the Cloudflare Tunnel header (this backend
+// always sits behind one, per deploy/README.md), then a generic proxy header, then the
+// raw connection address.
+func clientIP(r *http.Request) string {
+	if ip := r.Header.Get("CF-Connecting-IP"); ip != "" {
+		return ip
+	}
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		return strings.TrimSpace(strings.Split(fwd, ",")[0])
+	}
+	return r.RemoteAddr
+}
+
+// Guard rate-limits next. A caller identified by auth.FromContext (route through
+// authenticator.Optional first) gets the higher per-user budget; everyone else gets the
+// lower per-IP budget.
+func (l *Limiter) Guard(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		key := "ip:" + clientIP(r)
+		rps, burst := l.anon, l.anonB
+		if u, ok := auth.FromContext(r.Context()); ok {
+			key = fmt.Sprintf("user:%d", u.ID)
+			rps, burst = l.authed, l.authedB
+		}
+
+		l.mu.Lock()
+		b, ok := l.buckets[key]
+		if !ok {
+			b = rate.NewLimiter(rps, burst)
+			l.buckets[key] = b
+		}
+		l.seen[key] = time.Now()
+		l.mu.Unlock()
+
+		if !b.Allow() {
+			w.Header().Set("Retry-After", "3600")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":"rate_limited"}`))
+			return
+		}
+		next(w, r)
+	}
+}

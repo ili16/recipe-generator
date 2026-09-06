@@ -276,6 +276,7 @@ func generateRefineFromMessages(ctx context.Context, messages []openai.ChatCompl
 		return model.RefineResult{}, errors.New("no choices returned")
 	}
 	telemetry.RecordLLMUsage(ctx, "refine", string(recipeModel), completion.Usage.PromptTokens, completion.Usage.CompletionTokens)
+	recordCost(ctx, "refine", string(recipeModel), completion.Usage.PromptTokens, completion.Usage.CompletionTokens)
 
 	raw := completion.Choices[0].Message.Content
 	slog.DebugContext(ctx, "llm: refine raw output", "json", raw)
@@ -341,6 +342,7 @@ func generateStructuredFromMessages(ctx context.Context, callType string, messag
 		return model.RecipeDocument{}, errors.New("no choices returned")
 	}
 	telemetry.RecordLLMUsage(ctx, callType, string(recipeModel), completion.Usage.PromptTokens, completion.Usage.CompletionTokens)
+	recordCost(ctx, callType, string(recipeModel), completion.Usage.PromptTokens, completion.Usage.CompletionTokens)
 
 	raw := completion.Choices[0].Message.Content
 	slog.DebugContext(ctx, "llm: structured raw output", "json", raw)

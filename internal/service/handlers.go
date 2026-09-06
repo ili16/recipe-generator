@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ili16/recipe-generator/internal/auth"
+	"github.com/ili16/recipe-generator/internal/billing"
 	"github.com/ili16/recipe-generator/internal/model"
 	"github.com/ili16/recipe-generator/internal/storage"
 	"github.com/ili16/recipe-generator/internal/telemetry"
@@ -27,6 +28,22 @@ type namedReader struct {
 }
 
 func (n namedReader) Name() string { return n.name }
+
+// recordCost estimates and persists the USD cost of one LLM call for the authenticated
+// caller. No-ops for anonymous requests — there's no user to attach cost to.
+func recordCost(ctx context.Context, callType, model string, promptTokens, completionTokens int64) {
+	recordCostUSD(ctx, callType, model, billing.CostUSD(model, promptTokens, completionTokens), promptTokens, completionTokens)
+}
+
+func recordCostUSD(ctx context.Context, callType, model string, costUSD float64, promptTokens, completionTokens int64) {
+	u, ok := auth.FromContext(ctx)
+	if !ok {
+		return
+	}
+	if err := storage.RecordUsage(ctx, u.ID, callType, model, promptTokens, completionTokens, costUSD); err != nil {
+		slog.Warn("record usage failed", "error", err)
+	}
+}
 
 func HandleTranscribeAudio(w http.ResponseWriter, r *http.Request) {
 	slog.Debug("handler: transcribe audio")
@@ -61,6 +78,8 @@ func HandleTranscribeAudio(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "transcription failed", http.StatusInternalServerError)
 		return
 	}
+
+	recordCostUSD(r.Context(), "transcribe", string(openai.AudioModelWhisper1), billing.TranscribeCostUSD(), 0, 0)
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(map[string]string{"text": transcription.Text}); err != nil {
