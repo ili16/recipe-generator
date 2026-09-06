@@ -9,19 +9,10 @@ This file provides working guidance for the Go backend in this folder.
 ```mermaid
 flowchart TD
     INPUT[User input\ntext · URL · image] --> GEN[POST /generate]
-    GEN --> REVIEW[Review Screen\nStructured recipe]
+    GEN --> REVIEW[Review Screen\nStructured recipe + single chat pane]
 
-    REVIEW -->|global change\ne.g. make it vegan| REFINE[POST /refine-recipe\noptional auth]
+    REVIEW -->|chat message\ne.g. "remove garlic" · "make it vegan"| REFINE[POST /refine-recipe\noptional auth]
     REFINE --> REVIEW
-
-    REVIEW -->|per-item note| VALIDATE[POST /validate-changes]
-    VALIDATE -->|clean| UPDATE_ITEM[POST /update-item ×N]
-    VALIDATE -->|flags| MODAL[Warning modal]
-    MODAL -->|proceed anyway| UPDATE_ITEM
-    UPDATE_ITEM --> REVIEW
-
-    REVIEW -->|step question| ASK[POST /ask-step\nanswered inline]
-    ASK --> REVIEW
 
     REVIEW -->|save| AUTH{Logged in?}
     AUTH -->|yes| SAVE[POST /add-recipe]
@@ -41,9 +32,6 @@ graph LR
         G[POST /generate]
         S[POST /suggest]
         SP[POST /suggest-prefs]
-        UI[POST /update-item]
-        VC[POST /validate-changes]
-        AS[POST /ask-step]
     end
     subgraph optional["Optional auth\nidentified if token present"]
         RR[POST /refine-recipe]
@@ -119,6 +107,20 @@ Optional auth tuning:
 - CORS_ORIGIN (must match the browser origin exactly, e.g. http://localhost:8081)
 - PORT (default: 8080)
 
+Optional OpenTelemetry metrics (internal/telemetry):
+- OTEL_ENABLED — must be `true` to turn metrics on at all; unset/false = no-op, safe default
+  for local dev. When true, OTEL_EXPORTER_OTLP_ENDPOINT must also be set (Init errors otherwise).
+- OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL (e.g. `http/protobuf`),
+  OTEL_EXPORTER_OTLP_HEADERS (e.g. Grafana Cloud's `Authorization=Basic ...`) — standard OTel
+  env vars, read directly by the exporter.
+- OTEL_SERVICE_NAME (default: recipe-generator-backend)
+- Local stack lives in the sibling `../observability/` folder (otel-collector + Prometheus +
+  Grafana), not in this repo's docker-compose.yml: `cd ../observability && docker compose up -d`,
+  then run the backend with `OTEL_ENABLED=true OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+  OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`. Grafana: http://localhost:3000 (Prometheus
+  datasource pre-provisioned). Same env vars point at Grafana Cloud's OTLP endpoint instead when
+  you have one.
+
 ## Request Flow and Middleware
 
 Server pipeline in cmd/main.go:
@@ -142,35 +144,75 @@ Public:
 - GET /health
 - POST /generate
 	- multipart form
-	- fields: description (text), url, image
+	- fields: description (text), url, image, language (optional, ISO 639-1, e.g. "en" —
+	  client's browser/device locale, used as the default output language when the prompt
+	  doesn't carry a clear language signal of its own; see "Language detection" below)
+
+Optional auth (identified if a Bearer token is present, anonymous otherwise):
+- POST /refine-recipe
+	- JSON: `{"origin":{"prompt":"...","source_type":"text|url|image","source_url":"..."},`
+	  `"initial":<RecipeDocument>,"history":[{"change_prompt":"...","structured":<RecipeDocument>}],`
+	  `"change_prompt":"..."}`
+	- Threads the whole conversation (original ask → initial doc → every prior accepted
+	  edit → the new instruction) into one multi-turn LLM call, so each edit stays
+	  consistent with everything before it. `history` is the edits since `initial`,
+	  oldest first — it does NOT include `initial` itself.
 
 Authenticated (Bearer token required):
 - GET /user-info
 - GET /get-recipes
 - POST /add-recipe
-	- JSON: {"recipename":"...","recipe":"...","category":"..."}
+	- JSON: `{"recipename":"...","recipe":"...","tags":["..."],"structured":<RecipeDocument>,`
+	  `"origin":{...},"history":[{"change_prompt":"","structured":<RecipeDocument>}, ...]}`
+	- `origin`/`history` are optional. When present (structured saves only), `history[0]`
+	  is the initial generation (`change_prompt: ""`); each entry becomes a
+	  `recipe_versions` row (`change_kind` `'extraction'` then `'ai_edit'`, `change_note`
+	  = the instruction) and a matching `recipe_timeline_events` row, and `origin` is
+	  recorded as a `sources` row. `current_version` ends up `len(history)` — so
+	  `current_version == 1` means "saved the first generation unedited."
 	- 201 with the created recipe
 - DELETE /delete-recipe/{id}
 	- 204 on success
 - PATCH /update-recipe
-	- JSON: {"id":1,"recipename":"...","recipe":"...","category":"..."}
+	- JSON: `{"id":1,"structured":<RecipeDocument>,"ai_sourced":false,"change_prompt":""}` —
+	  overwrites the recipe's header, ingredients, steps, and tags with `structured` (tags
+	  are always fully replaced, no more "empty tags = unchanged"). `ai_sourced` defaults to
+	  `false`; when `false` the recipe is flagged `manually_edited = true`, when `true`
+	  (persisting an applied `/refine-recipe` result) the flag is cleared to `false`. Every
+	  call also appends one `recipe_versions` snapshot (`change_kind` `'manual'` or
+	  `'ai_edit'` to match) and a matching `recipe_timeline_events` row, bumping
+	  `current_version` — so a saved recipe's edit trail keeps growing after the initial
+	  save, not just during it. `change_prompt` is optional and becomes that version's
+	  `change_note`; it's the natural way to persist the AI instruction behind an
+	  `ai_sourced` update.
 - POST /update-recipe
 	- JSON: {"recipe":"...","changePrompt":"..."}
+- GET /recipes/{id}/history
+	- 200 with `[<RecipeVersion>, ...]`, newest first:
+	  `{"version":2,"change_kind":"ai_edit","change_note":"make it vegan","created_at":"...",`
+	  `"data":<RecipeDocument>}`. `change_note` is omitted for `"manual"`/`"extraction"`
+	  entries with no note. A recipe that's never had a structured save (markdown-only
+	  `add-recipe`, no `structured` field) returns `[]`. 404 if the recipe doesn't exist or
+	  isn't owned by the caller.
 
 Notes:
 - The historical "service" payload key is gone; the field is "recipe" everywhere.
+- Refining/saving an already-saved recipe (CookingModeScreen, "cooking notes" flow) does
+  not use `origin`/`history` — that path stays a single-turn refine with no persisted
+  edit trail. Only the pre-save GenerateScreen review chat does.
 - Ownership always comes from the token subject, never from the request body.
 
 ## Data Model
 
-See DATA_MODEL.md for the canonical schema. Migrations `00001`–`00004` create it from scratch;
-there is no legacy database to preserve.
+See DATA_MODEL.md for the canonical schema and RECIPE_TAGS.md for the tagging taxonomy.
+Migrations `00001`–`00006` create it from scratch; there is no legacy database to preserve.
 
 ## Code Map
 
 - cmd/main.go: route registration, handlers for user info/recipes/reprompt
 - internal/auth: JWKS validation, introspection, JIT user provisioning, typed request context
-- internal/service/generate_recipe.go: recipe generation logic (text/url/image), category and naming
+- internal/service/generate_recipe.go: recipe generation logic (text/url/image), tags and naming
+- internal/service/tags.go: fixed recipe tagging vocabulary (`AllTagSlugs`), see specs/RECIPE_TAGS.md
 - internal/service/handlers.go: generate + add handlers
 - internal/storage/db.go: pgx pool and recipe queries
 - internal/storage/users.go: EnsureUser upsert keyed by OIDC subject
@@ -186,10 +228,29 @@ there is no legacy database to preserve.
 - Unused guard exists:
 	- HandlerIsRecipeRelated is not wired to active routes.
 
-- Recipe content is still written as free-form markdown into `recipes.content`.
-  `recipe_ingredients` / `recipe_steps` exist but are not populated yet.
+- Recipe content is written as free-form markdown into `recipes.content` (still the field
+  the mobile client renders), but for structured saves (`storage.AddRecipeStructured`)
+  `recipe_ingredients` / `recipe_steps` / `recipe_versions` / `recipe_timeline_events` /
+  `sources` are all populated too — only the plain-markdown `storage.AddRecipe` path
+  (no `structured` field) skips them.
 
-- Language detection is prompt-based via lingua-go.
+- Language detection (text-generation path only): `resolveLanguage` in `generate_recipe.go`
+  trusts `lingua-go` detection only when the prompt is at least 4 words (a short foreign dish
+  name shouldn't override the client's browser locale); otherwise it falls back to the
+  `language` form field sent by the client, or to `""` (LLM self-detects) for older clients that
+  don't send it.
+
+- **Introspection requires an audience mapper on every client whose tokens reach this
+  backend.** Keycloak 26.x's `/protocol/openid-connect/token/introspect` returns
+  `{"active": false}` — not an error — for a perfectly valid, unexpired token if the
+  introspecting client (`KEYCLOAK_BACKEND_CLIENT_ID`, i.e. `backend`) isn't present in
+  the token's `aud` claim. `frontend` didn't have `backend` in its audience until an
+  explicit audience mapper was added (Terraform-managed, see
+  `../keycloak/terraform/`). If a new client is ever added (another app, a service,
+  etc.) and its calls to auth-required endpoints get an immediate, consistent 401 with
+  `introspection done active=false` in the logs — not something that only happens after
+  time passes — this is almost certainly the cause: add the same audience mapper for
+  that client.
 
 ## Editing Guidance
 
