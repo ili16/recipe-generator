@@ -38,7 +38,6 @@ services:
     networks:
       - recipe-network
 
-
 volumes:
   postgres_app_data:
   minio_data:

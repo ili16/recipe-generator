@@ -144,7 +144,10 @@ func resolveJSFetchContent(rawURL, html string) (string, bool) {
 	return "", false
 }
 
-func GetLanguage(prompt string) (string, error) {
+// DetectLanguage returns the ISO 639-1 code lingua-go confidently detects for
+// prompt, or ("", false) if it can't (unsupported language, or a signal too
+// weak to distinguish between the supported ones).
+func DetectLanguage(prompt string) (string, bool) {
 	languages := []lingua.Language{
 		lingua.English,
 		lingua.French,
@@ -159,10 +162,10 @@ func GetLanguage(prompt string) (string, error) {
 	language, exists := detector.DetectLanguageOf(prompt)
 
 	if !exists {
-		return "en", nil
+		return "", false
 	}
 
-	return language.IsoCode639_1().String(), nil
+	return strings.ToLower(language.IsoCode639_1().String()), true
 }
 
 func randomString() (string, error) {

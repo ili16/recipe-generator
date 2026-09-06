@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -13,7 +14,9 @@ import (
 	"github.com/ili16/recipe-generator/internal/model"
 	"github.com/ili16/recipe-generator/internal/service"
 	"github.com/ili16/recipe-generator/internal/storage"
+	"github.com/ili16/recipe-generator/internal/telemetry"
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 func main() {
@@ -25,6 +28,13 @@ func main() {
 		slog.Error("Missing environment variables")
 		os.Exit(1)
 	}
+
+	shutdownTelemetry, err := telemetry.Init(context.Background())
+	if err != nil {
+		slog.Error("Failed to initialize telemetry", "error", err)
+		os.Exit(1)
+	}
+	defer shutdownTelemetry(context.Background())
 
 	storage.InitDBPool()
 
@@ -42,13 +52,11 @@ func main() {
 	mux.HandleFunc("POST /api/v1/transcribe", service.HandleTranscribeAudio)
 	mux.HandleFunc("POST /api/v1/suggest", service.HandleSuggestInput)
 	mux.HandleFunc("POST /api/v1/suggest-prefs", service.HandleSuggestPrefs)
-	mux.HandleFunc("POST /api/v1/update-item", service.HandleUpdateItem)
-	mux.HandleFunc("POST /api/v1/validate-changes", service.HandleValidateChanges)
-	mux.HandleFunc("POST /api/v1/ask-step", service.HandleAskStep)
 	mux.HandleFunc("POST /api/v1/cooking-chat", service.HandleCookingChat)
 	mux.HandleFunc("POST /api/v1/refine-recipe", authenticator.Optional(service.HandleRefineRecipe))
 
 	mux.HandleFunc("GET /api/v1/recipes/{id}", authenticator.Require(HandleGetRecipeByID))
+	mux.HandleFunc("GET /api/v1/recipes/{id}/history", authenticator.Require(HandleGetRecipeHistory))
 
 	mux.HandleFunc("GET /api/v1/user-info", authenticator.Require(HandleGetUserInfo))
 	mux.HandleFunc("GET /api/v1/get-recipes", authenticator.Require(HandleGetRecipes))
@@ -58,7 +66,8 @@ func main() {
 
 	addr := ":" + envOrDefault("PORT", "8080")
 	slog.Info("Server is running", "addr", addr)
-	if err := http.ListenAndServe(addr, withCORS(logRequests(mux))); err != nil {
+	handler := otelhttp.NewHandler(withCORS(logRequests(mux)), "recipe-generator")
+	if err := http.ListenAndServe(addr, handler); err != nil {
 		slog.Error("Server failed", "error", err)
 		os.Exit(1)
 	}
@@ -97,7 +106,7 @@ func logRequests(next http.Handler) http.Handler {
 		start := time.Now()
 		rw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rw, r)
-		slog.Debug("request",
+		slog.DebugContext(r.Context(), "request",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rw.status,
@@ -173,6 +182,30 @@ func HandleGetRecipeByID(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, recipe)
 }
 
+func HandleGetRecipeHistory(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	recipeID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || recipeID <= 0 {
+		http.Error(w, "invalid recipe id", http.StatusBadRequest)
+		return
+	}
+	versions, err := storage.GetRecipeVersions(r.Context(), user.ID, recipeID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("Error getting recipe history", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, versions)
+}
+
 func HandleGetRecipes(w http.ResponseWriter, r *http.Request) {
 	slog.Debug("handler: get recipes")
 	user, ok := auth.FromContext(r.Context())
@@ -226,10 +259,10 @@ func HandleUpdateRecipe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var updateReq struct {
-		ID         int    `json:"id"`
-		Recipename string `json:"recipename"`
-		Recipe     string `json:"recipe"`
-		Category   string `json:"category"`
+		ID           int                  `json:"id"`
+		Structured   model.RecipeDocument `json:"structured"`
+		AISourced    bool                 `json:"ai_sourced,omitempty"`
+		ChangePrompt string               `json:"change_prompt,omitempty"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&updateReq); err != nil {
@@ -238,12 +271,13 @@ func HandleUpdateRecipe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if updateReq.ID == 0 || updateReq.Recipename == "" || updateReq.Recipe == "" {
+	if updateReq.ID == 0 || updateReq.Structured.Title == "" {
 		http.Error(w, "Missing required fields", http.StatusBadRequest)
 		return
 	}
 
-	updated, err := storage.UpdateRecipe(r.Context(), user.ID, updateReq.ID, updateReq.Recipename, updateReq.Recipe, updateReq.Category)
+	content := service.RenderMarkdown(updateReq.Structured)
+	updated, err := storage.UpdateRecipeStructured(r.Context(), user.ID, updateReq.ID, updateReq.Structured, content, !updateReq.AISourced, updateReq.ChangePrompt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			http.Error(w, "Recipe not found", http.StatusNotFound)

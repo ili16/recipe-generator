@@ -1,7 +1,7 @@
 # Recipe Data Model
 
-Date: 2026-08-21
-Status: implemented as goose migrations `00001`–`00004` (clean initial schema, no legacy DB)
+Date: 2026-08-21 (tags updated 2026-09-06)
+Status: implemented as goose migrations `00001`–`00006` (clean initial schema, no legacy DB)
 System of record: PostgreSQL. Markdown/HTML are rendered views, never the source of truth.
 
 ## Design Rules
@@ -27,6 +27,8 @@ System of record: PostgreSQL. Markdown/HTML are rendered views, never the source
 | `recipe_timeline_events` | append-only activity log | `user_id` |
 | `techniques`, `flavor_profiles` | reference vocabularies | — |
 | `recipe_techniques`, `recipe_flavor_profiles` | validation tags with confidence | via `recipe_id` |
+| `tags` | fixed multi-group tagging taxonomy, see `RECIPE_TAGS.md` | — |
+| `recipe_tags` | recipe ↔ tag join table (replaces the old `recipes.category`) | via `recipe_id` |
 | `creator_follows`, `feed_candidates` | blog/creator follow + discovered recipes | `user_id` |
 | `meal_plans`, `meal_plan_items` | week planning over saved recipes | `user_id` |
 
@@ -63,7 +65,6 @@ public_id             UUID UNIQUE            -- external/shareable id
 user_id               INT FK users
 title                 TEXT NOT NULL
 summary               TEXT
-category              TEXT NOT NULL DEFAULT 'other'
 language              TEXT NOT NULL DEFAULT 'en'
 servings              INT
 prep_minutes          INT
@@ -97,6 +98,13 @@ into "Dough" / "Sauce" blocks.
 
 `recipe_steps` carries `timer_seconds` and `temperature_c` so the mobile app can render
 in-step timers without re-parsing prose.
+
+## Tags
+
+`recipes.category` (a single `main|starter|bread|dessert|other` value) was replaced in
+migration `00006` by `tags` (fixed reference vocabulary, `slug`/`label`/`tag_group`) and
+`recipe_tags` (recipe ↔ tag join table, composite PK). A recipe can carry any number of tags
+across any number of groups. Full taxonomy, schema, and API contract: `RECIPE_TAGS.md`.
 
 ## Versioning
 
