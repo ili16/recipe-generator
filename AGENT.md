@@ -174,13 +174,26 @@ Authenticated (Bearer token required):
 - DELETE /delete-recipe/{id}
 	- 204 on success
 - PATCH /update-recipe
-	- JSON: `{"id":1,"structured":<RecipeDocument>,"ai_sourced":false}` — overwrites the
-	  recipe's header, ingredients, steps, and tags with `structured` (tags are always
-	  fully replaced, no more "empty tags = unchanged"). `ai_sourced` defaults to `false`;
-	  when `false` the recipe is flagged `manually_edited = true`, when `true` (persisting
-	  an applied `/refine-recipe` result) the flag is cleared to `false`.
+	- JSON: `{"id":1,"structured":<RecipeDocument>,"ai_sourced":false,"change_prompt":""}` —
+	  overwrites the recipe's header, ingredients, steps, and tags with `structured` (tags
+	  are always fully replaced, no more "empty tags = unchanged"). `ai_sourced` defaults to
+	  `false`; when `false` the recipe is flagged `manually_edited = true`, when `true`
+	  (persisting an applied `/refine-recipe` result) the flag is cleared to `false`. Every
+	  call also appends one `recipe_versions` snapshot (`change_kind` `'manual'` or
+	  `'ai_edit'` to match) and a matching `recipe_timeline_events` row, bumping
+	  `current_version` — so a saved recipe's edit trail keeps growing after the initial
+	  save, not just during it. `change_prompt` is optional and becomes that version's
+	  `change_note`; it's the natural way to persist the AI instruction behind an
+	  `ai_sourced` update.
 - POST /update-recipe
 	- JSON: {"recipe":"...","changePrompt":"..."}
+- GET /recipes/{id}/history
+	- 200 with `[<RecipeVersion>, ...]`, newest first:
+	  `{"version":2,"change_kind":"ai_edit","change_note":"make it vegan","created_at":"...",`
+	  `"data":<RecipeDocument>}`. `change_note` is omitted for `"manual"`/`"extraction"`
+	  entries with no note. A recipe that's never had a structured save (markdown-only
+	  `add-recipe`, no `structured` field) returns `[]`. 404 if the recipe doesn't exist or
+	  isn't owned by the caller.
 
 Notes:
 - The historical "service" payload key is gone; the field is "recipe" everywhere.
