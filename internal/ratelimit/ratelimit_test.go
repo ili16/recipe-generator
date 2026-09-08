@@ -4,10 +4,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestGuardBlocksAfterBurst(t *testing.T) {
-	l := New(2, 60) // anon: 2/hour, burst 2
+	l := New(2, 60, time.Hour) // anon: 2/hour, burst 2
 	h := l.Guard(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 
 	req := httptest.NewRequest(http.MethodPost, "/generate", nil)
@@ -32,7 +33,7 @@ func TestGuardBlocksAfterBurst(t *testing.T) {
 }
 
 func TestGuardSeparatesKeysByIP(t *testing.T) {
-	l := New(1, 60)
+	l := New(1, 60, time.Hour)
 	h := l.Guard(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 
 	for _, ip := range []string{"1.1.1.1:1", "2.2.2.2:2"} {

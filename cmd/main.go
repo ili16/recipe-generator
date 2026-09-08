@@ -17,6 +17,7 @@ import (
 	"github.com/ili16/recipe-generator/internal/service"
 	"github.com/ili16/recipe-generator/internal/storage"
 	"github.com/ili16/recipe-generator/internal/telemetry"
+	"github.com/ili16/recipe-generator/internal/worker"
 	"github.com/jackc/pgx/v5"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
@@ -39,6 +40,7 @@ func main() {
 	defer shutdownTelemetry(context.Background())
 
 	storage.InitDBPool()
+	worker.Start(time.Duration(envIntOrDefault("WORKER_INTERVAL_MINUTES", 60)) * time.Minute)
 
 	authenticator, err := auth.New(auth.ConfigFromEnv(), storage.Users{})
 	if err != nil {
@@ -46,13 +48,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	// rl guards the real generation endpoints: a handful of recipes per short window is
+	// plenty for a real user, but stops a script hammering the endpoint.
 	rl := ratelimit.New(
-		envIntOrDefault("RATE_LIMIT_ANON_PER_HOUR", 5),
-		envIntOrDefault("RATE_LIMIT_AUTH_PER_HOUR", 60),
+		envIntOrDefault("RATE_LIMIT_ANON_PER_10MIN", 5),
+		envIntOrDefault("RATE_LIMIT_AUTH_PER_10MIN", 15),
+		10*time.Minute,
+	)
+	// rlSuggest guards suggest/suggest-prefs, which are cheap autocomplete-style calls a
+	// single screen fires off repeatedly — budget them far more generously than real
+	// generations so normal use never trips the limiter.
+	rlSuggest := ratelimit.New(
+		envIntOrDefault("RATE_LIMIT_SUGGEST_ANON_PER_10MIN", 30),
+		envIntOrDefault("RATE_LIMIT_SUGGEST_AUTH_PER_10MIN", 100),
+		10*time.Minute,
 	)
 	// llm wraps an LLM-calling handler with rate limiting and budget enforcement, seeing
 	// the caller's identity (if any) via authenticator.Optional first.
-	llm := func(h http.HandlerFunc) http.HandlerFunc {
+	llm := func(rl *ratelimit.Limiter, h http.HandlerFunc) http.HandlerFunc {
 		return authenticator.Optional(rl.Guard(billing.Guard(h)))
 	}
 
@@ -60,12 +73,13 @@ func main() {
 
 	mux.HandleFunc("GET /health", HandleHealth)
 
-	mux.HandleFunc("POST /api/v1/generate", llm(service.HandleGenerateRecipe))
-	mux.HandleFunc("POST /api/v1/transcribe", llm(service.HandleTranscribeAudio))
-	mux.HandleFunc("POST /api/v1/suggest", llm(service.HandleSuggestInput))
-	mux.HandleFunc("POST /api/v1/suggest-prefs", llm(service.HandleSuggestPrefs))
-	mux.HandleFunc("POST /api/v1/cooking-chat", llm(service.HandleCookingChat))
-	mux.HandleFunc("POST /api/v1/refine-recipe", llm(service.HandleRefineRecipe))
+	mux.HandleFunc("POST /api/v1/generate", llm(rl, service.HandleGenerateRecipe))
+	mux.HandleFunc("POST /api/v1/generate/stream", llm(rl, service.HandleGenerateRecipeStream))
+	mux.HandleFunc("POST /api/v1/transcribe", llm(rl, service.HandleTranscribeAudio))
+	mux.HandleFunc("POST /api/v1/suggest", llm(rlSuggest, service.HandleSuggestInput))
+	mux.HandleFunc("POST /api/v1/suggest-prefs", llm(rlSuggest, service.HandleSuggestPrefs))
+	mux.HandleFunc("POST /api/v1/cooking-chat", llm(rl, service.HandleCookingChat))
+	mux.HandleFunc("POST /api/v1/refine-recipe", llm(rl, service.HandleRefineRecipe))
 
 	mux.HandleFunc("GET /api/v1/recipes/{id}", authenticator.Require(HandleGetRecipeByID))
 	mux.HandleFunc("GET /api/v1/recipes/{id}/history", authenticator.Require(HandleGetRecipeHistory))
@@ -76,6 +90,21 @@ func main() {
 	mux.HandleFunc("DELETE /api/v1/delete-recipe/{id}", authenticator.Require(HandleDeleteRecipe))
 	mux.HandleFunc("PATCH /api/v1/update-recipe", authenticator.Require(HandleUpdateRecipe))
 	mux.HandleFunc("GET /api/v1/usage", authenticator.Require(HandleGetUsage))
+	mux.HandleFunc("GET /api/v1/preferences", authenticator.Require(HandleGetPreferences))
+	mux.HandleFunc("PATCH /api/v1/preferences", authenticator.Require(HandlePatchPreferences))
+	mux.HandleFunc("GET /api/v1/meal-plan/week-preferences", authenticator.Require(HandleGetWeekPreferences))
+	mux.HandleFunc("PATCH /api/v1/meal-plan/week-preferences", authenticator.Require(HandlePatchWeekPreferences))
+	mux.HandleFunc("PUT /api/v1/recipes/{id}/vote", authenticator.Require(HandleVoteRecipe))
+	mux.HandleFunc("DELETE /api/v1/recipes/{id}/vote", authenticator.Require(HandleUnvoteRecipe))
+	mux.HandleFunc("POST /api/v1/decline-generation", authenticator.Require(HandleDeclineGeneration))
+	mux.HandleFunc("GET /api/v1/meal-plan", authenticator.Require(HandleGetMealPlan))
+	mux.HandleFunc("POST /api/v1/meal-plan/items", authenticator.Require(HandleAddMealPlanItem))
+	mux.HandleFunc("PATCH /api/v1/meal-plan/items/{id}", authenticator.Require(HandlePatchMealPlanItem))
+	mux.HandleFunc("DELETE /api/v1/meal-plan/items/{id}", authenticator.Require(HandleDeleteMealPlanItem))
+	mux.HandleFunc("POST /api/v1/meal-plan/suggest", llm(rl, HandleSuggestMealPlan))
+	mux.HandleFunc("POST /api/v1/meal-plan/chat", llm(rl, HandleMealPlanChat))
+	mux.HandleFunc("POST /api/v1/meal-plan/chat/stream", llm(rl, HandleMealPlanChatReplyStream))
+	mux.HandleFunc("POST /api/v1/meal-plan/variants/{id}", llm(rl, HandleGenerateVariant))
 
 	mux.HandleFunc("GET /api/v1/admin/users", authenticator.RequireAdmin(HandleAdminListUsers))
 	mux.HandleFunc("PATCH /api/v1/admin/users/{id}/budget", authenticator.RequireAdmin(HandleAdminSetBudget))
@@ -152,6 +181,16 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+// Flush forwards to the underlying ResponseWriter's Flusher, if it has one. Without
+// this, streaming handlers (SSE) doing `w.(http.Flusher)` behind logRequests would
+// fail the type assertion — statusRecorder embeds the http.ResponseWriter interface,
+// which doesn't include Flush, so it isn't promoted automatically.
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 func HandleGetUserInfo(w http.ResponseWriter, r *http.Request) {
 	slog.Debug("handler: get user info")
 	user, ok := auth.FromContext(r.Context())
@@ -195,6 +234,177 @@ func HandleGetUsage(w http.ResponseWriter, r *http.Request) {
 		"period_start": periodStart.Format(time.RFC3339),
 		"pct_used":     pct,
 	})
+}
+
+// dietaryPrefSlugs is the subset of service.AllTagSlugs valid as a user's own dietary
+// preference (as opposed to the full recipe-tagging vocabulary, which also covers meal
+// type, cooking method, etc. — not meaningful as a standing user preference).
+var dietaryPrefSlugs = map[string]bool{
+	"vegan": true, "vegetarian": true, "gluten-free": true, "dairy-free": true,
+	"nut-free": true, "keto": true, "low-carb": true,
+}
+
+// weekdayNames validates UserPreferences.MealPlanNoFoodDays/MealPlanNoCookDays/
+// WeekStartDay entries.
+var weekdayNames = map[string]bool{
+	"monday": true, "tuesday": true, "wednesday": true, "thursday": true,
+	"friday": true, "saturday": true, "sunday": true,
+}
+
+// HandleGetPreferences returns the caller's explicit profile settings.
+func HandleGetPreferences(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+	prefs, err := storage.GetPreferences(r.Context(), user.ID)
+	if err != nil {
+		slog.Error("Error getting preferences", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, prefs)
+}
+
+// HandlePatchPreferences overwrites the caller's explicit profile settings.
+func HandlePatchPreferences(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+	var prefs model.UserPreferences
+	if err := json.NewDecoder(r.Body).Decode(&prefs); err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+	if prefs.SkillLevel != nil {
+		switch *prefs.SkillLevel {
+		case "beginner", "intermediate", "advanced":
+		default:
+			http.Error(w, "invalid skill_level", http.StatusBadRequest)
+			return
+		}
+	}
+	if prefs.CookingCadence != nil {
+		switch *prefs.CookingCadence {
+		case "daily", "every_couple_days", "meal_prep_batching":
+		default:
+			http.Error(w, "invalid cooking_cadence", http.StatusBadRequest)
+			return
+		}
+	}
+	for _, slug := range prefs.DietaryPrefs {
+		if !dietaryPrefSlugs[slug] {
+			http.Error(w, "invalid dietary_prefs entry: "+slug, http.StatusBadRequest)
+			return
+		}
+	}
+	for _, day := range prefs.MealPlanNoFoodDays {
+		if !weekdayNames[day] {
+			http.Error(w, "invalid meal_plan_no_food_days entry: "+day, http.StatusBadRequest)
+			return
+		}
+	}
+	for _, day := range prefs.MealPlanNoCookDays {
+		if !weekdayNames[day] {
+			http.Error(w, "invalid meal_plan_no_cook_days entry: "+day, http.StatusBadRequest)
+			return
+		}
+	}
+	switch prefs.MealPlanBatchDays {
+	case 1, 2, 3:
+	default:
+		http.Error(w, "meal_plan_batch_days must be 1, 2, or 3", http.StatusBadRequest)
+		return
+	}
+	if prefs.WeekStartDay == "" {
+		prefs.WeekStartDay = "monday"
+	} else if !weekdayNames[prefs.WeekStartDay] {
+		http.Error(w, "invalid week_start_day", http.StatusBadRequest)
+		return
+	}
+	if err := storage.UpdatePreferences(r.Context(), user.ID, prefs); err != nil {
+		slog.Error("Error updating preferences", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, prefs)
+}
+
+// HandleVoteRecipe upserts the caller's thumbs up(+1)/down(-1) vote on a recipe they own.
+func HandleVoteRecipe(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+	recipeID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || recipeID <= 0 {
+		http.Error(w, "invalid recipe id", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		Vote int16 `json:"vote"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || (req.Vote != 1 && req.Vote != -1) {
+		http.Error(w, "vote must be 1 or -1", http.StatusBadRequest)
+		return
+	}
+	found, err := storage.SetVote(r.Context(), user.ID, recipeID, req.Vote)
+	if err != nil {
+		slog.Error("Error setting vote", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !found {
+		http.Error(w, "recipe not found", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleUnvoteRecipe removes the caller's vote on a recipe, if any.
+func HandleUnvoteRecipe(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+	recipeID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || recipeID <= 0 {
+		http.Error(w, "invalid recipe id", http.StatusBadRequest)
+		return
+	}
+	if err := storage.RemoveVote(r.Context(), user.ID, recipeID); err != nil {
+		slog.Error("Error removing vote", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleDeclineGeneration is a best-effort analytics beacon fired when the user closes
+// the review screen without saving. Always 204 — no client-visible distinction between
+// "resolved"/"already resolved"/"unknown generation_id", since this must never block the UI.
+func HandleDeclineGeneration(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+	var req struct {
+		GenerationID string `json:"generation_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err == nil && req.GenerationID != "" {
+		if err := storage.Resolve(r.Context(), user.ID, req.GenerationID, "declined", nil); err != nil {
+			slog.Warn("resolve declined generation failed", "error", err)
+		} else {
+			telemetry.RecordGenerationOutcome(r.Context(), "declined", 1)
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // HandleAdminListUsers returns every user with their current-month spend and effective

@@ -30,7 +30,7 @@ System of record: PostgreSQL. Markdown/HTML are rendered views, never the source
 | `tags` | fixed multi-group tagging taxonomy, see `RECIPE_TAGS.md` | — |
 | `recipe_tags` | recipe ↔ tag join table (replaces the old `recipes.category`) | via `recipe_id` |
 | `creator_follows`, `feed_candidates` | blog/creator follow + discovered recipes | `user_id` |
-| `meal_plans`, `meal_plan_items` | week planning over saved recipes | `user_id` |
+| `meal_plans`, `meal_plan_items` | meal planning over saved recipes (items carry `start_time`, migration `00013`) | `user_id` |
 
 ## `users`
 
@@ -86,6 +86,13 @@ deleted_at            TIMESTAMPTZ            -- soft delete
 `content` is a convenience copy of the rendered markdown so the current mobile client keeps
 working; `recipe_ingredients` and `recipe_steps` are authoritative once the structured write
 path lands.
+
+Migration `00014` adds `variant_of_recipe_id INT REFERENCES recipes(id) ON DELETE SET NULL`
+(indexed, partial) — links a recipe back to the one it was generated as a twist on via
+`POST /meal-plan/variants/{id}`, when the caller accepts the proposal. Not yet surfaced in
+any listing/grouping UI. (This block otherwise predates several later migrations —
+`manually_edited`, `recipe_votes`, `user_preferences`, `user_cooking_profiles`,
+`generation_events` — see the migration files for the current full schema.)
 
 ## Ingredients and Steps
 

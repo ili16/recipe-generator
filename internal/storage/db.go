@@ -112,7 +112,7 @@ func insertIngredientsAndSteps(ctx context.Context, tx pgx.Tx, recipeID int, doc
 // matching recipe_timeline_events row, so "was this recipe saved unedited?" is just
 // current_version == 1. The saved document is history's last entry; an empty history is
 // treated as a single unedited entry seeded with doc.
-func AddRecipeStructured(ctx context.Context, userID int, doc model.RecipeDocument, content string, origin *model.GenerationOrigin, history []model.EditTurn, aiModel, promptVersion string) (model.Recipe, error) {
+func AddRecipeStructured(ctx context.Context, userID int, doc model.RecipeDocument, content string, origin *model.GenerationOrigin, history []model.EditTurn, aiModel, promptVersion string, variantOfRecipeID *int) (model.Recipe, error) {
 	if len(history) == 0 {
 		history = []model.EditTurn{{Structured: doc}}
 	}
@@ -132,12 +132,13 @@ func AddRecipeStructured(ctx context.Context, userID int, doc model.RecipeDocume
 	err = tx.QueryRow(ctx, `
 		INSERT INTO recipes
 			(user_id, title, summary, language, servings, prep_minutes, cook_minutes,
-			 difficulty, source_type, content, ai_model, ai_prompt_version, current_version)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+			 difficulty, source_type, content, ai_model, ai_prompt_version, current_version,
+			 variant_of_recipe_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 		RETURNING id`,
 		userID, doc.Title, doc.Summary, doc.Language,
 		doc.Servings, doc.PrepMinutes, doc.CookMinutes, doc.Difficulty, sourceType, content,
-		aiModel, promptVersion, len(history),
+		aiModel, promptVersion, len(history), variantOfRecipeID,
 	).Scan(&recipeID)
 	if err != nil {
 		return model.Recipe{}, err
@@ -341,13 +342,16 @@ func GetRecipeByID(ctx context.Context, userID, recipeID int) (model.Recipe, err
 
 	err := Pool.QueryRow(ctx, `
 		SELECT r.id, r.title, r.content, r.manually_edited,
-		       r.summary, r.language, r.servings, r.prep_minutes, r.cook_minutes, r.difficulty
+		       r.summary, r.language, r.servings, r.prep_minutes, r.cook_minutes, r.difficulty,
+		       rv.vote
 		FROM recipes r
+		LEFT JOIN recipe_votes rv ON rv.recipe_id = r.id AND rv.user_id = $2
 		WHERE r.id = $1 AND r.user_id = $2 AND r.deleted_at IS NULL`,
 		recipeID, userID,
 	).Scan(
 		&recipe.ID, &recipe.Recipename, &recipe.Recipe, &recipe.ManuallyEdited,
 		&doc.Summary, &doc.Language, &doc.Servings, &doc.PrepMinutes, &doc.CookMinutes, &doc.Difficulty,
+		&recipe.MyVote,
 	)
 	if err != nil {
 		return model.Recipe{}, err
@@ -460,7 +464,11 @@ func GetRecipeVersions(ctx context.Context, userID, recipeID int) ([]model.Recip
 func GetRecipes(userid int) ([]model.Recipe, error) {
 	slog.Debug("db: query recipes", "userID", userid)
 	t := time.Now()
-	rows, err := Pool.Query(context.Background(), "SELECT id, title, content, manually_edited FROM recipes WHERE user_id = $1 ORDER BY updated_at DESC", userid)
+	rows, err := Pool.Query(context.Background(), `
+		SELECT r.id, r.title, r.content, r.manually_edited, rv.vote, r.variant_of_recipe_id
+		FROM recipes r
+		LEFT JOIN recipe_votes rv ON rv.recipe_id = r.id AND rv.user_id = $1
+		WHERE r.user_id = $1 ORDER BY r.updated_at DESC`, userid)
 	if err != nil {
 		slog.Error("Failed to query recipes", "error", err)
 		return nil, err
@@ -469,7 +477,7 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 	var recipes []model.Recipe
 	for rows.Next() {
 		var recipe model.Recipe
-		err := rows.Scan(&recipe.ID, &recipe.Recipename, &recipe.Recipe, &recipe.ManuallyEdited)
+		err := rows.Scan(&recipe.ID, &recipe.Recipename, &recipe.Recipe, &recipe.ManuallyEdited, &recipe.MyVote, &recipe.VariantOfRecipeID)
 		if err != nil {
 			rows.Close()
 			slog.Error("Failed to scan recipe", "error", err)

@@ -34,7 +34,7 @@ func TestUpdateRecipeStructuredTogglesManuallyEdited(t *testing.T) {
 		Ingredients: []model.RecipeIngredient{{Item: "Water", Optional: false}},
 		Steps:       []model.RecipeStep{{SortOrder: 1, StepText: "Boil it"}},
 	}
-	created, err := AddRecipeStructured(ctx, userID, doc, "# Test Soup", nil, nil, "test-model", "v1")
+	created, err := AddRecipeStructured(ctx, userID, doc, "# Test Soup", nil, nil, "test-model", "v1", nil)
 	if err != nil {
 		t.Fatalf("AddRecipeStructured: %v", err)
 	}

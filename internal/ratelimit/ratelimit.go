@@ -3,7 +3,9 @@ package ratelimit
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,27 +26,31 @@ type Limiter struct {
 
 	anon, authed   rate.Limit
 	anonB, authedB int
+	window         time.Duration
 }
 
-// New creates a Limiter. anonPerHour/authPerHour are request caps per rolling hour;
-// burst is set to the full hourly cap so a caller can use their whole budget at once.
-func New(anonPerHour, authPerHour int) *Limiter {
+// New creates a Limiter. anonPerWindow/authPerWindow are request caps per rolling
+// window; burst is set to the full window cap so a caller can use their whole budget
+// at once, then refills steadily over window.
+func New(anonPerWindow, authPerWindow int, window time.Duration) *Limiter {
+	seconds := window.Seconds()
 	l := &Limiter{
 		buckets: make(map[string]*rate.Limiter),
 		seen:    make(map[string]time.Time),
-		anon:    rate.Limit(float64(anonPerHour) / 3600),
-		anonB:   anonPerHour,
-		authed:  rate.Limit(float64(authPerHour) / 3600),
-		authedB: authPerHour,
+		anon:    rate.Limit(float64(anonPerWindow) / seconds),
+		anonB:   anonPerWindow,
+		authed:  rate.Limit(float64(authPerWindow) / seconds),
+		authedB: authPerWindow,
+		window:  window,
 	}
 	go l.sweep()
 	return l
 }
 
-// sweep evicts buckets idle for more than 10 minutes so the map doesn't grow unbounded.
+// sweep evicts buckets idle for longer than window so the map doesn't grow unbounded.
 func (l *Limiter) sweep() {
-	for range time.Tick(10 * time.Minute) {
-		cutoff := time.Now().Add(-10 * time.Minute)
+	for range time.Tick(l.window) {
+		cutoff := time.Now().Add(-l.window)
 		l.mu.Lock()
 		for k, t := range l.seen {
 			if t.Before(cutoff) {
@@ -91,7 +97,8 @@ func (l *Limiter) Guard(next http.HandlerFunc) http.HandlerFunc {
 		l.mu.Unlock()
 
 		if !b.Allow() {
-			w.Header().Set("Retry-After", "3600")
+			slog.WarnContext(r.Context(), "rate limited", "key", key, "path", r.URL.Path)
+			w.Header().Set("Retry-After", strconv.Itoa(int(l.window.Seconds())))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
 			w.Write([]byte(`{"error":"rate_limited"}`))

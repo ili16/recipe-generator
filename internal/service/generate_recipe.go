@@ -364,6 +364,135 @@ func generateStructuredFromMessages(ctx context.Context, callType string, messag
 	return doc, nil
 }
 
+// generateStructuredStream mirrors generateStructuredFromMessages but streams the raw
+// JSON text via onDelta as it arrives (client.Chat.Completions.NewStreaming, same
+// pattern as StreamMealPlanChatReply in mealplan.go), then parses/validates/records
+// cost against the fully accumulated text exactly like the non-streaming path once the
+// stream ends.
+func generateStructuredStream(ctx context.Context, language string, onDelta func(string), parts ...openai.ChatCompletionContentPartUnionParam) (model.RecipeDocument, error) {
+	client := OpenAIclient()
+	messages := []openai.ChatCompletionMessageParamUnion{
+		openai.SystemMessage(buildSystemPrompt(language)),
+		openai.UserMessage(parts),
+	}
+
+	slog.DebugContext(ctx, "llm: structured stream start", "model", recipeModel, "call_type", "generate")
+	t := time.Now()
+
+	ctx, span := telemetry.StartSpan(ctx, "llm.chat_completion")
+	span.SetAttributes(attribute.String("llm.model", string(recipeModel)), attribute.String("llm.call_type", "generate"))
+	defer span.End()
+
+	stream := client.Chat.Completions.NewStreaming(ctx, openai.ChatCompletionNewParams{
+		Messages: messages,
+		Model:    recipeModel,
+		ResponseFormat: openai.ChatCompletionNewParamsResponseFormatUnion{
+			OfJSONSchema: &openai.ResponseFormatJSONSchemaParam{
+				JSONSchema: openai.ResponseFormatJSONSchemaJSONSchemaParam{
+					Name:   "recipe",
+					Schema: recipeJSONSchema(),
+					Strict: param.NewOpt(true),
+				},
+			},
+		},
+		StreamOptions: openai.ChatCompletionStreamOptionsParam{IncludeUsage: param.NewOpt(true)},
+	})
+	defer stream.Close()
+
+	var raw strings.Builder
+	var promptTokens, completionTokens int64
+	for stream.Next() {
+		chunk := stream.Current()
+		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
+			delta := chunk.Choices[0].Delta.Content
+			raw.WriteString(delta)
+			onDelta(delta)
+		}
+		if chunk.Usage.TotalTokens > 0 {
+			promptTokens, completionTokens = chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens
+		}
+	}
+	if err := stream.Err(); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		telemetry.RecordLLMCall(ctx, "generate", string(recipeModel), time.Since(t).Milliseconds(), false)
+		return model.RecipeDocument{}, fmt.Errorf("structured stream: %w", err)
+	}
+
+	telemetry.RecordLLMUsage(ctx, "generate", string(recipeModel), promptTokens, completionTokens)
+	recordCost(ctx, "generate", string(recipeModel), promptTokens, completionTokens)
+
+	var doc model.RecipeDocument
+	if err := json.Unmarshal([]byte(raw.String()), &doc); err != nil {
+		telemetry.RecordLLMCall(ctx, "generate", string(recipeModel), time.Since(t).Milliseconds(), false)
+		return model.RecipeDocument{}, fmt.Errorf("parse structured response: %w", err)
+	}
+	if doc.Title == "" && len(doc.Ingredients) == 0 && len(doc.Steps) == 0 {
+		telemetry.RecordLLMCall(ctx, "generate", string(recipeModel), time.Since(t).Milliseconds(), false)
+		return model.RecipeDocument{}, errors.New("no recipe found in the provided content")
+	}
+	slog.DebugContext(ctx, "llm: structured stream recipe", "model", recipeModel,
+		"dur_ms", time.Since(t).Milliseconds(),
+		"tokens", promptTokens+completionTokens,
+		"title", doc.Title)
+	telemetry.RecordLLMCall(ctx, "generate", string(recipeModel), time.Since(t).Milliseconds(), true)
+	return doc, nil
+}
+
+// GenerateRecipeStream mirrors GenerateRecipe but streams the LLM's raw JSON output via
+// onDelta as it's generated. url-fetch/image-read stay synchronous pre-steps exactly as
+// in GenerateRecipe — only the final LLM call streams.
+func GenerateRecipeStream(input model.GenerateRecipeInput, onDelta func(string)) (model.RecipeDocument, error) {
+	if input.Image != nil {
+		return generateFromImageStream(input.Image, input.Prompt, onDelta)
+	}
+	if input.URL != "" {
+		return generateFromURLStream(input.URL, input.Prompt, onDelta)
+	}
+	return generateFromTextStream(input.Prompt, input.PreferredLanguage, onDelta)
+}
+
+func generateFromTextStream(prompt, preferredLanguage string, onDelta func(string)) (model.RecipeDocument, error) {
+	language := resolveLanguage(prompt, preferredLanguage)
+	slog.Debug("generate/stream: text", "prompt_len", len(prompt), "language", language)
+	return generateStructuredStream(context.TODO(), language, onDelta, openai.TextContentPart("Generate a recipe for: "+prompt))
+}
+
+func generateFromURLStream(url, prompt string, onDelta func(string)) (model.RecipeDocument, error) {
+	slog.Debug("generate/stream/url: fetching page", "url", url)
+	content, err := utils.GetWebsiteContent(url)
+	if err != nil {
+		return model.RecipeDocument{}, fmt.Errorf("fetch url: %w", err)
+	}
+	slog.Debug("generate/stream/url: page fetched", "bytes", len(content))
+	userText := "Extract and structure this recipe from the webpage content."
+	if prompt != "" {
+		userText += " Additional instructions: " + prompt
+	}
+	return generateStructuredStream(context.TODO(), "", onDelta, openai.TextContentPart(userText+"\n\n"+content))
+}
+
+func generateFromImageStream(file multipart.File, prompt string, onDelta func(string)) (model.RecipeDocument, error) {
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return model.RecipeDocument{}, fmt.Errorf("read image: %w", err)
+	}
+	mime := http.DetectContentType(data)
+	if mime == "application/octet-stream" {
+		mime = "image/jpeg"
+	}
+	slog.Debug("generate/stream/image: read", "bytes", len(data), "mime", mime)
+	userText := "Extract and structure the recipe shown in this image."
+	if prompt != "" {
+		userText += " Additional instructions: " + prompt
+	}
+	dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)
+	return generateStructuredStream(context.TODO(), "", onDelta,
+		openai.TextContentPart(userText),
+		openai.ImageContentPart(openai.ChatCompletionContentPartImageImageURLParam{URL: dataURL}),
+	)
+}
+
 // minWordsForLanguageDetection is a naive proxy for "the prompt is a sustained
 // sentence in a language, not just a short foreign proper noun/dish name".
 // ponytail: raw word count, not confidence-weighted — if longer prompts still

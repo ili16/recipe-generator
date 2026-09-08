@@ -22,6 +22,21 @@ Related plans:
 - `PORT` env var; startup warning when `CORS_ORIGIN` is unset.
 - Debug logging with timing for every request, LLM call, DB query, and auth step.
 - MIME detection for uploaded images (`http.DetectContentType` replaces hardcoded `image/jpeg`).
+- Weekly meal planning MVP: `GET /api/v1/meal-plan`, `POST /api/v1/meal-plan/items`,
+  `DELETE /api/v1/meal-plan/items/{id}` (`internal/storage/mealplan.go`, `cmd/mealplan.go`) —
+  one recipe per day, `meal_plans` row created implicitly on first write.
+- (2026-09-08) Meal planner v2 — AI-first: `POST /meal-plan/suggest` composes a plan from
+  the caller's saved recipes (LLM-calling, structured JSON like `/refine-recipe`);
+  `POST /meal-plan/chat` refines a proposal conversationally (same stateless,
+  client-resends-history pattern); `POST /meal-plan/variants/{id}` proposes a new,
+  unsaved recipe as a twist on an existing one (`recipes.variant_of_recipe_id`,
+  migration `00014`) for when saved-recipe variety is low (<10). Items now carry
+  `start_time` (migration `00013`) and `PATCH /meal-plan/items/{id}` moves one — the Day
+  view's drag interaction. `GET /meal-plan` generalized to an arbitrary date range
+  (`ends_on` optional, defaults to a week) so Day/Week/Month share one endpoint.
+  `AddMealPlanItem` now upserts by day. The "recommendation query" (ranking saved
+  recipes by cook history for a non-AI suggestion) stays unscheduled (see Backlog) — the
+  AI suggest flow above supersedes the immediate need for it.
 
 ---
 
@@ -61,14 +76,11 @@ All three extract modes (text/url/image) must go through this path. Same output 
 - Returns proposed diff (not a direct mutation).
 - On user accept: write new `recipe_versions` row + apply to live tables + append `recipe_timeline_events`.
 
-### What to eat today / meal planning
-- `meal_plans` and `meal_plan_items` tables already exist.
-- Implement CRUD endpoints and a simple recommendation query.
-
 ---
 
 ## 🗂 Backlog (future)
 
+- Meal plan recommendation query ("what to eat today") — needs cooked/like/dislike signal first.
 - Creator/blog follows and feed candidates.
 - Notes and timeline read/write endpoints.
 - Techniques and flavor profiles wired to extraction output.
