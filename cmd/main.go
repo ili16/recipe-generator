@@ -72,6 +72,8 @@ func main() {
 	// AI route it replaced is gone (BACKLOG.md 3.5, 3.9, 3.13).
 	mux.HandleFunc("POST /api/v1/chat", llm(rl, service.HandleChat))
 
+	mux.HandleFunc("GET /api/v1/recipes/trash", authenticator.Require(HandleGetTrash))
+	mux.HandleFunc("POST /api/v1/recipes/{id}/restore", authenticator.Require(HandleRestoreRecipe))
 	mux.HandleFunc("GET /api/v1/recipes/{id}", authenticator.Require(HandleGetRecipeByID))
 	mux.HandleFunc("GET /api/v1/recipes/{id}/history", authenticator.Require(HandleGetRecipeHistory))
 
@@ -85,6 +87,12 @@ func main() {
 	mux.HandleFunc("PATCH /api/v1/preferences", authenticator.Require(HandlePatchPreferences))
 	mux.HandleFunc("PUT /api/v1/recipes/{id}/vote", authenticator.Require(HandleVoteRecipe))
 	mux.HandleFunc("DELETE /api/v1/recipes/{id}/vote", authenticator.Require(HandleUnvoteRecipe))
+	mux.HandleFunc("GET /api/v1/collections", authenticator.Require(HandleGetCollections))
+	mux.HandleFunc("POST /api/v1/collections", authenticator.Require(HandleCreateCollection))
+	mux.HandleFunc("DELETE /api/v1/collections/{id}", authenticator.Require(HandleDeleteCollection))
+	mux.HandleFunc("PUT /api/v1/collections/{id}/recipes/{recipeId}", authenticator.Require(HandleSetCollectionMembership))
+	mux.HandleFunc("DELETE /api/v1/collections/{id}/recipes/{recipeId}", authenticator.Require(HandleSetCollectionMembership))
+
 	mux.HandleFunc("GET /api/v1/meal-plan", authenticator.Require(HandleGetMealPlan))
 	mux.HandleFunc("POST /api/v1/meal-plan/items", authenticator.Require(HandleAddMealPlanItem))
 	mux.HandleFunc("DELETE /api/v1/meal-plan/items/{id}", authenticator.Require(HandleDeleteMealPlanItem))
@@ -541,6 +549,153 @@ func HandleDeleteRecipe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleGetTrash lists the caller's soft-deleted recipes (BACKLOG 8.2).
+func HandleGetTrash(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+
+	recipes, err := storage.GetTrashedRecipes(r.Context(), user.ID)
+	if err != nil {
+		slog.Error("Error getting trash", "error", err)
+		http.Error(w, "Error getting trash", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, recipes)
+}
+
+// HandleRestoreRecipe un-deletes a trashed recipe. A id that isn't a trashed recipe of
+// the caller's — another user's, or one already restored — is a 404.
+func HandleRestoreRecipe(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+
+	recipeID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || recipeID <= 0 {
+		http.Error(w, "Invalid recipe id", http.StatusBadRequest)
+		return
+	}
+
+	if err := storage.RestoreRecipe(r.Context(), user.ID, recipeID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "Recipe not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("Error restoring recipe", "error", err)
+		http.Error(w, "Error restoring recipe", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+/* ── Collections (BACKLOG 8.1) ─────────────────────────────────────────────── */
+
+func HandleGetCollections(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+
+	collections, err := storage.ListCollections(r.Context(), user.ID)
+	if err != nil {
+		slog.Error("Error listing collections", "error", err)
+		http.Error(w, "Error listing collections", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, collections)
+}
+
+func HandleCreateCollection(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	collection, err := storage.CreateCollection(r.Context(), user.ID, req.Name)
+	if err != nil {
+		if errors.Is(err, storage.ErrEmptyCollectionName) {
+			http.Error(w, "Collection name is required", http.StatusBadRequest)
+			return
+		}
+		slog.Error("Error creating collection", "error", err)
+		http.Error(w, "Error creating collection", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusCreated, collection)
+}
+
+func HandleDeleteCollection(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+
+	collectionID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || collectionID <= 0 {
+		http.Error(w, "Invalid collection id", http.StatusBadRequest)
+		return
+	}
+
+	if err := storage.DeleteCollection(r.Context(), user.ID, collectionID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "Collection not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("Error deleting collection", "error", err)
+		http.Error(w, "Error deleting collection", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleSetCollectionMembership serves both PUT (add) and DELETE (remove) on
+// /collections/{id}/recipes/{recipeId} — same ownership check, same 404, one handler.
+func HandleSetCollectionMembership(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+
+	collectionID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || collectionID <= 0 {
+		http.Error(w, "Invalid collection id", http.StatusBadRequest)
+		return
+	}
+	recipeID, err := strconv.Atoi(r.PathValue("recipeId"))
+	if err != nil || recipeID <= 0 {
+		http.Error(w, "Invalid recipe id", http.StatusBadRequest)
+		return
+	}
+
+	if err := storage.SetCollectionMembership(r.Context(), user.ID, collectionID, recipeID, r.Method == http.MethodPut); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "Not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("Error updating collection membership", "error", err)
+		http.Error(w, "Error updating collection", http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

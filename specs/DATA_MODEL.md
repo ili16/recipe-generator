@@ -31,6 +31,8 @@ System of record: PostgreSQL. Markdown/HTML are rendered views, never the source
 | `recipe_tags` | recipe ↔ tag join table (replaces the old `recipes.category`) | via `recipe_id` |
 | `creator_follows`, `feed_candidates` | blog/creator follow + discovered recipes | `user_id` |
 | `meal_plans`, `meal_plan_items` | meal planning over saved recipes (items carry `start_time`, migration `00013`) | `user_id` |
+| `collections` | user-named groupings of their own recipes, unique per `(user_id, name)`, migration `00020` | `user_id` |
+| `recipe_collections` | recipe ↔ collection join table; a recipe may sit in several | via `collection_id` |
 
 ## `users`
 
@@ -89,7 +91,8 @@ extraction_confidence NUMERIC(4,3)
 current_version       INT NOT NULL DEFAULT 1
 attributes            JSONB NOT NULL DEFAULT '{}'
 created_at/updated_at TIMESTAMPTZ
-deleted_at            TIMESTAMPTZ            -- soft delete
+deleted_at            TIMESTAMPTZ            -- soft delete; set by DELETE /delete-recipe, cleared by
+                                             -- POST /recipes/:id/restore, purged after 30d (BACKLOG 8.2)
 ```
 
 `content` is a convenience copy of the rendered markdown so the current mobile client keeps

@@ -31,7 +31,8 @@ flowchart TD
     AUTH -->|no| LOGIN[Sign-in → Keycloak OIDC]
 
     SAVED --> LIST
-    LIST -->|delete| DEL[DELETE /delete-recipe/:id]
+    LIST -->|delete| DEL[DELETE /delete-recipe/:id\nsoft — trash for 30 days]
+    DEL -->|restore| SAVED
     LIST -->|rename / manual edit| PATCH[PATCH /update-recipe]
 ```
 
@@ -48,6 +49,11 @@ graph LR
         AR[POST /add-recipe]
         GR[GET /get-recipes]
         DR[DELETE /delete-recipe/:id]
+        TR[GET /recipes/trash]
+        RS[POST /recipes/:id/restore]
+        COL[GET/POST /collections]
+        COLD[DELETE /collections/:id]
+        COLM[PUT/DELETE /collections/:id/recipes/:recipeId]
         UR[PATCH /update-recipe]
         UF[GET /user-info]
         US[GET /usage]
@@ -295,7 +301,34 @@ Authenticated (Bearer token required):
 	  `current_version == 1` means "saved the first generation unedited."
 	- 201 with the created recipe
 - DELETE /delete-recipe/{id}
-	- 204 on success
+	- 204 on success. **Soft** since BACKLOG 8.2: it stamps `recipes.deleted_at`, and every
+	  read path filters `deleted_at IS NULL` — except `GetMealPlanRange`'s join, deliberately,
+	  so a week that already references the recipe still renders. `internal/worker` hard-deletes
+	  rows trashed longer than 30 days (`storage.PurgeDeletedRecipes`), and the FK cascades take
+	  the ingredients, steps, versions, timeline and meal-plan items with them.
+- GET /recipes/trash
+	- 200 with the caller's soft-deleted recipes (id, title, content, `deleted_at`), newest
+	  deletion first. Deliberately thinner than `/get-recipes` — nothing in the trash can be
+	  cooked, voted on or refined.
+- POST /recipes/{id}/restore
+	- 204, clearing `deleted_at`. 404 when the id isn't a *trashed* recipe of the caller's —
+	  another user's id and an already-restored one are indistinguishable on purpose. The
+	  recipe comes back intact, version history included, and reappears in its collections.
+- GET /collections
+	- 200 with `[{"id":1,"name":"Sunday","recipe_ids":[7,3]}, ...]`, by name. `recipe_ids` is
+	  the full membership, so the client filters its already-loaded library — there is
+	  deliberately **no** per-collection list endpoint. Soft-deleted recipes are left out of
+	  `recipe_ids` but keep their membership row, so restoring puts them back.
+- POST /collections
+	- JSON: `{"name":"Sunday"}` → 201 with the collection. The name is trimmed, and
+	  re-creating an existing name returns *that* collection (upsert on `(user_id, name)`) —
+	  not a duplicate and not an error. A blank name is 400. There is no rename endpoint yet.
+- DELETE /collections/{id}
+	- 204. Drops the collection and its membership rows; the recipes are untouched
+	  (`recipe_collections` cascades, `recipes` does not). 404 if not the caller's.
+- PUT | DELETE /collections/{id}/recipes/{recipeId}
+	- 204. Adds/removes one recipe; a recipe may sit in several collections. Adding twice is
+	  a no-op. 404 when either id isn't the caller's, or when removing a non-member.
 - PATCH /update-recipe
 	- JSON: `{"id":1,"structured":<RecipeDocument>,"ai_sourced":false,"change_prompt":""}` —
 	  overwrites the recipe's header, ingredients, steps, and tags with `structured` (tags
@@ -388,6 +421,8 @@ Notes:
 
 See DATA_MODEL.md for the canonical schema and RECIPE_TAGS.md for the tagging taxonomy.
 Migrations `00001`–`00006` create it from scratch; there is no legacy database to preserve.
+`00020` adds `collections` + `recipe_collections` (BACKLOG 8.1). `recipes.deleted_at` has
+existed since `00001` but only became meaningful with BACKLOG 8.2's soft delete.
 
 ## Code Map
 
@@ -395,6 +430,8 @@ Migrations `00001`–`00006` create it from scratch; there is no legacy database
 - cmd/mealplan.go: meal-plan handlers (range get / add / patch / delete item, variants)
 - internal/auth: JWKS validation, introspection, JIT user provisioning, admin role, typed request context
 - internal/ratelimit: in-memory per-IP/per-user token-bucket request limiter
+- internal/worker: the periodic background pass — cooking-profile recompute, and purging
+  recipes trashed longer than 30 days
 - internal/billing: LLM cost estimation (pricing.go) and monthly budget enforcement (guard.go)
 - internal/llm: the one OpenAI chat-completion call path (`Call[T]` for a decoded value,
   `CallMessage` for the raw assistant message with its tool calls, which is what the agent
@@ -413,6 +450,8 @@ Migrations `00001`–`00006` create it from scratch; there is no legacy database
 - internal/storage/usage.go: LLM usage recording, spend lookup, admin usage listing, budget overrides
 - internal/storage/mealplan.go: meal-plan range queries, transactional upsert-by-day apply
   (`ApplyMealPlanDays`; `AddMealPlanItem` is the one-day case), move (patch), delete
+- internal/storage/collections.go: collections CRUD and membership, every query scoped by
+  `user_id` so another user's id is not-found (BACKLOG 8.1)
 - internal/storage/conversations.go: server-held chat threads for /chat, ownership-checked on
   every read and append
 - internal/model/models.go: request/response structs

@@ -63,6 +63,18 @@ type Recipe struct {
 	SourceType string     `json:"source_type,omitempty"`
 	SourceURL  *string    `json:"source_url,omitempty"`
 	CreatedAt  *time.Time `json:"created_at,omitempty"`
+	// DeletedAt is set only on the trash listing (GET /recipes/trash); every other
+	// read path filters soft-deleted rows out, so it is always nil there.
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+}
+
+// Collection is a user-named grouping of their own recipes (BACKLOG 8.1). RecipeIDs is
+// the membership, so the client filters its already-loaded library rather than asking
+// the server for a second, filtered list.
+type Collection struct {
+	ID        int    `json:"id"`
+	Name      string `json:"name"`
+	RecipeIDs []int  `json:"recipe_ids"`
 }
 
 // UserPreferences is the explicit profile settings a user can set about themselves:

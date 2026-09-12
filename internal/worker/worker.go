@@ -1,5 +1,5 @@
-// Package worker runs a single periodic background pass: recomputing per-user cooking
-// profiles. It also used to close out stale generation_events; that table was dropped
+// Package worker runs the periodic background passes: recomputing per-user cooking
+// profiles, and purging recipes that have sat in the trash past the retention window. It also used to close out stale generation_events; that table was dropped
 // with the funnel it described (BACKLOG.md 3.10/3.14).
 package worker
 
@@ -33,10 +33,19 @@ func (w *Worker) loop() {
 	}
 }
 
+// trashRetention is how long a soft-deleted recipe stays restorable (BACKLOG 8.2).
+const trashRetention = 30 * 24 * time.Hour
+
 func (w *Worker) runOnce(ctx context.Context) {
 	if n, err := storage.RecomputeAllCookingProfiles(ctx); err != nil {
 		slog.Error("worker: recompute cooking profiles failed", "error", err)
 	} else {
 		slog.Debug("worker: recomputed cooking profiles", "users", n)
+	}
+
+	if n, err := storage.PurgeDeletedRecipes(ctx, trashRetention); err != nil {
+		slog.Error("worker: purge deleted recipes failed", "error", err)
+	} else if n > 0 {
+		slog.Info("worker: purged trashed recipes", "count", n)
 	}
 }

@@ -284,14 +284,72 @@ func UpdateRecipeStructured(ctx context.Context, userID, recipeID int, doc model
 	}, nil
 }
 
+// DeleteRecipe soft-deletes: it stamps deleted_at, so the row survives for the trash
+// (BACKLOG 8.2). Every read path filters on `deleted_at IS NULL` — except the meal-plan
+// join, deliberately, so a week that already references the recipe still renders.
+// PurgeDeletedRecipes does the real DELETE 30 days later.
 func DeleteRecipe(ctx context.Context, userID, recipeID int) error {
-	slog.Debug("db: delete recipe", "userID", userID, "recipeID", recipeID)
+	slog.Debug("db: soft delete recipe", "userID", userID, "recipeID", recipeID)
 	t := time.Now()
-	_, err := Pool.Exec(ctx, "DELETE FROM recipes WHERE user_id = $1 AND id = $2", userID, recipeID)
+	_, err := Pool.Exec(ctx,
+		"UPDATE recipes SET deleted_at = NOW() WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL",
+		userID, recipeID)
 	if err == nil {
-		slog.Debug("db: delete recipe done", "recipeID", recipeID, "dur_ms", time.Since(t).Milliseconds())
+		slog.Debug("db: soft delete recipe done", "recipeID", recipeID, "dur_ms", time.Since(t).Milliseconds())
 	}
 	return err
+}
+
+// RestoreRecipe clears deleted_at. Returns pgx.ErrNoRows when the id isn't a trashed
+// recipe of userID's — an unowned id and an already-restored one are indistinguishable
+// to the caller on purpose.
+func RestoreRecipe(ctx context.Context, userID, recipeID int) error {
+	tag, err := Pool.Exec(ctx,
+		"UPDATE recipes SET deleted_at = NULL WHERE user_id = $1 AND id = $2 AND deleted_at IS NOT NULL",
+		userID, recipeID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+// GetTrashedRecipes lists userID's soft-deleted recipes, most recently deleted first.
+// Deliberately thinner than GetRecipes: the trash row shows a title and a date, and
+// nothing on it can be cooked, voted on or refined.
+func GetTrashedRecipes(ctx context.Context, userID int) ([]model.Recipe, error) {
+	rows, err := Pool.Query(ctx, `
+		SELECT id, title, content, deleted_at
+		FROM recipes WHERE user_id = $1 AND deleted_at IS NOT NULL
+		ORDER BY deleted_at DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	recipes := []model.Recipe{}
+	for rows.Next() {
+		var r model.Recipe
+		if err := rows.Scan(&r.ID, &r.Recipename, &r.Recipe, &r.DeletedAt); err != nil {
+			return nil, err
+		}
+		recipes = append(recipes, r)
+	}
+	return recipes, rows.Err()
+}
+
+// PurgeDeletedRecipes hard-deletes everything trashed longer than retention ago. The FK
+// cascades take the ingredients, steps, versions, timeline and meal-plan items with it.
+func PurgeDeletedRecipes(ctx context.Context, retention time.Duration) (int64, error) {
+	tag, err := Pool.Exec(ctx,
+		"DELETE FROM recipes WHERE deleted_at IS NOT NULL AND deleted_at < NOW() - $1::interval",
+		retention.String())
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 func InitDBPool() {
@@ -444,7 +502,7 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 		       r.created_at
 		FROM recipes r
 		LEFT JOIN recipe_votes rv ON rv.recipe_id = r.id AND rv.user_id = $1
-		WHERE r.user_id = $1 ORDER BY r.updated_at DESC`, userid)
+		WHERE r.user_id = $1 AND r.deleted_at IS NULL ORDER BY r.updated_at DESC`, userid)
 	if err != nil {
 		slog.Error("Failed to query recipes", "error", err)
 		return nil, err
@@ -468,7 +526,7 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 		SELECT rt.recipe_id, t.slug
 		FROM recipe_tags rt
 		JOIN tags t ON t.id = rt.tag_id
-		WHERE rt.recipe_id = ANY(SELECT id FROM recipes WHERE user_id = $1)`, userid)
+		WHERE rt.recipe_id = ANY(SELECT id FROM recipes WHERE user_id = $1 AND deleted_at IS NULL)`, userid)
 	if err != nil {
 		slog.Error("Failed to query recipe tags", "error", err)
 		return nil, err
