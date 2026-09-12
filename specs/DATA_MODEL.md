@@ -44,6 +44,15 @@ email          TEXT NULL              -- optional claim
 oauth_provider TEXT NOT NULL DEFAULT ''
 created_at     TIMESTAMPTZ
 last_seen_at   TIMESTAMPTZ            -- refreshed on every authenticated request
+
+-- meal-plan scheduling defaults (migrations 00015/00016), fed into the meal-plan AI's
+-- system prompt server-side, see internal/service/mealplan.go
+meal_plan_no_food_days TEXT[] NOT NULL DEFAULT '{}'  -- skip entirely, no assignment
+meal_plan_no_cook_days TEXT[] NOT NULL DEFAULT '{}'  -- a "leftover day": repeat the most
+                                                      -- recent prior cooked day's dish
+meal_plan_batch_days   INT    NOT NULL DEFAULT 1     -- repeat one recipe across N
+                                                      -- consecutive days (1, 2, or 3)
+week_start_day         TEXT   NOT NULL DEFAULT 'monday'
 ```
 
 JIT upsert executed by `storage.Users.EnsureUser`:
@@ -134,6 +143,28 @@ append `recipe_timeline_events` row.
 
 `GET /recipes/:id?format=json|markdown|html` reads the live structured tables and renders
 on the fly. No rendered artifact is persisted.
+
+## Meal Planning
+
+`meal_plans` (one row per user per week, migration `00013`) carries per-week overrides
+of the `users` scheduling defaults above (migration `00016`), null meaning "inherit the
+global default":
+
+```
+id                     SERIAL PK
+user_id                INT FK users
+starts_on, ends_on     DATE                  -- the week this row covers
+no_food_days_override  TEXT[] NULL
+no_cook_days_override  TEXT[] NULL
+batch_days_override    INT NULL CHECK (... IN (1, 2, 3))
+```
+
+`meal_plan_items` is one recipe assigned to one day (`recipe_id`, `planned_on`,
+`start_time`, `meal_slot` defaulting to `'dinner'`), upserted by day. Neither table
+records *why* a day got its assignment — a day carried forward under
+`meal_plan_no_cook_days` ("a leftover day") is stored identically to a manually-picked
+or freshly-generated day; that provenance only exists transiently in the AI's response
+(`model.MealPlanSuggestion`), not once accepted.
 
 ## Remaining Work
 

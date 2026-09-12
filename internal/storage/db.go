@@ -131,13 +131,13 @@ func AddRecipeStructured(ctx context.Context, userID int, doc model.RecipeDocume
 	var recipeID int
 	err = tx.QueryRow(ctx, `
 		INSERT INTO recipes
-			(user_id, title, summary, language, servings, prep_minutes, cook_minutes,
+			(user_id, title, summary, language, servings, total_minutes, prep_minutes, cook_minutes,
 			 difficulty, source_type, content, ai_model, ai_prompt_version, current_version,
 			 variant_of_recipe_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 		RETURNING id`,
 		userID, doc.Title, doc.Summary, doc.Language,
-		doc.Servings, doc.PrepMinutes, doc.CookMinutes, doc.Difficulty, sourceType, content,
+		doc.Servings, doc.TotalMinutes, doc.PrepMinutes, doc.CookMinutes, doc.Difficulty, sourceType, content,
 		aiModel, promptVersion, len(history), variantOfRecipeID,
 	).Scan(&recipeID)
 	if err != nil {
@@ -199,32 +199,6 @@ func AddRecipeStructured(ctx context.Context, userID int, doc model.RecipeDocume
 	return model.Recipe{ID: recipeID, Recipename: doc.Title, Recipe: content, Tags: doc.Tags}, nil
 }
 
-func AddRecipe(ctx context.Context, userID int, name, content string, tags []string) (model.Recipe, error) {
-	const query = `
-		INSERT INTO recipes (user_id, title, content)
-		VALUES ($1, $2, $3)
-		RETURNING id, title, content`
-
-	slog.Debug("db: insert recipe", "userID", userID, "title", name)
-	t := time.Now()
-	var recipe model.Recipe
-	err := Pool.QueryRow(ctx, query, userID, name, content).
-		Scan(&recipe.ID, &recipe.Recipename, &recipe.Recipe)
-	if err != nil {
-		slog.Error("Inserting recipe failed", "error", err)
-		return model.Recipe{}, err
-	}
-	if err := insertRecipeTags(ctx, Pool, recipe.ID, tags); err != nil {
-		slog.Error("Inserting recipe tags failed", "error", err)
-		return model.Recipe{}, err
-	}
-	recipe.Tags = tags
-
-	slog.Info("Added recipe to database", "userID", userID, "recipeID", recipe.ID)
-	slog.Debug("db: insert recipe done", "recipeID", recipe.ID, "dur_ms", time.Since(t).Milliseconds())
-	return recipe, nil
-}
-
 // UpdateRecipeStructured overwrites an existing recipe's header, ingredients, steps, and
 // tags with doc, replacing the ingredient/step/tag rows wholesale (delete-then-reinsert,
 // same shape as AddRecipeStructured's insert). manuallyEdited is the caller's intent: true
@@ -247,12 +221,12 @@ func UpdateRecipeStructured(ctx context.Context, userID, recipeID int, doc model
 	var id, version int
 	err = tx.QueryRow(ctx, `
 		UPDATE recipes
-		SET title = $1, summary = $2, language = $3, servings = $4, prep_minutes = $5,
-		    cook_minutes = $6, difficulty = $7, content = $8, manually_edited = $9,
+		SET title = $1, summary = $2, language = $3, servings = $4, total_minutes = $5,
+		    prep_minutes = $6, cook_minutes = $7, difficulty = $8, content = $9, manually_edited = $10,
 		    current_version = current_version + 1, updated_at = NOW()
-		WHERE id = $10 AND user_id = $11 AND deleted_at IS NULL
+		WHERE id = $11 AND user_id = $12 AND deleted_at IS NULL
 		RETURNING id, current_version`,
-		doc.Title, doc.Summary, doc.Language, doc.Servings, doc.PrepMinutes,
+		doc.Title, doc.Summary, doc.Language, doc.Servings, doc.TotalMinutes, doc.PrepMinutes,
 		doc.CookMinutes, doc.Difficulty, content, manuallyEdited, recipeID, userID,
 	).Scan(&id, &version)
 	if err != nil {
@@ -342,7 +316,7 @@ func GetRecipeByID(ctx context.Context, userID, recipeID int) (model.Recipe, err
 
 	err := Pool.QueryRow(ctx, `
 		SELECT r.id, r.title, r.content, r.manually_edited,
-		       r.summary, r.language, r.servings, r.prep_minutes, r.cook_minutes, r.difficulty,
+		       r.summary, r.language, r.servings, r.total_minutes, r.prep_minutes, r.cook_minutes, r.difficulty,
 		       rv.vote
 		FROM recipes r
 		LEFT JOIN recipe_votes rv ON rv.recipe_id = r.id AND rv.user_id = $2
@@ -350,7 +324,7 @@ func GetRecipeByID(ctx context.Context, userID, recipeID int) (model.Recipe, err
 		recipeID, userID,
 	).Scan(
 		&recipe.ID, &recipe.Recipename, &recipe.Recipe, &recipe.ManuallyEdited,
-		&doc.Summary, &doc.Language, &doc.Servings, &doc.PrepMinutes, &doc.CookMinutes, &doc.Difficulty,
+		&doc.Summary, &doc.Language, &doc.Servings, &doc.TotalMinutes, &doc.PrepMinutes, &doc.CookMinutes, &doc.Difficulty,
 		&recipe.MyVote,
 	)
 	if err != nil {
@@ -465,7 +439,9 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 	slog.Debug("db: query recipes", "userID", userid)
 	t := time.Now()
 	rows, err := Pool.Query(context.Background(), `
-		SELECT r.id, r.title, r.content, r.manually_edited, rv.vote, r.variant_of_recipe_id
+		SELECT r.id, r.title, r.content, r.manually_edited, rv.vote, r.variant_of_recipe_id,
+		       r.source_type, (SELECT s.source_url FROM sources s WHERE s.recipe_id = r.id ORDER BY s.id LIMIT 1),
+		       r.created_at
 		FROM recipes r
 		LEFT JOIN recipe_votes rv ON rv.recipe_id = r.id AND rv.user_id = $1
 		WHERE r.user_id = $1 ORDER BY r.updated_at DESC`, userid)
@@ -477,7 +453,8 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 	var recipes []model.Recipe
 	for rows.Next() {
 		var recipe model.Recipe
-		err := rows.Scan(&recipe.ID, &recipe.Recipename, &recipe.Recipe, &recipe.ManuallyEdited, &recipe.MyVote, &recipe.VariantOfRecipeID)
+		err := rows.Scan(&recipe.ID, &recipe.Recipename, &recipe.Recipe, &recipe.ManuallyEdited, &recipe.MyVote, &recipe.VariantOfRecipeID,
+			&recipe.SourceType, &recipe.SourceURL, &recipe.CreatedAt)
 		if err != nil {
 			rows.Close()
 			slog.Error("Failed to scan recipe", "error", err)

@@ -1,0 +1,3 @@
+
+
+Recompute total_minutes, prep_minutes, and cook_minutes for the new document from its own steps' text and timer_seconds — do not carry over the previous document's time values if any step's timing changed.

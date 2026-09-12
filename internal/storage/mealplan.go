@@ -94,90 +94,88 @@ func findOrCreateMealPlanRow(ctx context.Context, q queryRower, userID int, star
 	return planID, err
 }
 
-// AddMealPlanItem assigns recipeID to plannedOn/startTime for userID, creating that
-// week's meal_plans row (starting on weekStartDay) on first use. Upserts by day: any
-// existing item(s) for (userID, plannedOn) are replaced, so assigning an already-filled
-// day is a single call with no separate delete step.
-func AddMealPlanItem(ctx context.Context, userID, recipeID int, plannedOn time.Time, startTime, weekStartDay string) (model.MealPlanItem, error) {
-	var recipeTitle string
-	if err := Pool.QueryRow(ctx,
-		`SELECT title FROM recipes WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
-		recipeID, userID,
-	).Scan(&recipeTitle); err != nil {
-		return model.MealPlanItem{}, err
-	}
+// PlannedDay is one (day → recipe) assignment for ApplyMealPlanDays.
+type PlannedDay struct {
+	RecipeID  int
+	PlannedOn time.Time
+	StartTime string
+}
 
-	startsOn := StartOfWeek(plannedOn, weekStartDay)
-	endsOn := startsOn.AddDate(0, 0, 6)
-
+// ApplyMealPlanDays writes every day in days for userID in **one transaction**, creating
+// each week's meal_plans row (starting on weekStartDay) as needed. Upserts by day: any
+// existing item(s) for (userID, day) are replaced, so assigning an already-filled day
+// needs no separate delete step. All-or-nothing is the point — a whole-week apply that
+// fails on day 5 must not leave days 1–4 written (BACKLOG.md 4.3).
+func ApplyMealPlanDays(ctx context.Context, userID int, weekStartDay string, days []PlannedDay) ([]model.MealPlanItem, error) {
 	tx, err := Pool.Begin(ctx)
 	if err != nil {
-		return model.MealPlanItem{}, err
+		return nil, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	planID, err := findOrCreateMealPlanRow(ctx, tx, userID, startsOn, endsOn)
-	if err != nil {
-		return model.MealPlanItem{}, err
-	}
+	items := make([]model.MealPlanItem, 0, len(days))
+	for _, d := range days {
+		// Ownership is checked inside the transaction, per recipe: an unowned id must
+		// abort the whole apply, not just skip its day.
+		var recipeTitle string
+		if err := tx.QueryRow(ctx,
+			`SELECT title FROM recipes WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+			d.RecipeID, userID,
+		).Scan(&recipeTitle); err != nil {
+			return nil, err
+		}
 
-	// Upsert-by-day: this user has at most one item per day (meal_slot is always the
-	// DB default 'dinner' for now), so replacing whatever's already on plannedOn is
-	// the natural "assign/swap" semantics for both manual picks and AI-accepted plans.
-	if _, err = tx.Exec(ctx, `
-		DELETE FROM meal_plan_items mpi
-		USING meal_plans mp
-		WHERE mpi.meal_plan_id = mp.id AND mp.user_id = $1 AND mpi.planned_on = $2`,
-		userID, plannedOn,
-	); err != nil {
-		return model.MealPlanItem{}, err
-	}
+		startsOn := StartOfWeek(d.PlannedOn, weekStartDay)
+		planID, err := findOrCreateMealPlanRow(ctx, tx, userID, startsOn, startsOn.AddDate(0, 0, 6))
+		if err != nil {
+			return nil, err
+		}
 
-	var itemID int
-	if err = tx.QueryRow(ctx,
-		`INSERT INTO meal_plan_items (meal_plan_id, recipe_id, planned_on, start_time)
-		 VALUES ($1, $2, $3, $4) RETURNING id`,
-		planID, recipeID, plannedOn, startTime,
-	).Scan(&itemID); err != nil {
-		return model.MealPlanItem{}, err
+		// Upsert-by-day: this user has at most one item per day (meal_slot is always
+		// the DB default 'dinner' for now), so replacing whatever's already there is
+		// the natural "assign/swap" semantics — and what makes re-applying the same
+		// plan a no-op rather than a duplicate.
+		if _, err = tx.Exec(ctx, `
+			DELETE FROM meal_plan_items mpi
+			USING meal_plans mp
+			WHERE mpi.meal_plan_id = mp.id AND mp.user_id = $1 AND mpi.planned_on = $2`,
+			userID, d.PlannedOn,
+		); err != nil {
+			return nil, err
+		}
+
+		var itemID int
+		if err = tx.QueryRow(ctx,
+			`INSERT INTO meal_plan_items (meal_plan_id, recipe_id, planned_on, start_time)
+			 VALUES ($1, $2, $3, $4) RETURNING id`,
+			planID, d.RecipeID, d.PlannedOn, d.StartTime,
+		).Scan(&itemID); err != nil {
+			return nil, err
+		}
+
+		items = append(items, model.MealPlanItem{
+			ID:          itemID,
+			RecipeID:    d.RecipeID,
+			RecipeTitle: recipeTitle,
+			PlannedOn:   d.PlannedOn.Format("2006-01-02"),
+			StartTime:   d.StartTime,
+		})
 	}
 
 	if err = tx.Commit(ctx); err != nil {
-		return model.MealPlanItem{}, err
+		return nil, err
 	}
-
-	return model.MealPlanItem{
-		ID:          itemID,
-		RecipeID:    recipeID,
-		RecipeTitle: recipeTitle,
-		PlannedOn:   plannedOn.Format("2006-01-02"),
-		StartTime:   startTime,
-	}, nil
+	return items, nil
 }
 
-// UpdateMealPlanItem moves itemID to plannedOn/startTime (full-replace, both fields
-// always given) if it belongs (via its plan) to userID.
-func UpdateMealPlanItem(ctx context.Context, userID, itemID int, plannedOn time.Time, startTime string) (model.MealPlanItem, error) {
-	var recipeID int
-	var recipeTitle string
-	err := Pool.QueryRow(ctx, `
-		UPDATE meal_plan_items mpi
-		SET planned_on = $1, start_time = $2
-		FROM meal_plans mp, recipes r
-		WHERE mpi.id = $3 AND mpi.meal_plan_id = mp.id AND mp.user_id = $4 AND r.id = mpi.recipe_id
-		RETURNING mpi.recipe_id, r.title`,
-		plannedOn, startTime, itemID, userID,
-	).Scan(&recipeID, &recipeTitle)
+// AddMealPlanItem assigns one recipe to one day — ApplyMealPlanDays with a single entry.
+func AddMealPlanItem(ctx context.Context, userID, recipeID int, plannedOn time.Time, startTime, weekStartDay string) (model.MealPlanItem, error) {
+	items, err := ApplyMealPlanDays(ctx, userID, weekStartDay,
+		[]PlannedDay{{RecipeID: recipeID, PlannedOn: plannedOn, StartTime: startTime}})
 	if err != nil {
 		return model.MealPlanItem{}, err
 	}
-	return model.MealPlanItem{
-		ID:          itemID,
-		RecipeID:    recipeID,
-		RecipeTitle: recipeTitle,
-		PlannedOn:   plannedOn.Format("2006-01-02"),
-		StartTime:   startTime,
-	}, nil
+	return items[0], nil
 }
 
 // DeleteMealPlanItem removes itemID if it belongs (via its plan) to userID.
@@ -195,35 +193,4 @@ func DeleteMealPlanItem(ctx context.Context, userID, itemID int) error {
 		return pgx.ErrNoRows
 	}
 	return nil
-}
-
-// GetWeekPreferences returns the per-week scheduling overrides for userID's week
-// starting on startsOn (already normalized via StartOfWeek by the caller). No row for
-// that week is not an error — it just means every field is unset (pure inherit).
-func GetWeekPreferences(ctx context.Context, userID int, startsOn time.Time) (model.MealPlanWeekPreferences, error) {
-	var prefs model.MealPlanWeekPreferences
-	err := Pool.QueryRow(ctx,
-		`SELECT no_food_days_override, no_cook_days_override, batch_days_override
-		 FROM meal_plans WHERE user_id = $1 AND starts_on = $2`,
-		userID, startsOn,
-	).Scan(&prefs.NoFoodDays, &prefs.NoCookDays, &prefs.BatchDays)
-	if err == pgx.ErrNoRows {
-		return model.MealPlanWeekPreferences{}, nil
-	}
-	return prefs, err
-}
-
-// UpdateWeekPreferences sets the per-week scheduling overrides for userID's week
-// starting on startsOn, creating that week's meal_plans row (bounded by endsOn) on first
-// use. A nil field clears back to "inherit the global default".
-func UpdateWeekPreferences(ctx context.Context, userID int, startsOn, endsOn time.Time, prefs model.MealPlanWeekPreferences) error {
-	planID, err := findOrCreateMealPlanRow(ctx, Pool, userID, startsOn, endsOn)
-	if err != nil {
-		return err
-	}
-	_, err = Pool.Exec(ctx,
-		`UPDATE meal_plans SET no_food_days_override = $1, no_cook_days_override = $2, batch_days_override = $3 WHERE id = $4`,
-		prefs.NoFoodDays, prefs.NoCookDays, prefs.BatchDays, planID,
-	)
-	return err
 }

@@ -37,10 +37,10 @@ func (Users) EnsureUser(ctx context.Context, subject, email, name, provider stri
 func GetPreferences(ctx context.Context, userID int) (model.UserPreferences, error) {
 	var p model.UserPreferences
 	err := Pool.QueryRow(ctx, `
-		SELECT skill_level, dietary_prefs, disliked_ingredients, cooking_cadence,
+		SELECT skill_level, dietary_prefs, disliked_ingredients,
 		       meal_plan_no_food_days, meal_plan_no_cook_days, meal_plan_batch_days, week_start_day
 		FROM users WHERE id = $1`, userID,
-	).Scan(&p.SkillLevel, &p.DietaryPrefs, &p.DislikedIngredients, &p.CookingCadence,
+	).Scan(&p.SkillLevel, &p.DietaryPrefs, &p.DislikedIngredients,
 		&p.MealPlanNoFoodDays, &p.MealPlanNoCookDays, &p.MealPlanBatchDays, &p.WeekStartDay)
 	return p, err
 }
@@ -49,10 +49,10 @@ func GetPreferences(ctx context.Context, userID int) (model.UserPreferences, err
 func UpdatePreferences(ctx context.Context, userID int, p model.UserPreferences) error {
 	_, err := Pool.Exec(ctx, `
 		UPDATE users
-		SET skill_level = $2, dietary_prefs = $3, disliked_ingredients = $4, cooking_cadence = $5,
-		    meal_plan_no_food_days = $6, meal_plan_no_cook_days = $7, meal_plan_batch_days = $8, week_start_day = $9
+		SET skill_level = $2, dietary_prefs = $3, disliked_ingredients = $4,
+		    meal_plan_no_food_days = $5, meal_plan_no_cook_days = $6, meal_plan_batch_days = $7, week_start_day = $8
 		WHERE id = $1`,
-		userID, p.SkillLevel, p.DietaryPrefs, p.DislikedIngredients, p.CookingCadence,
+		userID, p.SkillLevel, p.DietaryPrefs, p.DislikedIngredients,
 		p.MealPlanNoFoodDays, p.MealPlanNoCookDays, p.MealPlanBatchDays, p.WeekStartDay)
 	return err
 }

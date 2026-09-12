@@ -15,7 +15,7 @@ import (
 // DB_URL is set) for the meal-planner slice: AddMealPlanItem creates the week's
 // meal_plans row implicitly and upserts by day, GetMealPlanRange's date-range join
 // returns items for an arbitrary range (and excludes items outside it), ownership is
-// enforced on add/update/delete, and UpdateMealPlanItem moves an item.
+// enforced on add and delete.
 func TestMealPlanWeekAssignAndRemove(t *testing.T) {
 	dbURL := os.Getenv("DB_URL")
 	if dbURL == "" {
@@ -105,24 +105,12 @@ func TestMealPlanWeekAssignAndRemove(t *testing.T) {
 		t.Fatalf("expected 2 items across the two-week range, got %+v", twoWeeks)
 	}
 
-	// Ownership enforced on update: another user can't move it.
-	if _, err := UpdateMealPlanItem(ctx, otherUserID, replaced.ID, tuesday, "20:00:00"); !errors.Is(err, pgx.ErrNoRows) {
-		t.Fatalf("expected pgx.ErrNoRows updating another user's item, got %v", err)
-	}
-	moved, err := UpdateMealPlanItem(ctx, userID, replaced.ID, monday, "08:30:00")
-	if err != nil {
-		t.Fatalf("UpdateMealPlanItem: %v", err)
-	}
-	if moved.PlannedOn != "2026-09-07" || moved.StartTime != "08:30:00" {
-		t.Errorf("unexpected moved item: %+v", moved)
-	}
-
 	// Ownership enforced on delete: another user can't remove it.
-	if err := DeleteMealPlanItem(ctx, otherUserID, moved.ID); !errors.Is(err, pgx.ErrNoRows) {
+	if err := DeleteMealPlanItem(ctx, otherUserID, replaced.ID); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("expected pgx.ErrNoRows deleting another user's item, got %v", err)
 	}
 
-	if err := DeleteMealPlanItem(ctx, userID, moved.ID); err != nil {
+	if err := DeleteMealPlanItem(ctx, userID, replaced.ID); err != nil {
 		t.Fatalf("DeleteMealPlanItem: %v", err)
 	}
 	week, err = GetMealPlanRange(ctx, userID, monday, sunday)
@@ -151,66 +139,5 @@ func TestStartOfWeek(t *testing.T) {
 	// Unrecognized weekStartDay falls back to Monday.
 	if got := StartOfWeek(tuesday, ""); !got.Equal(monday) {
 		t.Errorf("StartOfWeek(tuesday, \"\") = %v, want %v (default to Monday)", got, monday)
-	}
-}
-
-// TestWeekPreferencesRoundTrip is a smoke test against a real DB (skipped unless DB_URL
-// is set): a week with no override returns all-nil (pure inherit), setting one persists
-// and round-trips, and it doesn't leak into an adjacent week.
-func TestWeekPreferencesRoundTrip(t *testing.T) {
-	dbURL := os.Getenv("DB_URL")
-	if dbURL == "" {
-		t.Skip("DB_URL not set, skipping DB integration test")
-	}
-	InitDBPool()
-	ctx := context.Background()
-
-	var userID int
-	if err := Pool.QueryRow(ctx, `INSERT INTO users (oauth_id) VALUES ('test-weekprefs-owner') RETURNING id`).Scan(&userID); err != nil {
-		t.Fatalf("seed user: %v", err)
-	}
-	t.Cleanup(func() { Pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, userID) })
-
-	monday := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
-	sunday := monday.AddDate(0, 0, 6)
-	nextMonday := monday.AddDate(0, 0, 7)
-
-	empty, err := GetWeekPreferences(ctx, userID, monday)
-	if err != nil {
-		t.Fatalf("GetWeekPreferences (no row yet): %v", err)
-	}
-	if empty.NoFoodDays != nil || empty.NoCookDays != nil || empty.BatchDays != nil {
-		t.Errorf("expected all-nil overrides before any write, got %+v", empty)
-	}
-
-	noCook := []string{"wednesday"}
-	batch := 2
-	if err := UpdateWeekPreferences(ctx, userID, monday, sunday, model.MealPlanWeekPreferences{
-		NoCookDays: &noCook, BatchDays: &batch,
-	}); err != nil {
-		t.Fatalf("UpdateWeekPreferences: %v", err)
-	}
-
-	got, err := GetWeekPreferences(ctx, userID, monday)
-	if err != nil {
-		t.Fatalf("GetWeekPreferences: %v", err)
-	}
-	if got.NoFoodDays != nil {
-		t.Errorf("expected NoFoodDays to stay nil (inherit), got %v", *got.NoFoodDays)
-	}
-	if got.NoCookDays == nil || len(*got.NoCookDays) != 1 || (*got.NoCookDays)[0] != "wednesday" {
-		t.Errorf("expected NoCookDays override [wednesday], got %v", got.NoCookDays)
-	}
-	if got.BatchDays == nil || *got.BatchDays != 2 {
-		t.Errorf("expected BatchDays override 2, got %v", got.BatchDays)
-	}
-
-	// The override must not leak into the following week.
-	nextWeek, err := GetWeekPreferences(ctx, userID, nextMonday)
-	if err != nil {
-		t.Fatalf("GetWeekPreferences (next week): %v", err)
-	}
-	if nextWeek.NoCookDays != nil || nextWeek.BatchDays != nil {
-		t.Errorf("expected next week's overrides to stay nil, got %+v", nextWeek)
 	}
 }

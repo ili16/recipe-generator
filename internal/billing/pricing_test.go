@@ -10,8 +10,13 @@ func TestCostUSDKnownModel(t *testing.T) {
 	}
 }
 
-func TestCostUSDUnknownModelIsZero(t *testing.T) {
-	if got := CostUSD("some-future-model", 1000, 1000); got != 0 {
-		t.Fatalf("got %v, want 0", got)
+func TestCostUSDUnknownModelUsesFallback(t *testing.T) {
+	got := CostUSD("some-future-model", 1_000_000, 1_000_000)
+	if got == 0 {
+		t.Fatalf("got 0, want a non-zero conservative fallback charge")
+	}
+	want := fallbackPricing.PromptPer1M + fallbackPricing.CompletionPer1M
+	if got != want {
+		t.Fatalf("got %v, want %v", got, want)
 	}
 }

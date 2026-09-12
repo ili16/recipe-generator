@@ -4,6 +4,7 @@ package ratelimit
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -62,15 +63,22 @@ func (l *Limiter) sweep() {
 	}
 }
 
-// clientIP reads the caller's IP, preferring the Cloudflare Tunnel header (this backend
+// ClientIP reads the caller's IP, preferring the Cloudflare Tunnel header (this backend
 // always sits behind one, per deploy/README.md), then a generic proxy header, then the
 // raw connection address.
-func clientIP(r *http.Request) string {
+func ClientIP(r *http.Request) string {
 	if ip := r.Header.Get("CF-Connecting-IP"); ip != "" {
 		return ip
 	}
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
 		return strings.TrimSpace(strings.Split(fwd, ",")[0])
+	}
+	// RemoteAddr carries the ephemeral source port ("127.0.0.1:58640"), which is
+	// different on every connection — returning it verbatim gave each request its own
+	// bucket, so the anonymous rate limit never limited and anonymous /chat threads
+	// (keyed by the same function) lost their history between turns.
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
 	}
 	return r.RemoteAddr
 }
@@ -80,7 +88,7 @@ func clientIP(r *http.Request) string {
 // lower per-IP budget.
 func (l *Limiter) Guard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		key := "ip:" + clientIP(r)
+		key := "ip:" + ClientIP(r)
 		rps, burst := l.anon, l.anonB
 		if u, ok := auth.FromContext(r.Context()); ok {
 			key = fmt.Sprintf("user:%d", u.ID)

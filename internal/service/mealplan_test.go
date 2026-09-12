@@ -1,7 +1,6 @@
 package service
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -15,18 +14,6 @@ func TestMealPlanSuggestSystemPrompt(t *testing.T) {
 	}
 	if !strings.Contains(mealPlanSuggestSystemPrompt(true), "fewer than 10") {
 		t.Error("low-variety prompt should include the low-variety addendum")
-	}
-}
-
-// TestMealPlanChatSystemPromptNotGatedByVariety guards the fix for the "shrimp to beef"
-// bug: chat must always be allowed to propose a targeted variant, regardless of how many
-// saved recipes the user has — unlike the fresh-week suggester.
-func TestMealPlanChatSystemPromptNotGatedByVariety(t *testing.T) {
-	if strings.Contains(mealPlanChatSystemPrompt, "fewer than 10") {
-		t.Error("chat prompt must not be gated by the low-variety addendum")
-	}
-	if !strings.Contains(mealPlanChatSystemPrompt, "regardless of how many saved recipes") {
-		t.Error("chat prompt should explicitly allow a targeted variant regardless of variety")
 	}
 }
 
@@ -137,61 +124,139 @@ func assertSchemaFields(t *testing.T, name string, schema map[string]any, want [
 	}
 }
 
-func TestBuildMealPlanChatMessages(t *testing.T) {
-	candidates := []model.Recipe{{ID: 1, Recipename: "Soup"}}
-	startsOn := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+// TestEnforceNoCookCarryover covers the code-level fix for the "leftover day" mechanic:
+// the system prompt alone can't guarantee a no-cook day repeats the right dish, so this
+// makes the day's content correct by construction regardless of what the model returned.
+func TestEnforceNoCookCarryover(t *testing.T) {
+	startsOn := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC) // a Monday
 	endsOn := startsOn.AddDate(0, 0, 6)
-	recipeID := 1
-	initial := model.MealPlanSuggestion{
-		Status: "applied",
-		Assignments: []model.MealPlanAssignment{
-			{RecipeID: &recipeID, PlannedOn: "2026-09-07", StartTime: "18:00:00"},
-		},
-	}
-	history := []model.MealPlanChatTurn{
-		{Message: "swap Monday", Plan: initial},
-	}
+	day := func(offset int) string { return startsOn.AddDate(0, 0, offset).Format("2006-01-02") }
+	weekday := func(offset int) string { return strings.ToLower(startsOn.AddDate(0, 0, offset).Weekday().String()) }
+	id := func(n int) *int { return &n }
 
-	messages, err := buildMealPlanChatMessages(candidates, model.CookingProfile{}, model.UserPreferences{}, startsOn, endsOn, nil, nil, initial, history, "make it vegetarian")
-	if err != nil {
-		t.Fatalf("buildMealPlanChatMessages: %v", err)
-	}
-	// system + context + initial(assistant) + history(user+assistant) + final user = 6
-	if len(messages) != 6 {
-		t.Fatalf("expected 6 messages, got %d", len(messages))
-	}
-}
-
-// TestBuildMealPlanChatMessagesGroundsAssignedRecipes covers the fix for the "shrimp to
-// beef" bug's grounding half: the current day's ingredients must reach the model, not
-// just its title, so a targeted swap has something real to edit.
-func TestBuildMealPlanChatMessagesGroundsAssignedRecipes(t *testing.T) {
-	startsOn := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
-	endsOn := startsOn.AddDate(0, 0, 6)
-	recipeID := 1
-	initial := model.MealPlanSuggestion{
-		Status:      "applied",
-		Assignments: []model.MealPlanAssignment{{RecipeID: &recipeID, PlannedOn: "2026-09-07", StartTime: "18:00:00"}},
-	}
-	assignedRecipes := map[int]model.RecipeDocument{
-		1: {Title: "Shrimp Tacos", Ingredients: []model.RecipeIngredient{{Item: "shrimp"}, {Item: "tortillas"}}},
-	}
-
-	messages, err := buildMealPlanChatMessages(nil, model.CookingProfile{}, model.UserPreferences{}, startsOn, endsOn, nil, assignedRecipes, initial, nil, "swap the shrimp for beef")
-	if err != nil {
-		t.Fatalf("buildMealPlanChatMessages: %v", err)
-	}
-	found := false
-	for _, m := range messages {
-		raw, err := json.Marshal(m)
-		if err != nil {
-			t.Fatalf("marshal message: %v", err)
+	findAssignment := func(t *testing.T, assignments []model.MealPlanAssignment, plannedOn string) model.MealPlanAssignment {
+		t.Helper()
+		for _, a := range assignments {
+			if a.PlannedOn == plannedOn {
+				return a
+			}
 		}
-		if strings.Contains(string(raw), "shrimp") && strings.Contains(string(raw), "Shrimp Tacos") {
-			found = true
+		t.Fatalf("no assignment found for %s", plannedOn)
+		return model.MealPlanAssignment{}
+	}
+
+	t.Run("mid-range no-cook day is overwritten with the prior cooked day's dish", func(t *testing.T) {
+		result := model.MealPlanSuggestion{Status: "applied", Assignments: []model.MealPlanAssignment{
+			{RecipeID: id(1), PlannedOn: day(0), StartTime: "18:00:00"},  // Mon, cooked
+			{RecipeID: id(2), PlannedOn: day(1), StartTime: "18:00:00"},  // Tue, cooked
+			{RecipeID: id(99), PlannedOn: day(2), StartTime: "18:00:00"}, // Wed, no-cook — model got it wrong
+			{RecipeID: id(3), PlannedOn: day(3), StartTime: "18:00:00"},  // Thu, cooked
+		}}
+		enforceNoCookCarryover(&result, model.UserPreferences{MealPlanNoCookDays: []string{weekday(2)}}, startsOn, endsOn, nil)
+
+		if wed := findAssignment(t, result.Assignments, day(2)); wed.RecipeID == nil || *wed.RecipeID != 2 {
+			t.Errorf("expected Wednesday to carry Tuesday's recipe_id 2, got %+v", wed)
 		}
-	}
-	if !found {
-		t.Error("expected the assigned recipe's ingredients to appear in a context message")
-	}
+	})
+
+	t.Run("an override is explained on the message, not applied silently", func(t *testing.T) {
+		// BACKLOG.md 2.5: "make Thursday salmon" on a no-cook Thursday used to be
+		// reverted here while the reply still said "Done!". The revert is still the
+		// right outcome — the rule is true by construction — but it has to be visible,
+		// so whoever renders the reply tells the user what actually happened.
+		msg := "Done!"
+		result := model.MealPlanSuggestion{Status: "applied", Message: &msg, Assignments: []model.MealPlanAssignment{
+			{RecipeID: id(1), PlannedOn: day(0), StartTime: "18:00:00"},  // Mon, cooked
+			{RecipeID: id(99), PlannedOn: day(3), StartTime: "18:00:00"}, // Thu, no-cook — user asked for this
+		}}
+		enforceNoCookCarryover(&result, model.UserPreferences{MealPlanNoCookDays: []string{weekday(3)}}, startsOn, endsOn, nil)
+
+		if thu := findAssignment(t, result.Assignments, day(3)); thu.RecipeID == nil || *thu.RecipeID != 1 {
+			t.Errorf("expected Thursday to carry Monday's recipe_id 1, got %+v", thu)
+		}
+		if result.Message == nil || !strings.Contains(*result.Message, day(3)) {
+			t.Errorf("the override was applied silently; message = %v", result.Message)
+		}
+		if !strings.HasPrefix(*result.Message, "Done!") {
+			t.Errorf("the model's own message was discarded: %q", *result.Message)
+		}
+	})
+
+	t.Run("a day the model already got right is not reported as an override", func(t *testing.T) {
+		result := model.MealPlanSuggestion{Status: "applied", Assignments: []model.MealPlanAssignment{
+			{RecipeID: id(1), PlannedOn: day(0), StartTime: "18:00:00"}, // Mon, cooked
+			{RecipeID: id(1), PlannedOn: day(3), StartTime: "18:00:00"}, // Thu, no-cook, already carried
+		}}
+		enforceNoCookCarryover(&result, model.UserPreferences{MealPlanNoCookDays: []string{weekday(3)}}, startsOn, endsOn, nil)
+
+		if result.Message != nil {
+			t.Errorf("nothing changed, but a note was added: %q", *result.Message)
+		}
+	})
+
+	t.Run("chained no-cook days all carry the same original cooked dish", func(t *testing.T) {
+		result := model.MealPlanSuggestion{Status: "applied", Assignments: []model.MealPlanAssignment{
+			{RecipeID: id(1), PlannedOn: day(0), StartTime: "18:00:00"},   // Mon, cooked
+			{RecipeID: id(2), PlannedOn: day(1), StartTime: "18:00:00"},   // Tue, cooked
+			{RecipeID: id(99), PlannedOn: day(2), StartTime: "18:00:00"},  // Wed, no-cook
+			{RecipeID: id(100), PlannedOn: day(3), StartTime: "18:00:00"}, // Thu, no-cook
+		}}
+		enforceNoCookCarryover(&result, model.UserPreferences{MealPlanNoCookDays: []string{weekday(2), weekday(3)}}, startsOn, endsOn, nil)
+
+		for _, offset := range []int{2, 3} {
+			if a := findAssignment(t, result.Assignments, day(offset)); a.RecipeID == nil || *a.RecipeID != 2 {
+				t.Errorf("day offset %d: expected carried recipe_id 2, got %+v", offset, a)
+			}
+		}
+	})
+
+	t.Run("no-cook day at the start of the range carries forward from priorMeal", func(t *testing.T) {
+		result := model.MealPlanSuggestion{Status: "applied", Assignments: []model.MealPlanAssignment{
+			{RecipeID: id(99), PlannedOn: day(0), StartTime: "18:00:00"}, // Mon, no-cook, model got it wrong
+		}}
+		priorMeal := &model.MealPlanItem{RecipeID: 42, PlannedOn: "2026-09-06", StartTime: "18:00:00"}
+		enforceNoCookCarryover(&result, model.UserPreferences{MealPlanNoCookDays: []string{weekday(0)}}, startsOn, endsOn, priorMeal)
+
+		if mon := findAssignment(t, result.Assignments, day(0)); mon.RecipeID == nil || *mon.RecipeID != 42 {
+			t.Errorf("expected Monday to carry priorMeal's recipe_id 42, got %+v", mon)
+		}
+	})
+
+	t.Run("missing assignment on a no-cook day is inserted, not just fixed", func(t *testing.T) {
+		result := model.MealPlanSuggestion{Status: "applied", Assignments: []model.MealPlanAssignment{
+			{RecipeID: id(1), PlannedOn: day(0), StartTime: "18:00:00"}, // Mon, cooked
+			// Tue (no-cook) has no assignment at all — model treated it like a no-food day.
+			{RecipeID: id(3), PlannedOn: day(2), StartTime: "18:00:00"}, // Wed, cooked
+		}}
+		enforceNoCookCarryover(&result, model.UserPreferences{MealPlanNoCookDays: []string{weekday(1)}}, startsOn, endsOn, nil)
+
+		if len(result.Assignments) != 3 {
+			t.Fatalf("expected the missing no-cook day to be inserted, got %d assignments", len(result.Assignments))
+		}
+		if tue := findAssignment(t, result.Assignments, day(1)); tue.RecipeID == nil || *tue.RecipeID != 1 {
+			t.Errorf("expected inserted Tuesday to carry Monday's recipe_id 1, got %+v", tue)
+		}
+	})
+
+	t.Run("no reference to carry forward leaves the model's assignment untouched", func(t *testing.T) {
+		result := model.MealPlanSuggestion{Status: "applied", Assignments: []model.MealPlanAssignment{
+			{RecipeID: id(7), PlannedOn: day(0), StartTime: "18:00:00"}, // Mon, no-cook, nothing to reference
+		}}
+		enforceNoCookCarryover(&result, model.UserPreferences{MealPlanNoCookDays: []string{weekday(0)}}, startsOn, endsOn, nil)
+
+		if mon := findAssignment(t, result.Assignments, day(0)); mon.RecipeID == nil || *mon.RecipeID != 7 {
+			t.Errorf("expected assignment to remain untouched, got %+v", mon)
+		}
+	})
+
+	t.Run("no-op when there are no no-cook days", func(t *testing.T) {
+		result := model.MealPlanSuggestion{Status: "applied", Assignments: []model.MealPlanAssignment{
+			{RecipeID: id(1), PlannedOn: day(0), StartTime: "18:00:00"},
+		}}
+		before := result.Assignments[0]
+		enforceNoCookCarryover(&result, model.UserPreferences{}, startsOn, endsOn, nil)
+		if result.Assignments[0] != before {
+			t.Errorf("expected no changes with no no-cook days, got %+v", result.Assignments[0])
+		}
+	})
 }

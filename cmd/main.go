@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/ili16/recipe-generator/internal/auth"
@@ -55,14 +57,6 @@ func main() {
 		envIntOrDefault("RATE_LIMIT_AUTH_PER_10MIN", 15),
 		10*time.Minute,
 	)
-	// rlSuggest guards suggest/suggest-prefs, which are cheap autocomplete-style calls a
-	// single screen fires off repeatedly — budget them far more generously than real
-	// generations so normal use never trips the limiter.
-	rlSuggest := ratelimit.New(
-		envIntOrDefault("RATE_LIMIT_SUGGEST_ANON_PER_10MIN", 30),
-		envIntOrDefault("RATE_LIMIT_SUGGEST_AUTH_PER_10MIN", 100),
-		10*time.Minute,
-	)
 	// llm wraps an LLM-calling handler with rate limiting and budget enforcement, seeing
 	// the caller's identity (if any) via authenticator.Optional first.
 	llm := func(rl *ratelimit.Limiter, h http.HandlerFunc) http.HandlerFunc {
@@ -73,13 +67,10 @@ func main() {
 
 	mux.HandleFunc("GET /health", HandleHealth)
 
-	mux.HandleFunc("POST /api/v1/generate", llm(rl, service.HandleGenerateRecipe))
-	mux.HandleFunc("POST /api/v1/generate/stream", llm(rl, service.HandleGenerateRecipeStream))
 	mux.HandleFunc("POST /api/v1/transcribe", llm(rl, service.HandleTranscribeAudio))
-	mux.HandleFunc("POST /api/v1/suggest", llm(rlSuggest, service.HandleSuggestInput))
-	mux.HandleFunc("POST /api/v1/suggest-prefs", llm(rlSuggest, service.HandleSuggestPrefs))
-	mux.HandleFunc("POST /api/v1/cooking-chat", llm(rl, service.HandleCookingChat))
-	mux.HandleFunc("POST /api/v1/refine-recipe", llm(rl, service.HandleRefineRecipe))
+	// The one conversational endpoint (specs/AGENT_CHAT.md §2). Every per-capability
+	// AI route it replaced is gone (BACKLOG.md 3.5, 3.9, 3.13).
+	mux.HandleFunc("POST /api/v1/chat", llm(rl, service.HandleChat))
 
 	mux.HandleFunc("GET /api/v1/recipes/{id}", authenticator.Require(HandleGetRecipeByID))
 	mux.HandleFunc("GET /api/v1/recipes/{id}/history", authenticator.Require(HandleGetRecipeHistory))
@@ -92,29 +83,46 @@ func main() {
 	mux.HandleFunc("GET /api/v1/usage", authenticator.Require(HandleGetUsage))
 	mux.HandleFunc("GET /api/v1/preferences", authenticator.Require(HandleGetPreferences))
 	mux.HandleFunc("PATCH /api/v1/preferences", authenticator.Require(HandlePatchPreferences))
-	mux.HandleFunc("GET /api/v1/meal-plan/week-preferences", authenticator.Require(HandleGetWeekPreferences))
-	mux.HandleFunc("PATCH /api/v1/meal-plan/week-preferences", authenticator.Require(HandlePatchWeekPreferences))
 	mux.HandleFunc("PUT /api/v1/recipes/{id}/vote", authenticator.Require(HandleVoteRecipe))
 	mux.HandleFunc("DELETE /api/v1/recipes/{id}/vote", authenticator.Require(HandleUnvoteRecipe))
-	mux.HandleFunc("POST /api/v1/decline-generation", authenticator.Require(HandleDeclineGeneration))
 	mux.HandleFunc("GET /api/v1/meal-plan", authenticator.Require(HandleGetMealPlan))
 	mux.HandleFunc("POST /api/v1/meal-plan/items", authenticator.Require(HandleAddMealPlanItem))
-	mux.HandleFunc("PATCH /api/v1/meal-plan/items/{id}", authenticator.Require(HandlePatchMealPlanItem))
 	mux.HandleFunc("DELETE /api/v1/meal-plan/items/{id}", authenticator.Require(HandleDeleteMealPlanItem))
-	mux.HandleFunc("POST /api/v1/meal-plan/suggest", llm(rl, HandleSuggestMealPlan))
-	mux.HandleFunc("POST /api/v1/meal-plan/chat", llm(rl, HandleMealPlanChat))
-	mux.HandleFunc("POST /api/v1/meal-plan/chat/stream", llm(rl, HandleMealPlanChatReplyStream))
 	mux.HandleFunc("POST /api/v1/meal-plan/variants/{id}", llm(rl, HandleGenerateVariant))
 
 	mux.HandleFunc("GET /api/v1/admin/users", authenticator.RequireAdmin(HandleAdminListUsers))
 	mux.HandleFunc("PATCH /api/v1/admin/users/{id}/budget", authenticator.RequireAdmin(HandleAdminSetBudget))
 
 	addr := ":" + envOrDefault("PORT", "8080")
-	slog.Info("Server is running", "addr", addr)
 	handler := otelhttp.NewHandler(withCORS(logRequests(mux)), "recipe-generator")
-	if err := http.ListenAndServe(addr, handler); err != nil {
-		slog.Error("Server failed", "error", err)
-		os.Exit(1)
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: handler,
+		// ReadHeaderTimeout guards against a slowloris client trickling in headers.
+		// WriteTimeout is generous rather than tight, since /generate/stream and
+		// /chat hold the response open for the whole SSE duration.
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      5 * time.Minute,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	go func() {
+		slog.Info("Server is running", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("Server failed", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+	<-stop
+	slog.Info("Shutting down, draining in-flight requests")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("Graceful shutdown failed", "error", err)
 	}
 }
 
@@ -287,14 +295,6 @@ func HandlePatchPreferences(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if prefs.CookingCadence != nil {
-		switch *prefs.CookingCadence {
-		case "daily", "every_couple_days", "meal_prep_batching":
-		default:
-			http.Error(w, "invalid cooking_cadence", http.StatusBadRequest)
-			return
-		}
-	}
 	for _, slug := range prefs.DietaryPrefs {
 		if !dietaryPrefSlugs[slug] {
 			http.Error(w, "invalid dietary_prefs entry: "+slug, http.StatusBadRequest)
@@ -307,9 +307,20 @@ func HandlePatchPreferences(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	noFood := make(map[string]bool, len(prefs.MealPlanNoFoodDays))
+	for _, day := range prefs.MealPlanNoFoodDays {
+		noFood[day] = true
+	}
 	for _, day := range prefs.MealPlanNoCookDays {
 		if !weekdayNames[day] {
 			http.Error(w, "invalid meal_plan_no_cook_days entry: "+day, http.StatusBadRequest)
+			return
+		}
+		// A day in both lists is contradictory: no_food says leave it empty, no_cook says
+		// carry the prior dish forward onto it, and enforceNoCookCarryover would write an
+		// assignment onto a day it was told to skip.
+		if noFood[day] {
+			http.Error(w, "day is in both meal_plan_no_food_days and meal_plan_no_cook_days: "+day, http.StatusBadRequest)
 			return
 		}
 	}
@@ -381,28 +392,6 @@ func HandleUnvoteRecipe(w http.ResponseWriter, r *http.Request) {
 		slog.Error("Error removing vote", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// HandleDeclineGeneration is a best-effort analytics beacon fired when the user closes
-// the review screen without saving. Always 204 — no client-visible distinction between
-// "resolved"/"already resolved"/"unknown generation_id", since this must never block the UI.
-func HandleDeclineGeneration(w http.ResponseWriter, r *http.Request) {
-	user, ok := auth.FromContext(r.Context())
-	if !ok {
-		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
-		return
-	}
-	var req struct {
-		GenerationID string `json:"generation_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err == nil && req.GenerationID != "" {
-		if err := storage.Resolve(r.Context(), user.ID, req.GenerationID, "declined", nil); err != nil {
-			slog.Warn("resolve declined generation failed", "error", err)
-		} else {
-			telemetry.RecordGenerationOutcome(r.Context(), "declined", 1)
-		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

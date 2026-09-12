@@ -5,32 +5,25 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/ili16/recipe-generator/internal/llm"
 	"github.com/ili16/recipe-generator/internal/model"
-	"github.com/ili16/recipe-generator/internal/telemetry"
+	"github.com/ili16/recipe-generator/internal/storage"
 	"github.com/openai/openai-go"
-	"github.com/openai/openai-go/packages/param"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 )
 
 // mealPlanAssignmentSchema describes one proposed day: exactly one of recipe_id
 // (existing saved recipe) or variant (a brand-new proposed recipe) is non-null.
 func mealPlanAssignmentSchema() map[string]any {
-	nullable := func(typ string) map[string]any {
-		return map[string]any{
-			"anyOf": []any{map[string]any{"type": typ}, map[string]any{"type": "null"}},
-		}
-	}
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"recipe_id":            nullable("integer"),
+			"recipe_id":            llm.Nullable("integer"),
 			"variant":              map[string]any{"anyOf": []any{recipeJSONSchema(), map[string]any{"type": "null"}}},
-			"variant_of_recipe_id": nullable("integer"),
+			"variant_of_recipe_id": llm.Nullable("integer"),
 			"planned_on":           map[string]any{"type": "string"},
 			"start_time":           map[string]any{"type": "string"},
 		},
@@ -58,42 +51,12 @@ func mealPlanSuggestionJSONSchema() map[string]any {
 	}
 }
 
-const mealPlanSuggestSystemPromptBase = `You are a meal-planning assistant. You are given a user's saved recipes and asked to assign one recipe per day to fill a date range.
-
-Rules:
-- Only use recipe_id values from the "Saved recipes" list provided — never invent a new recipe_id.
-- Each assignment sets exactly one of "recipe_id" (use an existing saved recipe) or "variant" (propose a brand-new recipe, only when explicitly permitted below) — never both, never neither.
-- When "variant" is set, "variant_of_recipe_id" must name the saved recipe it's a twist on, and "recipe_id" must be null. When "recipe_id" is set, "variant" and "variant_of_recipe_id" must be null.
-- Prefer variety across the range — avoid repeating the same recipe on consecutive days when enough saved recipes exist.
-- Use the user's most-cooked tags, preferred difficulty, dietary preferences, and disliked ingredients as soft signal, but every assignment must still come from (or be a variant of) the saved recipes list.
-- Each meal takes about one hour; default start_time to "18:00:00" unless the user's message says otherwise.
-- Respect any "needs no food planned" / "doesn't want to cook" / "cooks in batches" instructions in the context below: "needs no food" days get skipped entirely (no assignment for that date); "doesn't want to cook" days still get an assignment — repeat the most recent prior cooked day's recipe_id/variant (a leftover day) instead of skipping it or inventing a new dish, using the "Most recently cooked meal before this range" line when the no-cook day is at the very start of the range; when batching, repeat the same recipe_id across each run of that many consecutive days instead of a different recipe each day.
-- Respond with status "applied" and exactly one assignment per day in the range (skipped days simply have no assignment). Only use status "needs_clarification" (assignments empty) if the saved recipes list is completely empty.`
-
-const mealPlanLowVarietyAddendum = `
-
-The user has fewer than 10 saved recipes, so variety will be limited. Set "low_variety" to true. You may propose "variant" days (a new recipe generated as a twist on one of the saved ones) for at most 2 days in the range to fill it out, instead of only repeating existing recipes.`
-
 func mealPlanSuggestSystemPrompt(lowVariety bool) string {
 	if lowVariety {
-		return mealPlanSuggestSystemPromptBase + mealPlanLowVarietyAddendum
+		return llm.MealPlanSuggestBase + llm.MealPlanLowVarietyAddendum
 	}
-	return mealPlanSuggestSystemPromptBase
+	return llm.MealPlanSuggestBase
 }
-
-// mealPlanChatSystemPrompt governs /meal-plan/chat. Unlike the fresh-week suggester, a
-// chat message is a bounded, explicit edit request against an already-proposed plan —
-// so it is never gated by low_variety: a user asking to swap an ingredient on one day
-// must always have a legal way to express that as a targeted "variant", not just a pick
-// from the saved-recipes list (which is how a generic ingredient swap like "shrimp to
-// beef" used to end up substituting an unrelated saved recipe instead of editing the
-// current dish).
-const mealPlanChatSystemPrompt = mealPlanSuggestSystemPromptBase + `
-
-You are now refining an existing plan via chat, not proposing one from scratch:
-- The last assistant turn is the current plan. Leave every day the user's message doesn't ask you to change exactly as it is (same recipe_id/variant, same day/time).
-- For a day the user does want changed — swapping an ingredient, protein, cuisine style, etc. — you MAY produce a "variant" for that day regardless of how many saved recipes the user has: base it on that day's current dish (its current recipe_id's saved recipe, or its current variant), keep the same dish identity, and change only what was asked. Use the "Current day recipes" ingredient/step details below to ground the edit in the real recipe, not just its title.
-- Only pick a different existing recipe_id when the user is explicitly asking for a different already-saved recipe by name/description — never as a substitute for an edit you can't express by picking from the list.`
 
 // buildMealPlanContextText renders the candidate recipes plus soft personalization
 // signal as the user-role message grounding a suggest/chat call. priorMeal, when
@@ -148,102 +111,114 @@ func renderIngredientsSummary(doc model.RecipeDocument) string {
 	return strings.Join(items, ", ")
 }
 
-// buildMealPlanChatMessages threads an in-progress plan-refinement conversation the
-// same way buildRefineMessages does for a single recipe: original context, the
-// assistant's initial proposal, every accepted instruction paired with the plan it
-// produced, and finally the new message. assignedRecipes carries the structured content
-// (ingredients) for every recipe_id currently in initial.Assignments, so a targeted edit
-// ("swap the shrimp for beef") has real ingredients to work from instead of just a title.
-func buildMealPlanChatMessages(candidates []model.Recipe, profile model.CookingProfile, prefs model.UserPreferences, startsOn, endsOn time.Time, priorMeal *model.MealPlanItem, assignedRecipes map[int]model.RecipeDocument, initial model.MealPlanSuggestion, history []model.MealPlanChatTurn, message string) ([]openai.ChatCompletionMessageParamUnion, error) {
-	contextText := buildMealPlanContextText(candidates, profile, prefs, startsOn, endsOn, priorMeal)
-	if len(assignedRecipes) > 0 {
-		var b strings.Builder
-		b.WriteString("\nCurrent day recipes (ingredients, for grounding an edit):\n")
-		for id, doc := range assignedRecipes {
-			fmt.Fprintf(&b, "%d: %s — %s\n", id, doc.Title, renderIngredientsSummary(doc))
-		}
-		contextText += b.String()
-	}
-	messages := []openai.ChatCompletionMessageParamUnion{
-		openai.SystemMessage(mealPlanChatSystemPrompt),
-		openai.UserMessage(contextText),
-	}
-
-	appendPlan := func(plan model.MealPlanSuggestion) error {
-		raw, err := json.Marshal(plan)
-		if err != nil {
-			return err
-		}
-		messages = append(messages, openai.AssistantMessage(string(raw)))
-		return nil
-	}
-
-	if err := appendPlan(initial); err != nil {
-		return nil, fmt.Errorf("marshal initial plan: %w", err)
-	}
-	for _, turn := range history {
-		messages = append(messages, openai.UserMessage(turn.Message))
-		if err := appendPlan(turn.Plan); err != nil {
-			return nil, fmt.Errorf("marshal history plan: %w", err)
-		}
-	}
-	messages = append(messages, openai.UserMessage(message))
-	return messages, nil
-}
-
 // generateMealPlanSuggestion mirrors generateRefineFromMessages's call shape but
 // decodes into model.MealPlanSuggestion against mealPlanSuggestionJSONSchema.
 func generateMealPlanSuggestion(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (model.MealPlanSuggestion, error) {
-	client := OpenAIclient()
-
-	slog.DebugContext(ctx, "llm: meal plan suggestion start", "model", recipeModel, "messages", len(messages))
-	t := time.Now()
-
-	ctx, span := telemetry.StartSpan(ctx, "llm.chat_completion")
-	span.SetAttributes(attribute.String("llm.model", string(recipeModel)), attribute.String("llm.call_type", "meal_plan_suggest"))
-	defer span.End()
-
-	completion, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-		Messages: messages,
+	result, _, err := llm.Call[model.MealPlanSuggestion](ctx, llm.Spec{
 		Model:    recipeModel,
-		ResponseFormat: openai.ChatCompletionNewParamsResponseFormatUnion{
-			OfJSONSchema: &openai.ResponseFormatJSONSchemaParam{
-				JSONSchema: openai.ResponseFormatJSONSchemaJSONSchemaParam{
-					Name:   "meal_plan_suggestion",
-					Schema: mealPlanSuggestionJSONSchema(),
-					Strict: param.NewOpt(true),
-				},
-			},
-		},
+		CallType: "meal_plan_suggest",
+		Messages: messages,
+		Schema:   &llm.Schema{Name: "meal_plan_suggestion", Schema: mealPlanSuggestionJSONSchema()},
 	})
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		telemetry.RecordLLMCall(ctx, "meal_plan_suggest", string(recipeModel), time.Since(t).Milliseconds(), false)
-		return model.MealPlanSuggestion{}, fmt.Errorf("meal plan suggestion completion: %w", err)
-	}
-	if len(completion.Choices) == 0 {
-		telemetry.RecordLLMCall(ctx, "meal_plan_suggest", string(recipeModel), time.Since(t).Milliseconds(), false)
-		return model.MealPlanSuggestion{}, errors.New("no choices returned")
-	}
-	telemetry.RecordLLMUsage(ctx, "meal_plan_suggest", string(recipeModel), completion.Usage.PromptTokens, completion.Usage.CompletionTokens)
-	recordCost(ctx, "meal_plan_suggest", string(recipeModel), completion.Usage.PromptTokens, completion.Usage.CompletionTokens)
-
-	raw := completion.Choices[0].Message.Content
-	slog.DebugContext(ctx, "llm: meal plan suggestion raw output", "json", raw)
-
-	var result model.MealPlanSuggestion
-	if err := json.Unmarshal([]byte(raw), &result); err != nil {
-		telemetry.RecordLLMCall(ctx, "meal_plan_suggest", string(recipeModel), time.Since(t).Milliseconds(), false)
-		return model.MealPlanSuggestion{}, fmt.Errorf("parse meal plan suggestion response: %w", err)
+		return model.MealPlanSuggestion{}, err
 	}
 	if result.Status == "applied" && len(result.Assignments) == 0 {
-		telemetry.RecordLLMCall(ctx, "meal_plan_suggest", string(recipeModel), time.Since(t).Milliseconds(), false)
 		return model.MealPlanSuggestion{}, errors.New("applied status missing assignments")
 	}
-	slog.DebugContext(ctx, "llm: meal plan suggestion result", "status", result.Status, "dur_ms", time.Since(t).Milliseconds(), "tokens", completion.Usage.TotalTokens)
-	telemetry.RecordLLMCall(ctx, "meal_plan_suggest", string(recipeModel), time.Since(t).Milliseconds(), true)
 	return result, nil
+}
+
+// enforceNoCookCarryover overwrites the assignment on each no-cook day so it exactly
+// repeats the most recently cooked day's dish. The system prompt asks the model to do
+// this itself, but nothing about the JSON schema enforces it — this makes a no-cook
+// day's content correct by construction instead of by LLM cooperation. No-op when
+// there are no no-cook days or the suggestion wasn't applied. lastCooked starts from
+// priorMeal (if any) and is only advanced by genuinely-cooked days, so a run of
+// consecutive no-cook days all correctly carry the same original dish forward.
+func enforceNoCookCarryover(result *model.MealPlanSuggestion, prefs model.UserPreferences, startsOn, endsOn time.Time, priorMeal *model.MealPlanItem) {
+	if result.Status != "applied" || len(prefs.MealPlanNoCookDays) == 0 {
+		return
+	}
+	// Normalise to UTC calendar dates so Weekday() below names the same day the client
+	// derives from the YYYY-MM-DD string, whatever timezone this process runs in.
+	startsOn, endsOn = utcDate(startsOn), utcDate(endsOn)
+	var notes []string
+	noCook := make(map[string]bool, len(prefs.MealPlanNoCookDays))
+	for _, d := range prefs.MealPlanNoCookDays {
+		noCook[d] = true
+	}
+
+	byDate := make(map[string]int, len(result.Assignments))
+	for i, a := range result.Assignments {
+		byDate[a.PlannedOn] = i
+	}
+
+	var lastCooked *model.MealPlanAssignment
+	if priorMeal != nil {
+		lastCooked = &model.MealPlanAssignment{RecipeID: &priorMeal.RecipeID, PlannedOn: priorMeal.PlannedOn, StartTime: priorMeal.StartTime}
+	}
+
+	appended := false
+	for d := startsOn; !d.After(endsOn); d = d.AddDate(0, 0, 1) {
+		dateStr := d.Format("2006-01-02")
+		idx, exists := byDate[dateStr]
+
+		if noCook[strings.ToLower(d.Weekday().String())] {
+			if lastCooked == nil {
+				continue // nothing to carry forward yet — leave the model's guess alone
+			}
+			carried := *lastCooked
+			carried.PlannedOn = dateStr
+			carried.StartTime = "18:00:00"
+			if exists {
+				carried.StartTime = result.Assignments[idx].StartTime
+				if !sameAssignment(result.Assignments[idx], carried) {
+					// Say what was overridden. A silent revert lets the model reply
+					// "Done!" about a change this just undid (BACKLOG.md 2.5).
+					notes = append(notes, dateStr+" is a no-cook day, so it carries "+lastCooked.PlannedOn+"'s dish forward instead of the proposed one")
+				}
+				result.Assignments[idx] = carried
+			} else {
+				result.Assignments = append(result.Assignments, carried)
+				appended = true
+			}
+			continue
+		}
+		if exists {
+			cooked := result.Assignments[idx]
+			lastCooked = &cooked
+		}
+	}
+
+	if appended {
+		sort.Slice(result.Assignments, func(i, j int) bool { return result.Assignments[i].PlannedOn < result.Assignments[j].PlannedOn })
+	}
+	// Surface the overrides on the suggestion's own message, so whoever renders the
+	// reply — the meal-plan screen today, the agent loop tomorrow — tells the user what
+	// this changed instead of reporting an unqualified success.
+	if len(notes) > 0 {
+		msg := strings.Join(notes, " ")
+		if result.Message != nil && *result.Message != "" {
+			msg = *result.Message + " " + msg
+		}
+		result.Message = &msg
+	}
+}
+
+// utcDate strips a time to its calendar date in UTC.
+func utcDate(t time.Time) time.Time {
+	y, m, d := t.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
+// sameAssignment reports whether two assignments put the same dish on the plate —
+// enough to tell a real override from a no-op rewrite.
+func sameAssignment(a, b model.MealPlanAssignment) bool {
+	if a.RecipeID != nil && b.RecipeID != nil {
+		return *a.RecipeID == *b.RecipeID
+	}
+	return a.RecipeID == nil && b.RecipeID == nil && a.Variant == nil && b.Variant == nil
 }
 
 // SuggestMealPlan proposes a fresh plan for [startsOn, endsOn] from candidates. priorMeal,
@@ -255,78 +230,17 @@ func SuggestMealPlan(ctx context.Context, candidates []model.Recipe, profile mod
 		openai.SystemMessage(mealPlanSuggestSystemPrompt(len(candidates) < 10)),
 		openai.UserMessage(buildMealPlanContextText(candidates, profile, prefs, startsOn, endsOn, priorMeal)),
 	}
-	return generateMealPlanSuggestion(ctx, messages)
-}
-
-// MealPlanChat refines an in-progress plan proposal with a new user instruction,
-// stateless like /refine-recipe — the caller resends the full history each call.
-// assignedRecipes grounds a targeted edit in the real ingredients of whatever's
-// currently assigned (see buildMealPlanChatMessages).
-func MealPlanChat(ctx context.Context, candidates []model.Recipe, profile model.CookingProfile, prefs model.UserPreferences, startsOn, endsOn time.Time, priorMeal *model.MealPlanItem, assignedRecipes map[int]model.RecipeDocument, initial model.MealPlanSuggestion, history []model.MealPlanChatTurn, message string) (model.MealPlanSuggestion, error) {
-	messages, err := buildMealPlanChatMessages(candidates, profile, prefs, startsOn, endsOn, priorMeal, assignedRecipes, initial, history, message)
+	result, err := generateMealPlanSuggestion(ctx, messages)
 	if err != nil {
-		return model.MealPlanSuggestion{}, err
+		return result, err
 	}
-	return generateMealPlanSuggestion(ctx, messages)
+	enforceNoCookCarryover(&result, prefs, startsOn, endsOn, priorMeal)
+	return result, nil
 }
 
-const mealPlanChatReplySystemPrompt = `You are a friendly cooking assistant helping someone adjust their AI-suggested meal plan via chat. Given their message and the plan context, reply in 1-2 short, natural sentences acknowledging what you're doing (or, if it's not possible given the saved recipes, saying so briefly). Do not list the full plan or use markdown — just a short conversational acknowledgment, plain text.`
-
-// StreamMealPlanChatReply streams a short conversational acknowledgment of message
-// (assistModel, plain text, no JSON schema) via onChunk as tokens arrive, then records
-// cost/telemetry once the stream completes. Runs alongside MealPlanChat, which does
-// the actual structured plan update — this call exists purely so the chat feels alive
-// while that heavier call is in flight.
-func StreamMealPlanChatReply(ctx context.Context, candidates []model.Recipe, profile model.CookingProfile, prefs model.UserPreferences, startsOn, endsOn time.Time, message string, onChunk func(string)) error {
-	client := OpenAIclient()
-	contextText := buildMealPlanContextText(candidates, profile, prefs, startsOn, endsOn, nil)
-
-	slog.DebugContext(ctx, "llm: meal plan chat reply stream start", "model", assistModel)
-	t := time.Now()
-
-	ctx, span := telemetry.StartSpan(ctx, "llm.chat_completion")
-	span.SetAttributes(attribute.String("llm.model", string(assistModel)), attribute.String("llm.call_type", "meal_plan_chat_reply"))
-	defer span.End()
-
-	stream := client.Chat.Completions.NewStreaming(ctx, openai.ChatCompletionNewParams{
-		Messages: []openai.ChatCompletionMessageParamUnion{
-			openai.SystemMessage(mealPlanChatReplySystemPrompt),
-			openai.UserMessage(contextText),
-			openai.UserMessage(message),
-		},
-		Model:         assistModel,
-		StreamOptions: openai.ChatCompletionStreamOptionsParam{IncludeUsage: param.NewOpt(true)},
-	})
-	defer stream.Close()
-
-	var promptTokens, completionTokens int64
-	for stream.Next() {
-		chunk := stream.Current()
-		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
-			onChunk(chunk.Choices[0].Delta.Content)
-		}
-		if chunk.Usage.TotalTokens > 0 {
-			promptTokens, completionTokens = chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens
-		}
-	}
-	if err := stream.Err(); err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		telemetry.RecordLLMCall(ctx, "meal_plan_chat_reply", string(assistModel), time.Since(t).Milliseconds(), false)
-		return fmt.Errorf("meal plan chat reply stream: %w", err)
-	}
-
-	telemetry.RecordLLMUsage(ctx, "meal_plan_chat_reply", string(assistModel), promptTokens, completionTokens)
-	recordCost(ctx, "meal_plan_chat_reply", string(assistModel), promptTokens, completionTokens)
-	slog.DebugContext(ctx, "llm: meal plan chat reply stream done", "dur_ms", time.Since(t).Milliseconds())
-	telemetry.RecordLLMCall(ctx, "meal_plan_chat_reply", string(assistModel), time.Since(t).Milliseconds(), true)
-	return nil
-}
-
-// variantInstructions is appended to the base structured-recipe system prompt for
 // POST /meal-plan/variants/{id} so the model produces a genuinely different but
 // related recipe instead of an extraction of the one it's given.
-const variantInstructions = "\n\nYou are producing a VARIANT of an existing recipe: a genuinely different, complete recipe that shares the same core idea (main ingredient, dish type, or technique) but differs meaningfully — a different cuisine style, a protein/ingredient swap, or a different cooking method. Do not just re-describe the base recipe."
+var variantInstructions = llm.NoCarryOverTimeNote + llm.VariantAddendum
 
 // GenerateRecipeVariant proposes a new, unsaved RecipeDocument as a twist on base.
 // hint, if non-empty, steers the twist (e.g. "make it Thai-style"); otherwise the
@@ -348,4 +262,38 @@ func GenerateRecipeVariant(ctx context.Context, base model.RecipeDocument, hint 
 		openai.UserMessage(instruction),
 	}
 	return generateStructuredFromMessages(ctx, "meal_plan_variant", messages)
+}
+
+// LoadMealPlanSignal gathers the candidate recipes + soft personalization signal shared
+// by /meal-plan/suggest, /meal-plan/chat and the plan_week chat tool, with the user's per-week scheduling
+// overrides (if any) for the week containing startsOn merged over their global
+// defaults. A missing cooking profile (not yet computed by the background worker) or
+// unset preferences are not errors — both zero values are fine soft-signal inputs.
+func LoadMealPlanSignal(ctx context.Context, userID int, startsOn time.Time) ([]model.Recipe, model.CookingProfile, model.UserPreferences, error) {
+	candidates, err := storage.GetRecipes(userID)
+	if err != nil {
+		return nil, model.CookingProfile{}, model.UserPreferences{}, err
+	}
+	profile, _, err := storage.GetCookingProfile(ctx, userID)
+	if err != nil {
+		return nil, model.CookingProfile{}, model.UserPreferences{}, err
+	}
+	prefs, err := storage.GetPreferences(ctx, userID)
+	if err != nil {
+		return nil, model.CookingProfile{}, model.UserPreferences{}, err
+	}
+	return candidates, profile, prefs, nil
+}
+
+// LoadPriorMeal returns the most recently planned meal-plan item in the 3 days strictly
+// before startsOn, so a no-cook day at the very start of a range can carry forward a
+// dish cooked just before the week boundary (e.g. "cook Sunday for Monday"). No prior
+// item is not an error.
+func LoadPriorMeal(ctx context.Context, userID int, startsOn time.Time) (*model.MealPlanItem, error) {
+	items, err := storage.GetMealPlanRange(ctx, userID, startsOn.AddDate(0, 0, -3), startsOn.AddDate(0, 0, -1))
+	if err != nil || len(items) == 0 {
+		return nil, err
+	}
+	last := items[len(items)-1] // GetMealPlanRange orders by planned_on, start_time
+	return &last, nil
 }

@@ -32,6 +32,30 @@ func TestGuardBlocksAfterBurst(t *testing.T) {
 	}
 }
 
+// Every connection from one client carries a different ephemeral source port. Keying on
+// the raw RemoteAddr therefore handed each request its own bucket and the anonymous limit
+// never fired — the same key is what /chat uses to find an anonymous thread, so that lost
+// its history too.
+func TestGuardKeysIgnoreSourcePort(t *testing.T) {
+	l := New(2, 60, time.Hour) // anon: 2/hour, burst 2
+	h := l.Guard(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	codes := make([]int, 0, 3)
+	for _, port := range []string{"1111", "2222", "3333"} {
+		req := httptest.NewRequest(http.MethodPost, "/generate", nil)
+		req.RemoteAddr = "9.9.9.9:" + port
+		w := httptest.NewRecorder()
+		h(w, req)
+		codes = append(codes, w.Code)
+	}
+	if codes[0] != http.StatusOK || codes[1] != http.StatusOK {
+		t.Fatalf("first two requests: got %v, want 200s", codes)
+	}
+	if codes[2] != http.StatusTooManyRequests {
+		t.Fatalf("3rd request from the same IP on a new port: got %d, want 429", codes[2])
+	}
+}
+
 func TestGuardSeparatesKeysByIP(t *testing.T) {
 	l := New(1, 60, time.Hour)
 	h := l.Guard(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })

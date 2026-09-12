@@ -53,7 +53,7 @@ Two models, matched to the tiers in RECIPE_QUALITY.md §2:
 | `isRecipeRelated` (on-topic gate) | Judgment / gating | `assistModel` (`gpt-5.4-nano`) — a binary topic classification doesn't need generation-grade reasoning |
 | `classifyCategory` (free-form save categorization) | Judgment / gating | `assistModel` (`gpt-5.4-nano`) — same reasoning |
 | Refine edit-intent judgment (applied/rejected/needs_choice) | Judgment / gating, but tightly coupled to the refine call itself | `recipeModel` (part of the same call as regeneration) — keep as-is, it's judged in the same call as the regeneration, splitting it out would add a call, not remove one |
-| `/suggest`, `/suggest-prefs`, `/cooking-chat` | UX-latency-critical assist | `assistModel` (`gpt-5.4-nano`) |
+| `/cooking-chat` | UX-latency-critical assist | `assistModel` (`gpt-5.4-nano`) |
 
 **Net effect**: `/generate` makes 1 call on the frontier tier (generate) and 1 on the
 assist tier (judge) — the expensive tier is reserved for the call that actually produces

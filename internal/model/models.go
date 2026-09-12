@@ -1,14 +1,16 @@
 package model
 
 import (
-	"mime/multipart"
+	"io"
 	"time"
 )
 
 type GenerateRecipeInput struct {
-	Prompt            string
-	URL               string
-	Image             multipart.File
+	Prompt string
+	URL    string
+	// Image is any reader over the image bytes: the multipart file on /generate, a
+	// bytes.Reader over a /chat attachment. Nil when there is no image.
+	Image             io.Reader
 	PreferredLanguage string
 }
 
@@ -30,16 +32,17 @@ type RecipeStep struct {
 }
 
 type RecipeDocument struct {
-	Title       string             `json:"title"`
-	Summary     *string            `json:"summary"`
-	Language    string             `json:"language"`
-	Tags        []string           `json:"tags"`
-	Servings    *int               `json:"servings"`
-	PrepMinutes *int               `json:"prep_minutes"`
-	CookMinutes *int               `json:"cook_minutes"`
-	Difficulty  *string            `json:"difficulty"`
-	Ingredients []RecipeIngredient `json:"ingredients"`
-	Steps       []RecipeStep       `json:"steps"`
+	Title        string             `json:"title"`
+	Summary      *string            `json:"summary"`
+	Language     string             `json:"language"`
+	Tags         []string           `json:"tags"`
+	Servings     *int               `json:"servings"`
+	TotalMinutes *int               `json:"total_minutes"`
+	PrepMinutes  *int               `json:"prep_minutes"`
+	CookMinutes  *int               `json:"cook_minutes"`
+	Difficulty   *string            `json:"difficulty"`
+	Ingredients  []RecipeIngredient `json:"ingredients"`
+	Steps        []RecipeStep       `json:"steps"`
 }
 
 type Recipe struct {
@@ -52,23 +55,23 @@ type Recipe struct {
 	ManuallyEdited bool            `json:"manually_edited"`
 	// MyVote is the caller's own thumbs up(+1)/down(-1) on this recipe, if any.
 	MyVote *int16 `json:"my_vote,omitempty"`
-	// GenerationID identifies the /generate call that produced this recipe, so a
-	// later /add-recipe or /refine-recipe call can report it back for funnel
-	// tracking (see generation_events). Only set on /generate's own response.
-	GenerationID string `json:"generation_id,omitempty"`
 	// VariantOfRecipeID links this recipe back to the saved recipe it was generated
 	// as a variant of (POST /meal-plan/variants/{id}), if any.
 	VariantOfRecipeID *int `json:"variant_of_recipe_id,omitempty"`
+	// SourceType and SourceURL are where this recipe came from: recipes.source_type
+	// plus the sources row AddRecipeStructured writes. Read-only provenance.
+	SourceType string     `json:"source_type,omitempty"`
+	SourceURL  *string    `json:"source_url,omitempty"`
+	CreatedAt  *time.Time `json:"created_at,omitempty"`
 }
 
 // UserPreferences is the explicit profile settings a user can set about themselves:
-// cooking skill level, dietary preferences, disliked ingredients, and how often they
-// cook. Fed back to the client via GET/PATCH /preferences.
+// cooking skill level, dietary preferences, disliked ingredients, and meal-plan
+// scheduling. Fed back to the client via GET/PATCH /preferences.
 type UserPreferences struct {
 	SkillLevel          *string  `json:"skill_level"`
 	DietaryPrefs        []string `json:"dietary_prefs"`
 	DislikedIngredients []string `json:"disliked_ingredients"`
-	CookingCadence      *string  `json:"cooking_cadence"`
 	// MealPlanNoFoodDays are lowercase weekday names ("wednesday") on which the user
 	// needs no food planned at all — the meal-plan AI must leave them with no
 	// assignment.
@@ -84,16 +87,6 @@ type UserPreferences struct {
 	// WeekStartDay is the lowercase weekday name the user's meal-plan week begins on
 	// (default "monday").
 	WeekStartDay string `json:"week_start_day"`
-}
-
-// MealPlanWeekPreferences overrides UserPreferences' 3 scheduling fields for one
-// specific week. Each pointer nil means "inherit the user's global default"; a non-nil
-// pointer (including one pointing at an empty slice) is an explicit override for that
-// week. Fed back to the client via GET/PATCH /meal-plan/week-preferences.
-type MealPlanWeekPreferences struct {
-	NoFoodDays *[]string `json:"no_food_days"`
-	NoCookDays *[]string `json:"no_cook_days"`
-	BatchDays  *int      `json:"batch_days"`
 }
 
 // CookingProfile is a behavioral profile derived from a user's saved recipe history by
@@ -166,14 +159,6 @@ type MealPlanSuggestion struct {
 	Assignments []MealPlanAssignment `json:"assignments"`
 }
 
-// MealPlanChatTurn is one exchange in an in-progress /meal-plan/chat conversation: the
-// user's message and the plan proposal it produced. By convention the first turn the
-// client sends alongside `initial` is not included here — see EditTurn's convention.
-type MealPlanChatTurn struct {
-	Message string             `json:"message"`
-	Plan    MealPlanSuggestion `json:"plan"`
-}
-
 // RefineResult is the outcome of a /refine-recipe call. Status is one of:
 //   - "applied": the change was made; Recipe holds the new document.
 //   - "rejected": the change would break the dish's essential identity; Message
@@ -185,4 +170,25 @@ type RefineResult struct {
 	Message *string         `json:"message"`
 	Options []string        `json:"options"`
 	Recipe  *RecipeDocument `json:"recipe"`
+}
+
+// ToolCall is one tool invocation the model asked for in an agent turn: the provider's
+// call id, the tool name, and its raw JSON arguments (kept as text — arguments are
+// model-generated and may not match the declared schema, so they are validated at
+// dispatch, not at deserialization).
+type ToolCall struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Args string `json:"args"`
+}
+
+// ConversationMessage is one message in a server-held chat thread (table
+// conversation_messages, specs/AGENT_CHAT.md §2.1). Role "assistant" may carry
+// ToolCalls; role "tool" carries the matching ToolCallID and the tool's JSON result as
+// Content.
+type ConversationMessage struct {
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
 }

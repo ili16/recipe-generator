@@ -45,16 +45,14 @@ func StartSpan(ctx context.Context, name string) (context.Context, trace.Span) {
 var meter = otel.Meter("recipe-generator")
 
 var (
-	generateCount          = mustCounter("recipe.generate.count", "recipe generation calls")
-	generateDuration       = mustHistogram("recipe.generate.duration_ms", "ms", "recipe generation latency")
-	refineCount            = mustCounter("recipe.refine.count", "recipe refinement calls")
-	refineDuration         = mustHistogram("recipe.refine.duration_ms", "ms", "recipe refinement latency")
-	saveCount              = mustCounter("recipe.save.count", "recipe save calls")
-	saveIterations         = mustHistogram("recipe.save.iterations", "1", "chat edits applied before a recipe was saved")
-	generationOutcomeCount = mustCounter("recipe.generation_outcome.count", "generation funnel terminal outcome (saved/refined/declined/abandoned)")
-	llmTokenUsage          = mustCounter("llm.tokens", "LLM tokens consumed, by prompt/completion")
-	llmCallDuration        = mustHistogram("llm.call.duration_ms", "ms", "LLM call latency by model/call_type")
-	judgeDecisions         = mustCounter("judge.decision.count", "cooking-relevance judge allow/deny decisions")
+	generateCount    = mustCounter("recipe.generate.count", "recipe generation calls")
+	generateDuration = mustHistogram("recipe.generate.duration_ms", "ms", "recipe generation latency")
+	refineCount      = mustCounter("recipe.refine.count", "recipe refinement calls")
+	refineDuration   = mustHistogram("recipe.refine.duration_ms", "ms", "recipe refinement latency")
+	saveCount        = mustCounter("recipe.save.count", "recipe save calls")
+	saveIterations   = mustHistogram("recipe.save.iterations", "1", "chat edits applied before a recipe was saved")
+	llmTokenUsage    = mustCounter("llm.tokens", "LLM tokens consumed, by prompt/completion")
+	llmCallDuration  = mustHistogram("llm.call.duration_ms", "ms", "LLM call latency by model/call_type")
 )
 
 func mustCounter(name, desc string) metric.Int64Counter {
@@ -254,17 +252,6 @@ func RecordSave(ctx context.Context, iterations int, ok bool) {
 	saveIterations.Record(ctx, int64(iterations))
 }
 
-// RecordGenerationOutcome reports n generation_events rows resolved to outcome
-// ("saved"/"refined"/"declined"/"abandoned") in one call — the funnel's numerator.
-// recipe.generate.count (RecordGenerate) is the denominator: conversion ratio is
-// computed downstream (e.g. in PromQL) as outcome-count / generate-count.
-func RecordGenerationOutcome(ctx context.Context, outcome string, n int64) {
-	if n <= 0 {
-		return
-	}
-	generationOutcomeCount.Add(ctx, n, metric.WithAttributes(attribute.String("outcome", outcome)))
-}
-
 // RecordLLMCall reports latency and outcome for one LLM call, broken out by call_type
 // (generate/refine/classify/judge/suggest_input/suggest_prefs/cooking_chat) and model —
 // use this to compare model swaps and spot which call type is slow or erroring.
@@ -273,20 +260,6 @@ func RecordLLMCall(ctx context.Context, callType, model string, durMs int64, ok 
 		attribute.String("call_type", callType),
 		attribute.String("model", model),
 		attribute.String("outcome", outcomeAttr(ok)),
-	))
-}
-
-// RecordJudgeDecision reports one isRecipeRelated verdict. hasContext distinguishes
-// judging a fresh input (generate/suggest/cooking-chat, no existing recipe) from judging
-// a change against an existing recipe (refine) — deny rates often differ between the two.
-func RecordJudgeDecision(ctx context.Context, hasContext, allowed bool) {
-	decision := "deny"
-	if allowed {
-		decision = "allow"
-	}
-	judgeDecisions.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("decision", decision),
-		attribute.Bool("has_context", hasContext),
 	))
 }
 

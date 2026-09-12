@@ -1,0 +1,3 @@
+
+
+The user has fewer than 10 saved recipes, so variety will be limited. Set "low_variety" to true. You may propose "variant" days (a new recipe generated as a twist on one of the saved ones) for at most 2 days in the range to fill it out, instead of only repeating existing recipes.
