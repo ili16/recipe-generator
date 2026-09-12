@@ -68,10 +68,10 @@ func insertIngredientsAndSteps(ctx context.Context, tx pgx.Tx, recipeID int, doc
 		var ingID int64
 		err := tx.QueryRow(ctx, `
 			INSERT INTO recipe_ingredients
-				(recipe_id, sort_order, section, item, quantity, quantity_text, unit, optional)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+				(recipe_id, sort_order, section, item, quantity, quantity_text, unit, optional, category)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 			RETURNING id`,
-			recipeID, i+1, ing.Section, ing.Item, ing.Quantity, ing.QuantityText, ing.Unit, ing.Optional,
+			recipeID, i+1, ing.Section, ing.Item, ing.Quantity, ing.QuantityText, ing.Unit, ing.Optional, ing.Category,
 		).Scan(&ingID)
 		if err != nil {
 			return err
@@ -403,13 +403,13 @@ func GetRecipeByID(ctx context.Context, userID, recipeID int) (model.Recipe, err
 	doc.Tags = recipe.Tags
 
 	ingRows, err := Pool.Query(ctx, `
-		SELECT section, item, quantity, quantity_text, unit, optional
+		SELECT section, item, quantity, quantity_text, unit, optional, category
 		FROM recipe_ingredients WHERE recipe_id = $1 ORDER BY sort_order`, recipeID)
 	if err == nil {
 		defer ingRows.Close()
 		for ingRows.Next() {
 			var ing model.RecipeIngredient
-			if scanErr := ingRows.Scan(&ing.Section, &ing.Item, &ing.Quantity, &ing.QuantityText, &ing.Unit, &ing.Optional); scanErr == nil {
+			if scanErr := ingRows.Scan(&ing.Section, &ing.Item, &ing.Quantity, &ing.QuantityText, &ing.Unit, &ing.Optional, &ing.Category); scanErr == nil {
 				doc.Ingredients = append(doc.Ingredients, ing)
 			}
 		}
@@ -505,7 +505,7 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 	rows, err := Pool.Query(context.Background(), `
 		SELECT r.id, r.title, r.content, r.manually_edited, rv.vote, r.variant_of_recipe_id,
 		       r.source_type, (SELECT s.source_url FROM sources s WHERE s.recipe_id = r.id ORDER BY s.id LIMIT 1),
-		       r.created_at, r.servings,
+		       r.created_at, r.servings, r.last_cooked_at, r.share_token,
 		       -- Same prep+cook fallback the client used to do per-recipe; NULLIF keeps
 		       -- "unknown" distinct from "zero minutes".
 		       NULLIF(COALESCE(r.total_minutes, COALESCE(r.prep_minutes, 0) + COALESCE(r.cook_minutes, 0)), 0)
@@ -521,7 +521,7 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 	for rows.Next() {
 		var recipe model.Recipe
 		err := rows.Scan(&recipe.ID, &recipe.Recipename, &recipe.Recipe, &recipe.ManuallyEdited, &recipe.MyVote, &recipe.VariantOfRecipeID,
-			&recipe.SourceType, &recipe.SourceURL, &recipe.CreatedAt, &recipe.Servings, &recipe.TotalMinutes)
+			&recipe.SourceType, &recipe.SourceURL, &recipe.CreatedAt, &recipe.Servings, &recipe.LastCookedAt, &recipe.ShareToken, &recipe.TotalMinutes)
 		if err != nil {
 			rows.Close()
 			slog.Error("Failed to scan recipe", "error", err)

@@ -26,8 +26,9 @@ func mealPlanAssignmentSchema() map[string]any {
 			"variant_of_recipe_id": llm.Nullable("integer"),
 			"planned_on":           map[string]any{"type": "string"},
 			"start_time":           map[string]any{"type": "string"},
+			"servings":             llm.Nullable("integer"),
 		},
-		"required":             []string{"recipe_id", "variant", "variant_of_recipe_id", "planned_on", "start_time"},
+		"required":             []string{"recipe_id", "variant", "variant_of_recipe_id", "planned_on", "start_time", "servings"},
 		"additionalProperties": false,
 	}
 }
@@ -72,9 +73,13 @@ func buildMealPlanContextText(candidates []model.Recipe, profile model.CookingPr
 	if len(candidates) == 0 {
 		b.WriteString("Saved recipes: none.\n")
 	} else {
-		b.WriteString("Saved recipes (id: title [tags]):\n")
+		b.WriteString("Saved recipes (id: title [tags], and what the recipe yields):\n")
 		for _, r := range candidates {
-			fmt.Fprintf(&b, "%d: %s %v\n", r.ID, r.Recipename, r.Tags)
+			fmt.Fprintf(&b, "%d: %s %v", r.ID, r.Recipename, r.Tags)
+			if r.Servings != nil {
+				fmt.Fprintf(&b, " (serves %d)", *r.Servings)
+			}
+			b.WriteString("\n")
 		}
 	}
 	if len(profile.TopTags) > 0 {
@@ -264,6 +269,27 @@ func GenerateRecipeVariant(ctx context.Context, base model.RecipeDocument, hint 
 	return generateStructuredFromMessages(ctx, "meal_plan_variant", messages)
 }
 
+// CookedCooldown is how long a recipe stays out of the meal-plan candidate list after
+// the user marks it cooked (BACKLOG 6.3) — long enough that a week's plan doesn't repeat
+// what was eaten days ago, short enough that a small library still cycles.
+const CookedCooldown = 14 * 24 * time.Hour
+
+// suppressRecentlyCooked drops candidates cooked within CookedCooldown of now. A library
+// where everything is on cooldown falls back to the full list: no candidates means the
+// planner has nothing to plan, which is worse than a repeat.
+func suppressRecentlyCooked(candidates []model.Recipe, now time.Time) []model.Recipe {
+	kept := make([]model.Recipe, 0, len(candidates))
+	for _, r := range candidates {
+		if r.LastCookedAt == nil || now.Sub(*r.LastCookedAt) >= CookedCooldown {
+			kept = append(kept, r)
+		}
+	}
+	if len(kept) == 0 {
+		return candidates
+	}
+	return kept
+}
+
 // LoadMealPlanSignal gathers the candidate recipes + soft personalization signal shared
 // by /meal-plan/suggest, /meal-plan/chat and the plan_week chat tool, with the user's per-week scheduling
 // overrides (if any) for the week containing startsOn merged over their global
@@ -274,6 +300,7 @@ func LoadMealPlanSignal(ctx context.Context, userID int, startsOn time.Time) ([]
 	if err != nil {
 		return nil, model.CookingProfile{}, model.UserPreferences{}, err
 	}
+	candidates = suppressRecentlyCooked(candidates, time.Now())
 	profile, _, err := storage.GetCookingProfile(ctx, userID)
 	if err != nil {
 		return nil, model.CookingProfile{}, model.UserPreferences{}, err

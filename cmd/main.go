@@ -87,6 +87,12 @@ func main() {
 	mux.HandleFunc("PATCH /api/v1/preferences", authenticator.Require(HandlePatchPreferences))
 	mux.HandleFunc("PUT /api/v1/recipes/{id}/vote", authenticator.Require(HandleVoteRecipe))
 	mux.HandleFunc("DELETE /api/v1/recipes/{id}/vote", authenticator.Require(HandleUnvoteRecipe))
+	mux.HandleFunc("PUT /api/v1/recipes/{id}/cooked", authenticator.Require(HandleMarkCooked))
+	mux.HandleFunc("DELETE /api/v1/recipes/{id}/cooked", authenticator.Require(HandleUnmarkCooked))
+	mux.HandleFunc("POST /api/v1/recipes/{id}/share", authenticator.Require(HandleShareRecipe))
+	mux.HandleFunc("DELETE /api/v1/recipes/{id}/share", authenticator.Require(HandleUnshareRecipe))
+	// Deliberately unauthenticated (BACKLOG 8.4) — the token is the credential.
+	mux.HandleFunc("GET /api/v1/shared/{token}", HandleGetSharedRecipe)
 	mux.HandleFunc("GET /api/v1/collections", authenticator.Require(HandleGetCollections))
 	mux.HandleFunc("POST /api/v1/collections", authenticator.Require(HandleCreateCollection))
 	mux.HandleFunc("DELETE /api/v1/collections/{id}", authenticator.Require(HandleDeleteCollection))
@@ -94,6 +100,7 @@ func main() {
 	mux.HandleFunc("DELETE /api/v1/collections/{id}/recipes/{recipeId}", authenticator.Require(HandleSetCollectionMembership))
 
 	mux.HandleFunc("GET /api/v1/meal-plan", authenticator.Require(HandleGetMealPlan))
+	mux.HandleFunc("GET /api/v1/grocery-list", authenticator.Require(HandleGetGroceryList))
 	mux.HandleFunc("POST /api/v1/meal-plan/items", authenticator.Require(HandleAddMealPlanItem))
 	mux.HandleFunc("DELETE /api/v1/meal-plan/items/{id}", authenticator.Require(HandleDeleteMealPlanItem))
 	mux.HandleFunc("POST /api/v1/meal-plan/variants/{id}", llm(rl, HandleGenerateVariant))
@@ -398,6 +405,116 @@ func HandleUnvoteRecipe(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := storage.RemoveVote(r.Context(), user.ID, recipeID); err != nil {
 		slog.Error("Error removing vote", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleMarkCooked stamps a recipe the caller owns as cooked now (BACKLOG 6.3), which
+// holds it back from meal-plan candidates for service.CookedCooldown.
+func HandleMarkCooked(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+	recipeID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || recipeID <= 0 {
+		http.Error(w, "invalid recipe id", http.StatusBadRequest)
+		return
+	}
+	found, err := storage.MarkCooked(r.Context(), user.ID, recipeID)
+	if err != nil {
+		slog.Error("Error marking cooked", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !found {
+		http.Error(w, "recipe not found", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleShareRecipe turns on the read-only share link for a recipe the caller owns and
+// returns its token (BACKLOG 8.4). Re-sharing returns the same token.
+func HandleShareRecipe(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+	recipeID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || recipeID <= 0 {
+		http.Error(w, "invalid recipe id", http.StatusBadRequest)
+		return
+	}
+	token, err := storage.ShareRecipe(r.Context(), user.ID, recipeID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "recipe not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("Error sharing recipe", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"share_token": token})
+}
+
+// HandleUnshareRecipe revokes the link; the old token stops resolving immediately.
+func HandleUnshareRecipe(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+	recipeID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || recipeID <= 0 {
+		http.Error(w, "invalid recipe id", http.StatusBadRequest)
+		return
+	}
+	if err := storage.UnshareRecipe(r.Context(), user.ID, recipeID); err != nil {
+		slog.Error("Error unsharing recipe", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleGetSharedRecipe serves a shared recipe to anyone holding the token — no auth.
+// An unknown, revoked or trashed token is a 404, same as a recipe that was never shared.
+func HandleGetSharedRecipe(w http.ResponseWriter, r *http.Request) {
+	recipe, err := storage.GetSharedRecipe(r.Context(), r.PathValue("token"))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("Error getting shared recipe", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	// The reader is not the owner: strip the owner-only signals GetRecipeByID carries.
+	recipe.MyVote = nil
+	writeJSON(w, http.StatusOK, recipe)
+}
+
+// HandleUnmarkCooked clears the caller's cooked mark on a recipe, if any.
+func HandleUnmarkCooked(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+	recipeID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || recipeID <= 0 {
+		http.Error(w, "invalid recipe id", http.StatusBadRequest)
+		return
+	}
+	if err := storage.UnmarkCooked(r.Context(), user.ID, recipeID); err != nil {
+		slog.Error("Error unmarking cooked", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}

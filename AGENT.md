@@ -241,6 +241,15 @@ otherwise), rate-limited and budget-capped per the "Rate limiting + budget" note
 	  a `GenerationOrigin` on `draftInfo` (it is the only place that still knows whether the
 	  user gave a URL, a photo or a description), `transform_recipe` inherits it from its
 	  target draft, and `saveDraft` writes it as the recipe's `sources` row.
+	- `save_recipe` checks for a look-alike first (BACKLOG 8.3): a live recipe of the
+	  caller's with the same source URL, or failing that the same normalised title, comes
+	  back as `{saved:false, duplicate_of:{recipe_id,title,matched_on}}` and **nothing is
+	  written** — the model offers "a variant of that one" or "a separate recipe" and calls
+	  again with `confirm:true` (plus `variant_of:<id>` for the variant). A save is
+	  therefore deferred, never refused. The lookup is advisory: `storage.FindDuplicate`
+	  caps itself at 500 ms and treats any error or timeout as "no duplicate". Only this
+	  tool checks — `apply_week_plan` saves drafts through the same `saveDraft` and must
+	  not stop a week to ask.
 	- Tool catalog in `internal/service/chat_tools.go`. Two invariants: the user id comes
 	  from `auth.FromContext`, never from tool args (a recipe id in args only ever reaches
 	  a storage call already scoped to that user, so another user's id is not-found); and
@@ -365,23 +374,20 @@ Authenticated (Bearer token required):
 	- `starts_on` required; `ends_on` optional, defaults to `starts_on+6d` (a week). Range
 	  capped at 42 days; 400 if missing/unparseable/out of range.
 	- 200 with `{"starts_on":"...","ends_on":"...","items":[{"id":...,"recipe_id":...,`
-	  `"recipe_title":"...","planned_on":"...","start_time":"18:00:00"}, ...]}` — every
-	  item planned in that range, one recipe per day (`meal_slot` stays at its DB default
-	  `'dinner'`; not yet exposed via the API). Used by all three calendar views: Week
+	  `"recipe_title":"...","planned_on":"...","start_time":"18:00:00","meal_slot":"dinner"},`
+	  `...]}` — every item planned in that range, **up to one per (day, `meal_slot`)**,
+	  ordered by day then by the order a day is eaten (BACKLOG 6.4). Used by all three calendar views: Week
 	  passes a 7-day range, Day a single day, Month the full displayed grid (up to 42
 	  days).
 - POST /meal-plan/items
-	- JSON: `{"recipe_id":7,"planned_on":"2026-09-09","start_time":"18:00:00"}` →
-	  201 with the created item (same shape as one entry in `GET /meal-plan`'s `items`).
-	  `start_time` optional, defaults to `18:00:00`. 404 if `recipe_id` doesn't belong to
-	  the caller. Upserts by day — replaces whatever was already assigned to `planned_on`,
-	  so reassigning a filled day needs no separate delete. Creates that week's
-	  `meal_plans` row implicitly on first use.
-- PATCH /meal-plan/items/{id}
-	- JSON: `{"planned_on":"2026-09-10","start_time":"08:30:00"}` (both required, full
-	  replace) → 200 with the updated item. Moves an item to a new day and/or time — the
-	  Day view's drag interaction. 404 if the item doesn't exist or isn't owned by the
-	  caller.
+	- JSON: `{"recipe_id":7,"planned_on":"2026-09-09","start_time":"18:00:00",`
+	  `"meal_slot":"lunch"}` → 201 with the created item (same shape as one entry in
+	  `GET /meal-plan`'s `items`). `start_time` optional, defaults to `18:00:00`;
+	  `meal_slot` optional, defaults to `dinner`, 400 if it isn't one of
+	  `breakfast|lunch|dinner|snack`. 404 if `recipe_id` doesn't belong to the caller.
+	  Upserts by **(day, slot)** — replaces whatever was in that slot and leaves the
+	  day's other meals alone (BACKLOG 6.4), so reassigning a filled slot needs no
+	  separate delete. Creates that week's `meal_plans` row implicitly on first use.
 - DELETE /meal-plan/items/{id}
 	- 204 on success, 404 if the item doesn't exist or isn't owned by the caller.
 - GET /preferences
@@ -452,6 +458,8 @@ existed since `00001` but only became meaningful with BACKLOG 8.2's soft delete.
   (`ApplyMealPlanDays`; `AddMealPlanItem` is the one-day case), move (patch), delete
 - internal/storage/collections.go: collections CRUD and membership, every query scoped by
   `user_id` so another user's id is not-found (BACKLOG 8.1)
+- internal/storage/duplicates.go: the advisory, time-capped duplicate lookup behind
+  `save_recipe`'s prompt (BACKLOG 8.3)
 - internal/storage/conversations.go: server-held chat threads for /chat, ownership-checked on
   every read and append
 - internal/model/models.go: request/response structs

@@ -21,6 +21,11 @@ type RecipeIngredient struct {
 	QuantityText *string  `json:"quantity_text"`
 	Unit         *string  `json:"unit"`
 	Optional     bool     `json:"optional"`
+	// Category is the shopping aisle this ingredient belongs to, emitted by the
+	// generation call so the grocery list can group by aisle without a
+	// hand-maintained ingredient→aisle table (BACKLOG 6.1). One of GroceryCategories;
+	// nil on anything generated before 6.1 and grouped as "other".
+	Category *string `json:"category"`
 }
 
 type RecipeStep struct {
@@ -74,6 +79,12 @@ type Recipe struct {
 	Servings     *int       `json:"servings,omitempty"`
 	TotalMinutes *int       `json:"total_minutes,omitempty"`
 	CreatedAt    *time.Time `json:"created_at,omitempty"`
+	// LastCookedAt is when the owner last marked this cooked (BACKLOG 6.3). nil means
+	// never. Recent ones are held back from meal-plan candidates for CookedCooldown.
+	LastCookedAt *time.Time `json:"last_cooked_at,omitempty"`
+	// ShareToken is the read-only share link's token (BACKLOG 8.4), or nil when the
+	// recipe isn't shared. Owner-only: the public read strips it.
+	ShareToken *string `json:"share_token,omitempty"`
 	// DeletedAt is set only on the trash listing (GET /recipes/trash); every other
 	// read path filters soft-deleted rows out, so it is always nil there.
 	DeletedAt *time.Time `json:"deleted_at,omitempty"`
@@ -152,6 +163,40 @@ type RecipeVersion struct {
 	Data       RecipeDocument `json:"data"`
 }
 
+// GroceryCategories are the shopping aisles, in the order a list renders them. The
+// model picks one per ingredient; anything else (or nothing) is "other".
+var GroceryCategories = []string{"produce", "protein", "dairy", "pantry", "other"}
+
+// GroceryIngredient is one ingredient of one planned meal, as read for a week's grocery
+// list — the join of meal_plan_items × recipe_ingredients, before consolidation.
+type GroceryIngredient struct {
+	PlannedOn   string
+	RecipeTitle string
+	// PlannedServings is meal_plan_items.servings and RecipeServings is what the recipe
+	// itself yields; quantities are scaled by their ratio when both are known (BACKLOG 6.2).
+	PlannedServings *int
+	RecipeServings  *int
+	Item            string
+	Quantity        *float64
+	Unit            *string
+	QuantityText    *string
+	Category        *string
+}
+
+// GroceryLine is one shopping line: the same item across every meal in the week that
+// needs it, with the quantities summed where they are comparable. Note carries the
+// amounts that cannot be summed ("to taste") — they are folded in here rather than
+// dropped. For names the meals the line serves, so a line can be ignored when its meal
+// is (e.g. "Mon Roast chicken").
+type GroceryLine struct {
+	Item     string   `json:"item"`
+	Category string   `json:"category"`
+	Quantity *float64 `json:"quantity"`
+	Unit     *string  `json:"unit"`
+	Note     string   `json:"note,omitempty"`
+	For      []string `json:"for"`
+}
+
 // MealPlanItem is one recipe assigned to one day (and time) in a user's meal plan.
 type MealPlanItem struct {
 	ID          int    `json:"id"`
@@ -159,6 +204,14 @@ type MealPlanItem struct {
 	RecipeTitle string `json:"recipe_title"`
 	PlannedOn   string `json:"planned_on"` // YYYY-MM-DD
 	StartTime   string `json:"start_time"` // HH:MM:SS
+	// MealSlot is which meal of the day this is: breakfast|lunch|dinner|snack. It is the
+	// second half of the plan's upsert key, so a day holds up to one item per slot
+	// (BACKLOG 6.4). Anything that doesn't say defaults to dinner.
+	MealSlot string `json:"meal_slot"`
+	// Servings is how many portions of this recipe are wanted on this day (BACKLOG 6.2).
+	// nil means "as the recipe is written" — it scales the grocery list only when both it
+	// and the recipe's own servings are known.
+	Servings *int `json:"servings,omitempty"`
 }
 
 // MealPlanAssignment is one proposed day in an AI-suggested meal plan. Exactly one of
@@ -170,6 +223,7 @@ type MealPlanAssignment struct {
 	VariantOfRecipeID *int            `json:"variant_of_recipe_id"`
 	PlannedOn         string          `json:"planned_on"`
 	StartTime         string          `json:"start_time"`
+	Servings          *int            `json:"servings"`
 }
 
 // MealPlanSuggestion is the outcome of POST /meal-plan/suggest or /meal-plan/chat.

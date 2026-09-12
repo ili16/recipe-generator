@@ -130,8 +130,14 @@ func recipeJSONSchema() map[string]any {
 			"quantity_text": llm.Nullable("string"),
 			"unit":          llm.Nullable("string"),
 			"optional":      map[string]any{"type": "boolean"},
+			"category": map[string]any{
+				"anyOf": []any{
+					map[string]any{"type": "string", "enum": model.GroceryCategories},
+					map[string]any{"type": "null"},
+				},
+			},
 		},
-		"required":             []string{"section", "item", "quantity", "quantity_text", "unit", "optional"},
+		"required":             []string{"section", "item", "quantity", "quantity_text", "unit", "optional", "category"},
 		"additionalProperties": false,
 	}
 	stepSchema := map[string]any{

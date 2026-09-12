@@ -20,6 +20,8 @@ Nutrition rules — follow strictly:
 - If servings is null, or the ingredient quantities are too vague to estimate from (mostly 'to taste' / no amounts), set all four to null. A blank is correct; a confidently wrong calorie count is not.
 - Do not restate a source's per-100g figures as per-serving values without converting them.
 
+Shopping-aisle rule: set each ingredient's category to the aisle it is bought in — "produce" (fruit, vegetables, fresh herbs), "protein" (meat, poultry, fish, seafood, tofu, eggs), "dairy" (milk, butter, cream, cheese, yoghurt), "pantry" (dry and shelf-stable goods: flour, sugar, rice, pasta, oil, vinegar, spices, tinned and jarred items). Use "other" only when none of the four fits.
+
 ingredient_indices rule: for each step, set ingredient_indices to the list of 0-based indices (into the ingredients array) of every ingredient directly used in that step. Use an empty array if none apply.
 
 tags rule: assign every tag from the allowed list that genuinely applies to this recipe — usually several, spanning multiple groups (meal type, dietary, time/difficulty, cooking method, primary ingredient, cuisine/vibe). Do not limit yourself to one tag or one group.

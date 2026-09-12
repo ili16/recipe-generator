@@ -18,7 +18,8 @@ func TestMealPlanSuggestSystemPrompt(t *testing.T) {
 }
 
 func TestBuildMealPlanContextText(t *testing.T) {
-	candidates := []model.Recipe{{ID: 7, Recipename: "Chicken Curry", Tags: []string{"dinner", "spicy"}}}
+	four := 4
+	candidates := []model.Recipe{{ID: 7, Recipename: "Chicken Curry", Tags: []string{"dinner", "spicy"}, Servings: &four}}
 	profile := model.CookingProfile{TopTags: []string{"dinner"}}
 	difficulty := "easy"
 	profile.PreferredDifficulty = &difficulty
@@ -28,7 +29,7 @@ func TestBuildMealPlanContextText(t *testing.T) {
 
 	text := buildMealPlanContextText(candidates, profile, prefs, startsOn, endsOn, nil)
 
-	for _, want := range []string{"2026-09-07", "2026-09-13", "7: Chicken Curry", "dinner", "easy", "vegetarian", "cilantro"} {
+	for _, want := range []string{"2026-09-07", "2026-09-13", "7: Chicken Curry", "(serves 4)", "dinner", "easy", "vegetarian", "cilantro"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("context text missing %q:\n%s", want, text)
 		}
@@ -89,7 +90,7 @@ func TestBuildMealPlanContextTextPriorMeal(t *testing.T) {
 // silently break the live call rather than fail at build time.
 func TestMealPlanSchemasCoverStructFields(t *testing.T) {
 	assignmentSchema := mealPlanAssignmentSchema()
-	wantAssignmentFields := []string{"recipe_id", "variant", "variant_of_recipe_id", "planned_on", "start_time"}
+	wantAssignmentFields := []string{"recipe_id", "variant", "variant_of_recipe_id", "planned_on", "start_time", "servings"}
 	assertSchemaFields(t, "mealPlanAssignmentSchema", assignmentSchema, wantAssignmentFields)
 
 	suggestionSchema := mealPlanSuggestionJSONSchema()
@@ -259,4 +260,35 @@ func TestEnforceNoCookCarryover(t *testing.T) {
 			t.Errorf("expected no changes with no no-cook days, got %+v", result.Assignments[0])
 		}
 	})
+}
+
+// TestSuppressRecentlyCooked covers the cooldown (BACKLOG 6.3): a recipe cooked inside
+// the window is held back, one cooked before it (or never) is not, and a library where
+// everything is on cooldown is returned whole rather than empty.
+func TestSuppressRecentlyCooked(t *testing.T) {
+	now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) *time.Time { ts := now.Add(-d); return &ts }
+
+	ids := func(rs []model.Recipe) []int {
+		out := []int{}
+		for _, r := range rs {
+			out = append(out, r.ID)
+		}
+		return out
+	}
+
+	got := ids(suppressRecentlyCooked([]model.Recipe{
+		{ID: 1}, // never cooked
+		{ID: 2, LastCookedAt: at(3 * 24 * time.Hour)},  // inside the window
+		{ID: 3, LastCookedAt: at(30 * 24 * time.Hour)}, // long past it
+		{ID: 4, LastCookedAt: at(CookedCooldown)},      // exactly at the edge: allowed
+	}, now))
+	if len(got) != 3 || got[0] != 1 || got[1] != 3 || got[2] != 4 {
+		t.Fatalf("expected [1 3 4], got %v", got)
+	}
+
+	all := []model.Recipe{{ID: 1, LastCookedAt: at(time.Hour)}, {ID: 2, LastCookedAt: at(time.Hour)}}
+	if got := ids(suppressRecentlyCooked(all, now)); len(got) != 2 {
+		t.Fatalf("everything on cooldown should fall back to the full list, got %v", got)
+	}
 }

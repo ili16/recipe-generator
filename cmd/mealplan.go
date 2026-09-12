@@ -24,19 +24,16 @@ const maxMealPlanRangeDays = 42
 // HandleGetMealPlan returns every meal-plan item in [starts_on, ends_on]. ends_on
 // defaults to starts_on+6d (a week) when omitted, so the original Week view call
 // keeps working unmodified.
-func HandleGetMealPlan(w http.ResponseWriter, r *http.Request) {
-	user, ok := auth.FromContext(r.Context())
-	if !ok {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
+// parsePlanRange reads the [starts_on, ends_on] query pair shared by the meal plan and
+// the grocery list. ends_on defaults to starts_on+6d (a week). It writes the 400 itself
+// and reports ok=false, so a handler only has to return.
+func parsePlanRange(w http.ResponseWriter, r *http.Request) (startsOn, endsOn time.Time, ok bool) {
 	startsOn, err := time.Parse(dateLayout, r.URL.Query().Get("starts_on"))
 	if err != nil {
 		http.Error(w, "invalid or missing starts_on (YYYY-MM-DD)", http.StatusBadRequest)
 		return
 	}
-	endsOn := startsOn.AddDate(0, 0, 6)
+	endsOn = startsOn.AddDate(0, 0, 6)
 	if raw := r.URL.Query().Get("ends_on"); raw != "" {
 		endsOn, err = time.Parse(dateLayout, raw)
 		if err != nil {
@@ -46,6 +43,20 @@ func HandleGetMealPlan(w http.ResponseWriter, r *http.Request) {
 	}
 	if endsOn.Before(startsOn) || endsOn.Sub(startsOn).Hours()/24 > maxMealPlanRangeDays {
 		http.Error(w, "ends_on must be on or after starts_on, within 42 days", http.StatusBadRequest)
+		return
+	}
+	return startsOn, endsOn, true
+}
+
+func HandleGetMealPlan(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	startsOn, endsOn, ok := parsePlanRange(w, r)
+	if !ok {
 		return
 	}
 
@@ -63,8 +74,39 @@ func HandleGetMealPlan(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// HandleAddMealPlanItem assigns a saved recipe to a day (upsert-by-day — replaces
-// whatever was already on that day), creating that week's meal_plans row on first use.
+// HandleGetGroceryList returns the week's shopping list: every ingredient of every
+// recipe planned in [starts_on, ends_on], consolidated into one line per item
+// (BACKLOG 6.1). Read-only and derived — nothing about it is stored, so it always
+// reflects the plan as it stands right now.
+func HandleGetGroceryList(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	startsOn, endsOn, ok := parsePlanRange(w, r)
+	if !ok {
+		return
+	}
+
+	ingredients, err := storage.GetPlannedIngredients(r.Context(), user.ID, startsOn, endsOn)
+	if err != nil {
+		slog.Error("Error getting planned ingredients", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"starts_on": startsOn.Format(dateLayout),
+		"ends_on":   endsOn.Format(dateLayout),
+		"lines":     service.BuildGroceryList(ingredients),
+	})
+}
+
+// HandleAddMealPlanItem assigns a saved recipe to one meal slot of a day (upsert by
+// (day, slot) — replaces whatever was already in that slot, leaving the day's other
+// meals alone), creating that week's meal_plans row on first use.
 func HandleAddMealPlanItem(w http.ResponseWriter, r *http.Request) {
 	user, ok := auth.FromContext(r.Context())
 	if !ok {
@@ -76,9 +118,26 @@ func HandleAddMealPlanItem(w http.ResponseWriter, r *http.Request) {
 		RecipeID  int    `json:"recipe_id"`
 		PlannedOn string `json:"planned_on"`
 		StartTime string `json:"start_time,omitempty"`
+		// Servings is how many portions are wanted that day; omit to leave it as the
+		// recipe is written. Since this endpoint upserts by day, re-POSTing the same
+		// recipe with a new servings is how a day's servings get changed (BACKLOG 6.2).
+		Servings *int `json:"servings,omitempty"`
+		// MealSlot is which meal of the day this is; omit for dinner (BACKLOG 6.4).
+		MealSlot string `json:"meal_slot,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.RecipeID <= 0 {
 		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+	if req.Servings != nil && (*req.Servings < 1 || *req.Servings > 99) {
+		http.Error(w, "servings must be between 1 and 99", http.StatusBadRequest)
+		return
+	}
+	if req.MealSlot == "" {
+		req.MealSlot = storage.DefaultMealSlot
+	}
+	if !storage.ValidMealSlot(req.MealSlot) {
+		http.Error(w, "meal_slot must be one of breakfast, lunch, dinner, snack", http.StatusBadRequest)
 		return
 	}
 	plannedOn, err := time.Parse(dateLayout, req.PlannedOn)
@@ -101,7 +160,7 @@ func HandleAddMealPlanItem(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	item, err := storage.AddMealPlanItem(r.Context(), user.ID, req.RecipeID, plannedOn, startTime, globalPrefs.WeekStartDay)
+	item, err := storage.AddMealPlanItem(r.Context(), user.ID, req.RecipeID, plannedOn, startTime, globalPrefs.WeekStartDay, req.MealSlot, req.Servings)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			http.Error(w, "recipe not found", http.StatusNotFound)

@@ -110,10 +110,12 @@ var chatTools = map[string]tool{
 		Run:         toolGetRecipe,
 	},
 	"save_recipe": {
-		Description: "Save a draft to the user's account. Only call this when the user has actually asked to save.",
+		Description: "Save a draft to the user's account. Only call this when the user has actually asked to save. If the user already has a recipe that looks like this one, nothing is saved and the match is reported back as duplicate_of — tell the user what they already have and offer to save it as a variant of that recipe or as a separate recipe, then call again with confirm true (plus variant_of set to the existing id, if they chose variant).",
 		Params: obj(map[string]any{
-			"draft_ref": str("The draft_ref to save"),
-			"tags":      strList("Tag slugs; omit to keep the ones the draft already carries"),
+			"draft_ref":  str("The draft_ref to save"),
+			"tags":       strList("Tag slugs; omit to keep the ones the draft already carries"),
+			"confirm":    map[string]any{"type": "boolean", "description": "Set true to save even though a duplicate was reported"},
+			"variant_of": integer("The id of the existing recipe this is a variant of, when the user chose that over a separate recipe"),
 		}, "draft_ref"),
 		NeedsAuth: true,
 		Run:       toolSaveRecipe,
@@ -129,7 +131,7 @@ var chatTools = map[string]tool{
 		Run:       toolPlanWeek,
 	},
 	"apply_week_plan": {
-		Description: "Save a whole proposed plan to the user's meal plan in one atomic step: all days are written or none are. Call this once with every day of the plan. Days before today are already cooked and are skipped (reported as skipped_already_cooked). Days already filled with a different recipe are reported back instead of overwritten — show that list to the user and call again with confirm true once they agree.",
+		Description: "Save a whole proposed plan to the user's meal plan in one atomic step: all days are written or none are. Call this once with every day of the plan. Days before today are already cooked and are skipped (reported as skipped_already_cooked). Days already filled with a different recipe are reported back instead of overwritten — show that list to the user and call again with confirm true once they agree. Carry each day's servings over from the proposal.",
 		Params: obj(map[string]any{
 			"days": map[string]any{
 				"type":        "array",
@@ -138,6 +140,7 @@ var chatTools = map[string]tool{
 					"date":      str("The day to fill, YYYY-MM-DD"),
 					"recipe_id": integer("A saved recipe's id"),
 					"draft_ref": str("A draft_ref (e.g. from plan_week's variant_drafts) to save first, then plan"),
+					"servings":  integer("Portions wanted that day; omit for the recipe as written"),
 				}, "date"),
 			},
 			"confirm": map[string]any{"type": "boolean", "description": "Set true to go ahead and replace days that are already planned"},
@@ -151,6 +154,7 @@ var chatTools = map[string]tool{
 			"date":      str("The day to fill, YYYY-MM-DD"),
 			"recipe_id": integer("A saved recipe's id"),
 			"draft_ref": str("A draft_ref to save first, then plan"),
+			"servings":  integer("Portions wanted that day; omit for the recipe as written"),
 		}, "date"),
 		NeedsAuth: true,
 		Run:       toolSetPlanDay,
@@ -383,12 +387,30 @@ func toolGetRecipe(ctx context.Context, s *chatSession, args json.RawMessage) (a
 
 func toolSaveRecipe(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
 	var a struct {
-		DraftRef string   `json:"draft_ref"`
-		Tags     []string `json:"tags"`
+		DraftRef  string   `json:"draft_ref"`
+		Tags      []string `json:"tags"`
+		Confirm   bool     `json:"confirm"`
+		VariantOf int      `json:"variant_of"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, nil, errors.New("could not read the arguments")
 	}
+
+	// BACKLOG.md 8.3: report a look-alike back once instead of saving, so the model can
+	// offer "a variant of that one" or "a separate recipe". The second call carries
+	// confirm, so a save is deferred, never refused. Only this tool checks — the plan
+	// tools save drafts through saveDraft too, and a week plan must not stop to ask.
+	if !a.Confirm && a.VariantOf == 0 {
+		if dup := s.duplicateOf(ctx, a.DraftRef); dup != nil {
+			return map[string]any{"saved": false, "duplicate_of": dup}, nil, nil
+		}
+	}
+	if a.VariantOf > 0 {
+		if err := s.markVariantOf(ctx, a.DraftRef, a.VariantOf); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	id, doc, err := s.saveDraft(ctx, a.DraftRef, a.Tags)
 	if err != nil {
 		return nil, nil, err
@@ -476,13 +498,18 @@ type planDayArg struct {
 	Date     string `json:"date"`
 	RecipeID int    `json:"recipe_id"`
 	DraftRef string `json:"draft_ref"`
+	// Servings is portions wanted that day (BACKLOG 6.2); 0 (omitted) means "as the
+	// recipe is written" and leaves the column NULL.
+	Servings int `json:"servings"`
 }
 
 // resolvePlanDays turns the model's day arguments into storage assignments, saving any
 // named drafts on the way (idempotently — see saveDraft). Drafts are saved before the
 // apply transaction opens, so a failed apply can leave a recipe saved but unplanned;
 // re-running reuses it rather than duplicating it.
-// ponytail: one recipe per day, always 18:00 — meal_slot and per-day times are BACKLOG 6.4/4.4.
+// ponytail: the planner writes one dinner per day, always 18:00. 6.4 made a day hold a
+// meal per slot, but nothing asks the model to fill breakfast or lunch yet — widen
+// planDayArg with a slot when a user actually asks for it. Per-day times are 4.4.
 func (s *chatSession) resolvePlanDays(ctx context.Context, days []planDayArg) ([]storage.PlannedDay, []string, error) {
 	if len(days) == 0 {
 		return nil, nil, errors.New("give at least one day")
@@ -516,7 +543,12 @@ func (s *chatSession) resolvePlanDays(ctx context.Context, days []planDayArg) ([
 				return nil, nil, err
 			}
 		}
-		out = append(out, storage.PlannedDay{RecipeID: recipeID, PlannedOn: plannedOn, StartTime: "18:00:00"})
+		day := storage.PlannedDay{RecipeID: recipeID, PlannedOn: plannedOn, StartTime: "18:00:00"}
+		if d.Servings > 0 {
+			servings := d.Servings
+			day.Servings = &servings
+		}
+		out = append(out, day)
 	}
 	if len(out) == 0 {
 		return nil, past, errors.New("those days are already in the past and were cooked — pick today or later")
@@ -575,14 +607,20 @@ func (s *chatSession) wouldOverwrite(ctx context.Context, days []storage.Planned
 	if err != nil {
 		return nil, errors.New("could not read your plan")
 	}
-	byDate := map[string]model.MealPlanItem{}
+	// Keyed by (date, slot), the same key the apply upserts on: a day's breakfast is not
+	// a conflict for the dinner we are about to write (BACKLOG 6.4).
+	bySlot := map[string]model.MealPlanItem{}
 	for _, item := range existing {
-		byDate[item.PlannedOn] = item
+		bySlot[item.PlannedOn+" "+item.MealSlot] = item
 	}
 
 	conflicts := []map[string]any{}
 	for _, d := range days {
-		item, ok := byDate[d.PlannedOn.Format(time.DateOnly)]
+		slot := d.MealSlot
+		if slot == "" {
+			slot = storage.DefaultMealSlot
+		}
+		item, ok := bySlot[d.PlannedOn.Format(time.DateOnly)+" "+slot]
 		if ok && item.RecipeID != d.RecipeID {
 			conflicts = append(conflicts, map[string]any{"date": item.PlannedOn, "current_recipe": item.RecipeTitle})
 		}
@@ -815,6 +853,51 @@ func (s *chatSession) resolveRecipe(ctx context.Context, ref string) (model.Reci
 		return model.RecipeDocument{}, errors.New("no such recipe")
 	}
 	return *recipe.Structured, nil
+}
+
+// duplicateOf reports an existing recipe of this user's that the named draft looks like a
+// repeat of — same source URL, or the same title (BACKLOG.md 8.3). A draft that has
+// already been saved, or one already marked a variant, is never a duplicate of anything:
+// the question has been settled for it. nil means "go ahead and save".
+func (s *chatSession) duplicateOf(ctx context.Context, ref string) *storage.DuplicateMatch {
+	ref = strings.TrimSpace(ref)
+	doc, ok := s.drafts[ref]
+	if !ok {
+		return nil // saveDraft reports the bad ref
+	}
+	info := s.draftInfo[ref]
+	if info.savedID != 0 || info.variantOf != 0 {
+		return nil
+	}
+	var sourceURL string
+	if info.origin != nil {
+		sourceURL = info.origin.SourceURL
+	}
+	dup, err := storage.FindDuplicate(ctx, s.userID, doc.Title, sourceURL)
+	if err != nil {
+		return nil
+	}
+	return dup
+}
+
+// markVariantOf records that the draft is a twist on an existing recipe, so saveDraft
+// writes variant_of_recipe_id. The parent is looked up scoped to this session's user, so
+// an id the model invented (or another user's) is not-found rather than a foreign link.
+func (s *chatSession) markVariantOf(ctx context.Context, ref string, parentID int) error {
+	ref = strings.TrimSpace(ref)
+	if _, ok := s.drafts[ref]; !ok {
+		return errors.New("no such draft: " + ref)
+	}
+	if _, err := storage.GetRecipeByID(ctx, s.userID, parentID); err != nil {
+		return errors.New("no such recipe")
+	}
+	if s.draftInfo == nil {
+		s.draftInfo = map[string]draftInfo{}
+	}
+	info := s.draftInfo[ref]
+	info.variantOf = parentID
+	s.draftInfo[ref] = info
+	return nil
 }
 
 // saveDraft persists a draft as a real recipe and returns its id. Shared by save_recipe

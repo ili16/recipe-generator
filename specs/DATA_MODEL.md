@@ -162,8 +162,10 @@ no_cook_days_override  TEXT[] NULL
 batch_days_override    INT NULL CHECK (... IN (1, 2, 3))
 ```
 
-`meal_plan_items` is one recipe assigned to one day (`recipe_id`, `planned_on`,
-`start_time`, `meal_slot` defaulting to `'dinner'`), upserted by day. Neither table
+`meal_plan_items` is one recipe assigned to one meal of one day (`recipe_id`,
+`planned_on`, `start_time`, `meal_slot` defaulting to `'dinner'`), **upserted by
+(user, `planned_on`, `meal_slot`)** — so a day holds up to four meals and planning a
+lunch leaves that day's dinner alone (BACKLOG 6.4). Neither table
 records *why* a day got its assignment — a day carried forward under
 `meal_plan_no_cook_days` ("a leftover day") is stored identically to a manually-picked
 or freshly-generated day; that provenance only exists transiently in the AI's response
