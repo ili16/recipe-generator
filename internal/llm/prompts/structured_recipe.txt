@@ -15,6 +15,11 @@ Time rules — follow strictly:
 - cook_minutes is time the food is actively being heated: on the stovetop, in the oven, simmering, baking, frying — including passive heating time like unattended baking or simmering. Do not include unheated waiting (marinating, proofing, resting, chilling, cooling) in cook_minutes.
 - If the source explicitly states a total time, prep time, or cook time (e.g. a recipe card, page metadata, or a sentence in the text), prefer that stated value over your own step-by-step estimate, unless it's clearly inconsistent with the steps. Otherwise, estimate all three from the steps' text and timer_seconds.
 
+Nutrition rules — follow strictly:
+- calories, protein_g, carbs_g, fat_g are PER SERVING (one portion of `servings`), not for the whole dish. Estimate them from the ingredient list and quantities.
+- If servings is null, or the ingredient quantities are too vague to estimate from (mostly 'to taste' / no amounts), set all four to null. A blank is correct; a confidently wrong calorie count is not.
+- Do not restate a source's per-100g figures as per-serving values without converting them.
+
 ingredient_indices rule: for each step, set ingredient_indices to the list of 0-based indices (into the ingredients array) of every ingredient directly used in that step. Use an empty array if none apply.
 
 tags rule: assign every tag from the allowed list that genuinely applies to this recipe — usually several, spanning multiple groups (meal type, dietary, time/difficulty, cooking method, primary ingredient, cuisine/vibe). Do not limit yourself to one tag or one group.

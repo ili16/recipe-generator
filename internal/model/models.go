@@ -32,17 +32,23 @@ type RecipeStep struct {
 }
 
 type RecipeDocument struct {
-	Title        string             `json:"title"`
-	Summary      *string            `json:"summary"`
-	Language     string             `json:"language"`
-	Tags         []string           `json:"tags"`
-	Servings     *int               `json:"servings"`
-	TotalMinutes *int               `json:"total_minutes"`
-	PrepMinutes  *int               `json:"prep_minutes"`
-	CookMinutes  *int               `json:"cook_minutes"`
-	Difficulty   *string            `json:"difficulty"`
-	Ingredients  []RecipeIngredient `json:"ingredients"`
-	Steps        []RecipeStep       `json:"steps"`
+	Title        string   `json:"title"`
+	Summary      *string  `json:"summary"`
+	Language     string   `json:"language"`
+	Tags         []string `json:"tags"`
+	Servings     *int     `json:"servings"`
+	TotalMinutes *int     `json:"total_minutes"`
+	PrepMinutes  *int     `json:"prep_minutes"`
+	CookMinutes  *int     `json:"cook_minutes"`
+	Difficulty   *string  `json:"difficulty"`
+	// Per-serving macros. Nullable on purpose: these are model estimates, and a blank
+	// is better than a confidently wrong number (BACKLOG 6.6).
+	Calories    *int               `json:"calories"`
+	ProteinG    *int               `json:"protein_g"`
+	CarbsG      *int               `json:"carbs_g"`
+	FatG        *int               `json:"fat_g"`
+	Ingredients []RecipeIngredient `json:"ingredients"`
+	Steps       []RecipeStep       `json:"steps"`
 }
 
 type Recipe struct {
@@ -60,9 +66,14 @@ type Recipe struct {
 	VariantOfRecipeID *int `json:"variant_of_recipe_id,omitempty"`
 	// SourceType and SourceURL are where this recipe came from: recipes.source_type
 	// plus the sources row AddRecipeStructured writes. Read-only provenance.
-	SourceType string     `json:"source_type,omitempty"`
-	SourceURL  *string    `json:"source_url,omitempty"`
-	CreatedAt  *time.Time `json:"created_at,omitempty"`
+	SourceType string  `json:"source_type,omitempty"`
+	SourceURL  *string `json:"source_url,omitempty"`
+	// Servings and TotalMinutes are denormalised onto the list payload so the library can
+	// filter on batch size and cooking time without fetching every document (BACKLOG 6.5).
+	// Set by GetRecipes only; nil means unknown, never zero.
+	Servings     *int       `json:"servings,omitempty"`
+	TotalMinutes *int       `json:"total_minutes,omitempty"`
+	CreatedAt    *time.Time `json:"created_at,omitempty"`
 	// DeletedAt is set only on the trash listing (GET /recipes/trash); every other
 	// read path filters soft-deleted rows out, so it is always nil there.
 	DeletedAt *time.Time `json:"deleted_at,omitempty"`

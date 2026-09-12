@@ -166,12 +166,18 @@ func recipeJSONSchema() map[string]any {
 					map[string]any{"type": "null"},
 				},
 			},
+			"calories":  llm.Nullable("integer"),
+			"protein_g": llm.Nullable("integer"),
+			"carbs_g":   llm.Nullable("integer"),
+			"fat_g":     llm.Nullable("integer"),
+
 			"ingredients": map[string]any{"type": "array", "items": ingredientSchema},
 			"steps":       map[string]any{"type": "array", "items": stepSchema},
 		},
 		"required": []string{
 			"title", "summary", "language", "tags",
 			"servings", "total_minutes", "prep_minutes", "cook_minutes", "difficulty",
+			"calories", "protein_g", "carbs_g", "fat_g",
 			"ingredients", "steps",
 		},
 		"additionalProperties": false,
@@ -368,6 +374,25 @@ func RenderMarkdown(doc model.RecipeDocument) string {
 		b.WriteString("*" + strings.Join(meta, " · ") + "*\n\n")
 	}
 
+	// Estimated per-serving macros, each omitted when the model couldn't estimate it.
+	var macros []string
+	for _, m := range []struct {
+		label string
+		value *int
+	}{
+		{"%d kcal", doc.Calories},
+		{"%dg protein", doc.ProteinG},
+		{"%dg carbs", doc.CarbsG},
+		{"%dg fat", doc.FatG},
+	} {
+		if m.value != nil {
+			macros = append(macros, fmt.Sprintf(m.label, *m.value))
+		}
+	}
+	if len(macros) > 0 {
+		b.WriteString("*Per serving (estimated): " + strings.Join(macros, " · ") + "*\n\n")
+	}
+
 	ingHeading, prepHeading := headings(doc.Language)
 
 	b.WriteString("## " + ingHeading + "\n\n")
@@ -414,4 +439,3 @@ func RenderMarkdown(doc model.RecipeDocument) string {
 	}
 	return b.String()
 }
-

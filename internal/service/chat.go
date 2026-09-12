@@ -469,6 +469,9 @@ func fromOpenAIMessage(msg openai.ChatCompletionMessage) model.ConversationMessa
 func threadToParams(msgs []model.ConversationMessage, language string) []openai.ChatCompletionMessageParamUnion {
 	msgs = trimThread(msgs)
 	system := llm.ChatAgentSystemPrompt
+	// Without the date the model guesses starts_on, which is how "plan this week" ended up
+	// naming days that were already cooked (the plan tools also refuse those, see today()).
+	system += "- Today is " + time.Now().Format("Monday, 2006-01-02") + ". Resolve every date you pass to a tool against it, and never plan, change or clear a day before today — those meals have already been cooked.\n"
 	if language != "" {
 		system += "- The user's device language is \"" + language + "\" (ISO 639-1). Write in it, and pass it as generate_recipe's `language`, unless the user's own message is clearly in another language.\n"
 	}

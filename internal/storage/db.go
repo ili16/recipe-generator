@@ -132,12 +132,14 @@ func AddRecipeStructured(ctx context.Context, userID int, doc model.RecipeDocume
 	err = tx.QueryRow(ctx, `
 		INSERT INTO recipes
 			(user_id, title, summary, language, servings, total_minutes, prep_minutes, cook_minutes,
-			 difficulty, source_type, content, ai_model, ai_prompt_version, current_version,
+			 difficulty, calories, protein_g, carbs_g, fat_g,
+			 source_type, content, ai_model, ai_prompt_version, current_version,
 			 variant_of_recipe_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
 		RETURNING id`,
 		userID, doc.Title, doc.Summary, doc.Language,
-		doc.Servings, doc.TotalMinutes, doc.PrepMinutes, doc.CookMinutes, doc.Difficulty, sourceType, content,
+		doc.Servings, doc.TotalMinutes, doc.PrepMinutes, doc.CookMinutes, doc.Difficulty,
+		doc.Calories, doc.ProteinG, doc.CarbsG, doc.FatG, sourceType, content,
 		aiModel, promptVersion, len(history), variantOfRecipeID,
 	).Scan(&recipeID)
 	if err != nil {
@@ -223,11 +225,13 @@ func UpdateRecipeStructured(ctx context.Context, userID, recipeID int, doc model
 		UPDATE recipes
 		SET title = $1, summary = $2, language = $3, servings = $4, total_minutes = $5,
 		    prep_minutes = $6, cook_minutes = $7, difficulty = $8, content = $9, manually_edited = $10,
+		    calories = $11, protein_g = $12, carbs_g = $13, fat_g = $14,
 		    current_version = current_version + 1, updated_at = NOW()
-		WHERE id = $11 AND user_id = $12 AND deleted_at IS NULL
+		WHERE id = $15 AND user_id = $16 AND deleted_at IS NULL
 		RETURNING id, current_version`,
 		doc.Title, doc.Summary, doc.Language, doc.Servings, doc.TotalMinutes, doc.PrepMinutes,
-		doc.CookMinutes, doc.Difficulty, content, manuallyEdited, recipeID, userID,
+		doc.CookMinutes, doc.Difficulty, content, manuallyEdited,
+		doc.Calories, doc.ProteinG, doc.CarbsG, doc.FatG, recipeID, userID,
 	).Scan(&id, &version)
 	if err != nil {
 		return model.Recipe{}, err
@@ -375,6 +379,7 @@ func GetRecipeByID(ctx context.Context, userID, recipeID int) (model.Recipe, err
 	err := Pool.QueryRow(ctx, `
 		SELECT r.id, r.title, r.content, r.manually_edited,
 		       r.summary, r.language, r.servings, r.total_minutes, r.prep_minutes, r.cook_minutes, r.difficulty,
+		       r.calories, r.protein_g, r.carbs_g, r.fat_g,
 		       rv.vote
 		FROM recipes r
 		LEFT JOIN recipe_votes rv ON rv.recipe_id = r.id AND rv.user_id = $2
@@ -383,6 +388,7 @@ func GetRecipeByID(ctx context.Context, userID, recipeID int) (model.Recipe, err
 	).Scan(
 		&recipe.ID, &recipe.Recipename, &recipe.Recipe, &recipe.ManuallyEdited,
 		&doc.Summary, &doc.Language, &doc.Servings, &doc.TotalMinutes, &doc.PrepMinutes, &doc.CookMinutes, &doc.Difficulty,
+		&doc.Calories, &doc.ProteinG, &doc.CarbsG, &doc.FatG,
 		&recipe.MyVote,
 	)
 	if err != nil {
@@ -499,7 +505,10 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 	rows, err := Pool.Query(context.Background(), `
 		SELECT r.id, r.title, r.content, r.manually_edited, rv.vote, r.variant_of_recipe_id,
 		       r.source_type, (SELECT s.source_url FROM sources s WHERE s.recipe_id = r.id ORDER BY s.id LIMIT 1),
-		       r.created_at
+		       r.created_at, r.servings,
+		       -- Same prep+cook fallback the client used to do per-recipe; NULLIF keeps
+		       -- "unknown" distinct from "zero minutes".
+		       NULLIF(COALESCE(r.total_minutes, COALESCE(r.prep_minutes, 0) + COALESCE(r.cook_minutes, 0)), 0)
 		FROM recipes r
 		LEFT JOIN recipe_votes rv ON rv.recipe_id = r.id AND rv.user_id = $1
 		WHERE r.user_id = $1 AND r.deleted_at IS NULL ORDER BY r.updated_at DESC`, userid)
@@ -512,7 +521,7 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 	for rows.Next() {
 		var recipe model.Recipe
 		err := rows.Scan(&recipe.ID, &recipe.Recipename, &recipe.Recipe, &recipe.ManuallyEdited, &recipe.MyVote, &recipe.VariantOfRecipeID,
-			&recipe.SourceType, &recipe.SourceURL, &recipe.CreatedAt)
+			&recipe.SourceType, &recipe.SourceURL, &recipe.CreatedAt, &recipe.Servings, &recipe.TotalMinutes)
 		if err != nil {
 			rows.Close()
 			slog.Error("Failed to scan recipe", "error", err)

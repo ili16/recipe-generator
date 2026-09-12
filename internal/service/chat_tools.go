@@ -119,7 +119,7 @@ var chatTools = map[string]tool{
 		Run:       toolSaveRecipe,
 	},
 	"plan_week": {
-		Description: "Propose (not save) a meal plan for the week starting on starts_on, drawn from the user's saved recipes and their scheduling preferences. Returns the proposal plus variant_drafts, a date -> draft_ref map for days that are new recipes. To apply it, call apply_week_plan once with every day — never set_plan_day in a loop.",
+		Description: "Propose (not save) a meal plan for the week starting on starts_on, drawn from the user's saved recipes and their scheduling preferences. Days before today are already cooked and are left out of the proposal. Returns the proposal plus variant_drafts, a date -> draft_ref map for days that are new recipes. To apply it, call apply_week_plan once with every day — never set_plan_day in a loop.",
 		Params: obj(map[string]any{
 			"starts_on":   str("First day of the range, YYYY-MM-DD"),
 			"days":        integer("How many days to plan; defaults to 7"),
@@ -129,7 +129,7 @@ var chatTools = map[string]tool{
 		Run:       toolPlanWeek,
 	},
 	"apply_week_plan": {
-		Description: "Save a whole proposed plan to the user's meal plan in one atomic step: all days are written or none are. Call this once with every day of the plan. Days already filled with a different recipe are reported back instead of overwritten — show that list to the user and call again with confirm true once they agree.",
+		Description: "Save a whole proposed plan to the user's meal plan in one atomic step: all days are written or none are. Call this once with every day of the plan. Days before today are already cooked and are skipped (reported as skipped_already_cooked). Days already filled with a different recipe are reported back instead of overwritten — show that list to the user and call again with confirm true once they agree.",
 		Params: obj(map[string]any{
 			"days": map[string]any{
 				"type":        "array",
@@ -414,6 +414,16 @@ func toolPlanWeek(ctx context.Context, s *chatSession, args json.RawMessage) (an
 		days = 7
 	}
 	endsOn := startsOn.AddDate(0, 0, days-1)
+	// "Plan this week" on a Thursday names Monday as starts_on, but Mon–Wed are already
+	// cooked: propose from today onwards and leave the days behind us alone.
+	var skippedPast string
+	if startsOn.Before(today()) {
+		if endsOn.Before(today()) {
+			return nil, nil, errors.New("that whole range is in the past — it's already been cooked")
+		}
+		skippedPast = startsOn.Format(time.DateOnly)
+		startsOn = today()
+	}
 
 	candidates, profile, prefs, err := LoadMealPlanSignal(ctx, s.userID, startsOn)
 	if err != nil {
@@ -449,7 +459,11 @@ func toolPlanWeek(ctx context.Context, s *chatSession, args json.RawMessage) (an
 		}
 	}
 
-	return map[string]any{"plan": suggestion, "variant_drafts": variantDrafts}, &artifact{Kind: "week_plan", Data: map[string]any{
+	out := map[string]any{"plan": suggestion, "variant_drafts": variantDrafts}
+	if skippedPast != "" {
+		out["note"] = "the range started " + skippedPast + ", but days before today were already cooked, so the plan starts today"
+	}
+	return out, &artifact{Kind: "week_plan", Data: map[string]any{
 		"starts_on": startsOn.Format(time.DateOnly),
 		"ends_on":   endsOn.Format(time.DateOnly),
 		"plan":      suggestion,
@@ -469,35 +483,54 @@ type planDayArg struct {
 // apply transaction opens, so a failed apply can leave a recipe saved but unplanned;
 // re-running reuses it rather than duplicating it.
 // ponytail: one recipe per day, always 18:00 — meal_slot and per-day times are BACKLOG 6.4/4.4.
-func (s *chatSession) resolvePlanDays(ctx context.Context, days []planDayArg) ([]storage.PlannedDay, error) {
+func (s *chatSession) resolvePlanDays(ctx context.Context, days []planDayArg) ([]storage.PlannedDay, []string, error) {
 	if len(days) == 0 {
-		return nil, errors.New("give at least one day")
+		return nil, nil, errors.New("give at least one day")
 	}
 	out := make([]storage.PlannedDay, 0, len(days))
+	var past []string
 	seen := map[string]bool{}
 	for _, d := range days {
 		plannedOn, err := time.Parse(time.DateOnly, d.Date)
 		if err != nil {
-			return nil, errors.New("date must be a date like 2026-09-14")
+			return nil, nil, errors.New("date must be a date like 2026-09-14")
 		}
 		if seen[d.Date] {
-			return nil, errors.New("the same day is listed twice: " + d.Date)
+			return nil, nil, errors.New("the same day is listed twice: " + d.Date)
 		}
 		seen[d.Date] = true
+		// A day before today has already been cooked — replanning the current week must
+		// leave it alone rather than rewrite history.
+		if plannedOn.Before(today()) {
+			past = append(past, d.Date)
+			continue
+		}
 
 		recipeID := d.RecipeID
 		if recipeID == 0 {
 			if d.DraftRef == "" {
-				return nil, errors.New("each day needs either recipe_id or draft_ref")
+				return nil, nil, errors.New("each day needs either recipe_id or draft_ref")
 			}
 			// A draft has to exist as a saved recipe before it can be planned.
 			if recipeID, _, err = s.saveDraft(ctx, d.DraftRef, nil); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 		out = append(out, storage.PlannedDay{RecipeID: recipeID, PlannedOn: plannedOn, StartTime: "18:00:00"})
 	}
-	return out, nil
+	if len(out) == 0 {
+		return nil, past, errors.New("those days are already in the past and were cooked — pick today or later")
+	}
+	return out, past, nil
+}
+
+// today is the current date at midnight, the boundary between "already cooked" (which no
+// plan tool may touch) and "still plannable".
+// ponytail: server local time, not the user's — send the device date on the chat turn if
+// anyone ever plans from another timezone.
+func today() time.Time {
+	n := time.Now()
+	return time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, time.Local)
 }
 
 // applyPlanDays writes the resolved days, refusing first if any of them would replace a
@@ -565,13 +598,16 @@ func toolApplyWeekPlan(ctx context.Context, s *chatSession, args json.RawMessage
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, nil, errors.New("could not read the arguments")
 	}
-	days, err := s.resolvePlanDays(ctx, a.Days)
+	days, past, err := s.resolvePlanDays(ctx, a.Days)
 	if err != nil {
 		return nil, nil, err
 	}
 	result, err := s.applyPlanDays(ctx, days, a.Confirm)
 	if err != nil {
 		return nil, nil, err
+	}
+	if m, ok := result.(map[string]any); ok && len(past) > 0 {
+		m["skipped_already_cooked"] = past
 	}
 	return result, nil, nil
 }
@@ -581,7 +617,7 @@ func toolSetPlanDay(ctx context.Context, s *chatSession, args json.RawMessage) (
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, nil, errors.New("could not read the arguments")
 	}
-	days, err := s.resolvePlanDays(ctx, []planDayArg{a})
+	days, _, err := s.resolvePlanDays(ctx, []planDayArg{a})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -603,6 +639,9 @@ func toolClearPlanDay(ctx context.Context, s *chatSession, args json.RawMessage)
 	day, err := time.Parse(time.DateOnly, a.Date)
 	if err != nil {
 		return nil, nil, errors.New("date must be a date like 2026-09-14")
+	}
+	if day.Before(today()) {
+		return nil, nil, errors.New("that day is already in the past and was cooked — it can't be cleared")
 	}
 	items, err := storage.GetMealPlanRange(ctx, s.userID, day, day)
 	if err != nil {

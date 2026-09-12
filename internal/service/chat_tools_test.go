@@ -292,7 +292,7 @@ func TestResolvePlanDays(t *testing.T) {
 			if err := json.Unmarshal([]byte(c.days), &days); err != nil {
 				t.Fatalf("bad fixture: %v", err)
 			}
-			if _, err := session.resolvePlanDays(context.Background(), days); err == nil {
+			if _, _, err := session.resolvePlanDays(context.Background(), days); err == nil {
 				t.Error("expected an error")
 			}
 		})
@@ -365,5 +365,30 @@ func TestMergePreferences(t *testing.T) {
 	if merged.SkillLevel == nil || *merged.SkillLevel != "beginner" || merged.WeekStartDay != "monday" ||
 		len(merged.MealPlanNoCookDays) != 1 || merged.MealPlanBatchDays != 1 {
 		t.Errorf("patch clobbered untouched fields: %+v", merged)
+	}
+}
+
+// TestResolvePlanDaysSkipsPast pins the bug report: replanning the current week must not
+// rewrite the days already cooked, and a list of nothing but past days is an error.
+func TestResolvePlanDaysSkipsPast(t *testing.T) {
+	session := newTestSession(1, testDraft)
+	yesterday := today().AddDate(0, 0, -1).Format(time.DateOnly)
+	tomorrow := today().AddDate(0, 0, 1).Format(time.DateOnly)
+
+	days, past, err := session.resolvePlanDays(context.Background(),
+		[]planDayArg{{Date: yesterday, RecipeID: 1}, {Date: tomorrow, RecipeID: 2}})
+	if err != nil {
+		t.Fatalf("mixed range: %v", err)
+	}
+	if len(days) != 1 || days[0].RecipeID != 2 {
+		t.Errorf("expected only the future day, got %+v", days)
+	}
+	if len(past) != 1 || past[0] != yesterday {
+		t.Errorf("expected %s reported as past, got %v", yesterday, past)
+	}
+
+	if _, _, err := session.resolvePlanDays(context.Background(),
+		[]planDayArg{{Date: yesterday, RecipeID: 1}}); err == nil {
+		t.Error("a past-only day list should be refused")
 	}
 }
