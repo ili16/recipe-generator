@@ -50,18 +50,7 @@ func BackfillIngredientAisles(ctx context.Context, dryRun bool) (classified int,
 		if err != nil {
 			return classified, rowsUpdated, err
 		}
-		// Keep only the pairs worth writing, so one unusable answer costs its own item
-		// and not the batch.
-		var names, cats []string
-		for i, item := range chunk {
-			if i >= len(aisles) {
-				break
-			}
-			if a := aisles[i]; a != "other" && slices.Contains(model.GroceryCategories, a) {
-				names = append(names, item)
-				cats = append(cats, a)
-			}
-		}
+		names, cats := pickPairs(chunk, aisles)
 		if len(names) == 0 {
 			continue
 		}
@@ -80,12 +69,36 @@ func BackfillIngredientAisles(ctx context.Context, dryRun bool) (classified int,
 	return classified, rowsUpdated, nil
 }
 
-// classifyAisles asks the assist model for one aisle per item, in order. The schema
-// pins the answer to a plain string array so there is no name to match back up — the
-// index is the join.
-func classifyAisles(ctx context.Context, items []string) ([]string, error) {
+// pickPairs keeps only the answers worth writing, so one unusable answer costs its own
+// item and not the batch. An item the model dropped or reworded simply isn't in the map
+// and stays NULL for a later run; "other" is not written because NULL already groups as
+// "other" on the list, and storing it would cost a better-informed run the chance to retry.
+func pickPairs(chunk []string, aisles map[string]string) (names, cats []string) {
+	for _, item := range chunk {
+		a, ok := aisles[item]
+		if !ok {
+			continue
+		}
+		if a != "other" && slices.Contains(model.GroceryCategories, a) {
+			names = append(names, item)
+			cats = append(cats, a)
+		}
+	}
+	return names, cats
+}
+
+// classifyAisles asks the assist model for one aisle per item and returns them keyed by
+// item name. The name is the join, deliberately: an earlier version pinned the answer to
+// a bare string array and joined on index, which silently mis-labelled everything after
+// the first insertion or omission — a real run returned 111 aisles for 100 items. The
+// model echoing a name back wrong costs that one item; it can no longer shift the rest.
+func classifyAisles(ctx context.Context, items []string) (map[string]string, error) {
+	type pair struct {
+		Item  string `json:"item"`
+		Aisle string `json:"aisle"`
+	}
 	type answer struct {
-		Aisles []string `json:"aisles"`
+		Aisles []pair `json:"aisles"`
 	}
 	out, _, err := llm.Call[answer](ctx, llm.Spec{
 		Model:    assistModel,
@@ -98,8 +111,16 @@ func classifyAisles(ctx context.Context, items []string) ([]string, error) {
 			"type": "object",
 			"properties": map[string]any{
 				"aisles": map[string]any{
-					"type":  "array",
-					"items": map[string]any{"type": "string", "enum": model.GroceryCategories},
+					"type": "array",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"item":  map[string]any{"type": "string"},
+							"aisle": map[string]any{"type": "string", "enum": model.GroceryCategories},
+						},
+						"required":             []string{"item", "aisle"},
+						"additionalProperties": false,
+					},
 				},
 			},
 			"required":             []string{"aisles"},
@@ -109,12 +130,17 @@ func classifyAisles(ctx context.Context, items []string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("classify aisles: %w", err)
 	}
-	if len(out.Aisles) != len(items) {
-		// A short answer is usable up to where it stops; a long one is misaligned past
-		// the end of the batch and the extras are dropped by the caller's index guard.
-		slog.WarnContext(ctx, "aisle backfill: answer length mismatch", "items", len(items), "aisles", len(out.Aisles))
+	byItem := make(map[string]string, len(out.Aisles))
+	for _, p := range out.Aisles {
+		byItem[p.Item] = p.Aisle
 	}
-	return out.Aisles, nil
+	// Only names the model echoed back exactly can be written. Anything it dropped,
+	// invented or reworded is left NULL rather than guessed at, so a later run retries it.
+	if len(byItem) != len(items) {
+		slog.WarnContext(ctx, "aisle backfill: answer did not cover the batch",
+			"items", len(items), "answered", len(out.Aisles), "matched", len(byItem))
+	}
+	return byItem, nil
 }
 
 func sampleOf(names, cats []string) string {
