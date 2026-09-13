@@ -45,17 +45,15 @@ func StartSpan(ctx context.Context, name string) (context.Context, trace.Span) {
 var meter = otel.Meter("recipe-generator")
 
 var (
-	generateCount    = mustCounter("recipe.generate.count", "recipe generation calls")
-	generateDuration = mustHistogram("recipe.generate.duration_ms", "ms", "recipe generation latency")
-	refineCount      = mustCounter("recipe.refine.count", "recipe refinement calls")
-	refineDuration   = mustHistogram("recipe.refine.duration_ms", "ms", "recipe refinement latency")
-	saveCount        = mustCounter("recipe.save.count", "recipe save calls")
-	saveIterations   = mustHistogram("recipe.save.iterations", "1", "chat edits applied before a recipe was saved")
-	chatTurnCount    = mustCounter("chat.turn.count", "agent turns, by how they ended")
-	chatToolCount    = mustCounter("chat.tool.count", "agent tool calls, by tool and outcome")
-	chatRecipeSaved  = mustCounter("chat.recipe.saved", "recipes saved from an agent turn")
-	llmTokenUsage    = mustCounter("llm.tokens", "LLM tokens consumed, by prompt/completion")
-	llmCallDuration  = mustHistogram("llm.call.duration_ms", "ms", "LLM call latency by model/call_type")
+	refineCount     = mustCounter("recipe.refine.count", "recipe refinement calls")
+	refineDuration  = mustHistogram("recipe.refine.duration_ms", "ms", "recipe refinement latency")
+	saveCount       = mustCounter("recipe.save.count", "recipe save calls")
+	saveIterations  = mustHistogram("recipe.save.iterations", "1", "chat edits applied before a recipe was saved")
+	chatTurnCount   = mustCounter("chat.turn.count", "agent turns, by how they ended")
+	chatToolCount   = mustCounter("chat.tool.count", "agent tool calls, by tool and outcome")
+	chatRecipeSaved = mustCounter("chat.recipe.saved", "recipes saved from an agent turn")
+	llmTokenUsage   = mustCounter("llm.tokens", "LLM tokens consumed, by prompt/completion")
+	llmCallDuration = mustHistogram("llm.call.duration_ms", "ms", "LLM call latency by model/call_type")
 )
 
 func mustCounter(name, desc string) metric.Int64Counter {
@@ -220,15 +218,6 @@ func outcomeAttr(ok bool) string {
 	return "error"
 }
 
-// RecordGenerate reports one /generate call.
-func RecordGenerate(ctx context.Context, sourceType string, durMs int64, ok bool) {
-	generateCount.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("source_type", sourceType),
-		attribute.String("outcome", outcomeAttr(ok)),
-	))
-	generateDuration.Record(ctx, durMs, metric.WithAttributes(attribute.String("source_type", sourceType)))
-}
-
 // RecordRefine reports one /refine-recipe call. status is "applied", "rejected",
 // "needs_choice", or "error" (call failed before a status was produced).
 func RecordRefine(ctx context.Context, durMs int64, status string) {
@@ -236,7 +225,8 @@ func RecordRefine(ctx context.Context, durMs int64, status string) {
 	refineDuration.Record(ctx, durMs)
 }
 
-// RecordSave reports one /add-recipe call for a structured recipe. iterations is the
+// RecordSave reports one /add-recipe call for a structured recipe — the library-side
+// save path only. Agent saves are counted by RecordChatRecipeSaved; the two do not overlap. iterations is the
 // number of accepted chat edits applied before this save (0 = saved the first
 // generation unedited).
 func RecordSave(ctx context.Context, iterations int, ok bool) {
