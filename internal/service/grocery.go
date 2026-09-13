@@ -18,25 +18,6 @@ var categoryRank = func() map[string]int {
 	return m
 }()
 
-// unitFamily canonicalises a unit to the one it is summed in: kg sums with g, l with ml.
-// Anything else is its own family, and a missing unit ("2 eggs") is the empty family.
-// The generation prompt already normalises to metric-by-weight, so this only has to
-// close the gap between a recipe written in g and one written in kg.
-func unitFamily(unit *string) (family string, factor float64) {
-	u := ""
-	if unit != nil {
-		u = strings.ToLower(strings.TrimSpace(*unit))
-	}
-	switch u {
-	case "kg":
-		return "g", 1000
-	case "l":
-		return "ml", 1000
-	default:
-		return u, 1
-	}
-}
-
 // servingScale is how much of a recipe a planned day needs: 4 portions of a recipe that
 // yields 2 is a factor of 2 on every measured quantity (BACKLOG 6.2). Unknown or
 // nonsensical servings on either side mean "as written" — a factor of 1 — because
@@ -107,11 +88,11 @@ func BuildGroceryList(ingredients []model.GroceryIngredient) []model.GroceryLine
 	// Measured amounts first, so a "to taste" mention in an earlier meal still attaches
 	// to the line that carries the real quantity rather than splitting off its own.
 	for _, ing := range ingredients {
-		item := strings.ToLower(strings.TrimSpace(ing.Item))
+		item := model.NormalizeItem(ing.Item)
 		if item == "" || ing.Quantity == nil {
 			continue
 		}
-		family, factor := unitFamily(ing.Unit)
+		family, factor := model.NormalizeUnit(ing.Unit)
 		k := key{item, family}
 		line, ok := byKey[k]
 		if !ok {
@@ -127,7 +108,7 @@ func BuildGroceryList(ingredients []model.GroceryIngredient) []model.GroceryLine
 	}
 
 	for _, ing := range ingredients {
-		item := strings.ToLower(strings.TrimSpace(ing.Item))
+		item := model.NormalizeItem(ing.Item)
 		if item == "" || ing.Quantity != nil {
 			continue
 		}

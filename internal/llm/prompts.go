@@ -41,6 +41,13 @@ var MealPlanLowVarietyAddendum string
 //go:embed prompts/chat_agent_system.txt
 var ChatAgentSystemPrompt string
 
+// ThreadSummaryPrompt compresses the dropped span of an over-long thread into one
+// system message (BACKLOG.md 2.6). Cheap tier — it summarises text that is already in
+// hand, not a recipe.
+//
+//go:embed prompts/thread_summary.txt
+var ThreadSummaryPrompt string
+
 // promptHash is a short deterministic fingerprint of the given prompt contents,
 // concatenated in order.
 func promptHash(parts ...string) string {

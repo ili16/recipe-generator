@@ -55,6 +55,25 @@ func TestNutritionRoundTrip(t *testing.T) {
 		t.Errorf("unestimated carbs_g must stay nil, got %d", *got.Structured.CarbsG)
 	}
 
+	// BACKLOG 6.8: calories (and only calories) rides the list payload so the card can
+	// render a kcal badge without fetching the document.
+	list, err := GetRecipes(userID)
+	if err != nil {
+		t.Fatalf("GetRecipes: %v", err)
+	}
+	var listed *model.Recipe
+	for i := range list {
+		if list[i].ID == created.ID {
+			listed = &list[i]
+		}
+	}
+	if listed == nil {
+		t.Fatalf("recipe %d missing from list payload", created.ID)
+	}
+	if listed.Calories == nil || *listed.Calories != 480 {
+		t.Errorf("calories missing from list payload: %+v", listed.Calories)
+	}
+
 	// An edit that drops an estimate must clear the column, not keep the stale value.
 	edited := doc
 	edited.Calories = i(500)

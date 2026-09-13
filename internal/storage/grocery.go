@@ -41,3 +41,41 @@ func GetPlannedIngredients(ctx context.Context, userID int, startsOn, endsOn tim
 	}
 	return out, rows.Err()
 }
+
+// UncategorisedItems returns the distinct lowercased ingredient names that have no
+// shopping aisle — everything saved before BACKLOG 6.1's generation call started
+// emitting one. Distinct by name, not per recipe: "garlic" is the same aisle in every
+// recipe that uses it, so the backfill classifies each name once (BACKLOG 6.9).
+func UncategorisedItems(ctx context.Context) ([]string, error) {
+	rows, err := Pool.Query(ctx, `
+		SELECT DISTINCT lower(item) FROM recipe_ingredients
+		WHERE category IS NULL AND item <> '' ORDER BY 1`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var item string
+		if err := rows.Scan(&item); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// SetItemCategories writes one aisle per lowercased ingredient name across every recipe
+// that uses it, in a single statement. Only NULL rows are touched, so a row categorised
+// at generation time always wins over the backfill's guess (BACKLOG 6.9). items and
+// categories are parallel; it returns the number of rows updated.
+func SetItemCategories(ctx context.Context, items, categories []string) (int64, error) {
+	tag, err := Pool.Exec(ctx, `
+		UPDATE recipe_ingredients ri SET category = c.category
+		FROM (SELECT unnest($1::text[]) AS item, unnest($2::text[]) AS category) c
+		WHERE lower(ri.item) = c.item AND ri.category IS NULL`, items, categories)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}

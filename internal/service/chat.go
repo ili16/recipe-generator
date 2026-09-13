@@ -38,11 +38,15 @@ const (
 	// tens of seconds, and a turn may run several of them.
 	turnDeadline = 4 * time.Minute
 
-	// maxThreadMessages caps how much history is replayed to the model. The point of
-	// server-held threads is that this policy is ours to change without a client
-	// release; verbatim-last-N is the version worth having until threads get long
-	// enough to need summarisation (specs/AGENT_CHAT.md §2.1).
+	// maxThreadMessages caps how much history is replayed to the model, and is the
+	// point at which a thread is compacted (specs/AGENT_CHAT.md §2.1).
 	maxThreadMessages = 40
+
+	// compactKeep is how many recent messages survive compaction verbatim; everything
+	// older is summarised into the one system message at the head. Well under
+	// maxThreadMessages so a compacted thread has room to grow before it compacts
+	// again — keeping 39 of 40 would mean an LLM call on every turn.
+	compactKeep = 20
 
 	maxChatMessageChars = 2000
 
@@ -245,6 +249,18 @@ func HandleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	session.images = images
 	session.language = req.Language
+
+	// Compact before the turn, not during it: the summary has to be written to the
+	// thread ahead of this turn's messages to keep the stored order readable, and the
+	// loop below then runs against a thread that already fits.
+	if compacted, summary := compactThread(ctx, session.messages); summary != nil {
+		session.messages = compacted
+		if session.userID != 0 {
+			if err := storage.AppendConversationMessages(ctx, session.userID, session.id, []model.ConversationMessage{*summary}); err != nil {
+				slog.ErrorContext(ctx, "chat: persist thread summary failed", "error", err, "conversation_id", session.id)
+			}
+		}
+	}
 	session.messages = append(session.messages, model.ConversationMessage{Role: "user", Content: req.Message})
 
 	produced, code := runTurn(ctx, emit, session)
@@ -329,7 +345,7 @@ func openSession(ctx context.Context, r *http.Request, conversationID string) (*
 			if err != nil {
 				return nil, nil, err
 			}
-			session.messages = msgs
+			session.messages = sinceCompaction(msgs)
 		}
 	} else if session.id == "" {
 		session.id = newConversationID()
@@ -481,6 +497,10 @@ func threadToParams(msgs []model.ConversationMessage, language string) []openai.
 		switch m.Role {
 		case "tool":
 			params = append(params, openai.ToolMessage(m.Content, m.ToolCallID))
+		// The rolling summary of the compacted span, sent as a system message so the
+		// model reads it as context rather than as something the user said.
+		case "system":
+			params = append(params, openai.SystemMessage(m.Content))
 		case "assistant":
 			assistant := openai.ChatCompletionAssistantMessageParam{}
 			if m.Content != "" {
@@ -500,15 +520,103 @@ func threadToParams(msgs []model.ConversationMessage, language string) []openai.
 	return params
 }
 
-// trimThread keeps the last maxThreadMessages, then drops any leading tool results whose
-// requesting assistant message fell off the front — the API rejects an orphan tool
-// message outright.
+// trimThread is the within-turn backstop for a thread that outgrows the cap between
+// compactions: it keeps the last maxThreadMessages, then drops any leading tool results
+// whose requesting assistant message fell off the front — the API rejects an orphan tool
+// message outright. A leading summary is held back from the cut and re-attached: it
+// stands in for everything before it, and dropping it is exactly the silent forgetting
+// compaction exists to remove.
 func trimThread(msgs []model.ConversationMessage) []model.ConversationMessage {
-	if len(msgs) > maxThreadMessages {
-		msgs = msgs[len(msgs)-maxThreadMessages:]
+	var head []model.ConversationMessage
+	if len(msgs) > 0 && msgs[0].Role == "system" {
+		head, msgs = msgs[:1:1], msgs[1:]
+	}
+	if limit := maxThreadMessages - len(head); len(msgs) > limit {
+		msgs = msgs[len(msgs)-limit:]
 	}
 	for len(msgs) > 0 && msgs[0].Role == "tool" {
 		msgs = msgs[1:]
+	}
+	if len(head) == 0 {
+		return msgs
+	}
+	out := make([]model.ConversationMessage, 0, len(head)+len(msgs))
+	return append(append(out, head...), msgs...)
+}
+
+// compactCut is where an over-long thread is split: everything before the returned index
+// is summarised, everything from it is kept verbatim. 0 means nothing to compact. The cut
+// walks forward past any tool results that would otherwise lose the assistant message
+// that requested them.
+func compactCut(msgs []model.ConversationMessage) int {
+	if len(msgs) <= maxThreadMessages {
+		return 0
+	}
+	cut := len(msgs) - compactKeep
+	for cut < len(msgs) && msgs[cut].Role == "tool" {
+		cut++
+	}
+	if cut >= len(msgs) {
+		return 0
+	}
+	return cut
+}
+
+// compactThread replaces the front of an over-long thread with one summary rather than
+// dropping it silently (BACKLOG.md 2.6): past the cap the oldest messages used to simply
+// stop being sent, so the agent forgot the recipe it had just written with no signal to
+// anyone. Returns the compacted thread and the summary message to persist, or a nil
+// summary when nothing was compacted — including when the summarising call fails, in
+// which case trimThread's plain cut still applies.
+func compactThread(ctx context.Context, msgs []model.ConversationMessage) ([]model.ConversationMessage, *model.ConversationMessage) {
+	cut := compactCut(msgs)
+	if cut == 0 {
+		return msgs, nil
+	}
+	summary, err := chatCompletion(ctx, llm.ThreadSummaryPrompt, renderThread(msgs[:cut]), string(assistModel), "thread_summary")
+	if err != nil || strings.TrimSpace(summary) == "" {
+		slog.WarnContext(ctx, "chat: thread compaction failed, falling back to a plain cut", "error", err)
+		return msgs, nil
+	}
+	// A previous summary sits at msgs[0] and is itself part of the span being summarised,
+	// which is what makes this rolling rather than a one-off.
+	m := model.ConversationMessage{
+		Role:    "system",
+		Content: "Earlier in this conversation (" + strconv.Itoa(cut) + " messages, summarised):\n" + strings.TrimSpace(summary),
+	}
+	return append([]model.ConversationMessage{m}, msgs[cut:]...), &m
+}
+
+// renderThread flattens messages into the plain text the summariser reads. Tool calls
+// are named but their arguments and results are not replayed — what matters downstream
+// is that a recipe was generated and what it was, not the JSON that carried it.
+func renderThread(msgs []model.ConversationMessage) string {
+	var b strings.Builder
+	for _, m := range msgs {
+		switch m.Role {
+		case "tool":
+			continue
+		case "system":
+			b.WriteString("[earlier summary] " + m.Content + "\n")
+		default:
+			if m.Content != "" {
+				b.WriteString(m.Role + ": " + m.Content + "\n")
+			}
+			for _, c := range m.ToolCalls {
+				b.WriteString("assistant called " + c.Name + " with " + c.Args + "\n")
+			}
+		}
+	}
+	return b.String()
+}
+
+// sinceCompaction drops the span an earlier turn already summarised. The stored thread
+// keeps those messages for the record; from here on the summary stands in for them.
+func sinceCompaction(msgs []model.ConversationMessage) []model.ConversationMessage {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "system" {
+			return msgs[i:]
+		}
 	}
 	return msgs
 }

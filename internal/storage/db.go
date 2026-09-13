@@ -505,12 +505,27 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 	rows, err := Pool.Query(context.Background(), `
 		SELECT r.id, r.title, r.content, r.manually_edited, rv.vote, r.variant_of_recipe_id,
 		       r.source_type, (SELECT s.source_url FROM sources s WHERE s.recipe_id = r.id ORDER BY s.id LIMIT 1),
-		       r.created_at, r.servings, r.last_cooked_at, r.share_token,
+		       r.created_at, r.servings, r.last_cooked_at, r.cooked_rating, r.share_token, r.calories,
 		       -- Same prep+cook fallback the client used to do per-recipe; NULLIF keeps
 		       -- "unknown" distinct from "zero minutes".
-		       NULLIF(COALESCE(r.total_minutes, COALESCE(r.prep_minutes, 0) + COALESCE(r.cook_minutes, 0)), 0)
+		       NULLIF(COALESCE(r.total_minutes, COALESCE(r.prep_minutes, 0) + COALESCE(r.cook_minutes, 0)), 0),
+		       pm.total, pm.have
 		FROM recipes r
 		LEFT JOIN recipe_votes rv ON rv.recipe_id = r.id AND rv.user_id = $1
+		-- Pantry match (BACKLOG 7.3): how many of this recipe's ingredients the caller
+		-- already has. Matched on the normalised *name* only — "250 g flour" and "2 cups
+		-- flour" are the same pantry item, so comparing amounts would report a miss on the
+		-- very case the match exists to handle. lower(btrim(...)) is model.NormalizeItem,
+		-- which is also how pantry_items.name was written.
+		LEFT JOIN LATERAL (
+			SELECT count(*) AS total,
+			       count(*) FILTER (
+			           WHERE EXISTS (SELECT 1 FROM pantry_items p
+			                         WHERE p.user_id = $1 AND p.name = lower(btrim(ri.item)))
+			       ) AS have
+			FROM recipe_ingredients ri
+			WHERE ri.recipe_id = r.id AND btrim(ri.item) <> ''
+		) pm ON TRUE
 		WHERE r.user_id = $1 AND r.deleted_at IS NULL ORDER BY r.updated_at DESC`, userid)
 	if err != nil {
 		slog.Error("Failed to query recipes", "error", err)
@@ -521,7 +536,8 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 	for rows.Next() {
 		var recipe model.Recipe
 		err := rows.Scan(&recipe.ID, &recipe.Recipename, &recipe.Recipe, &recipe.ManuallyEdited, &recipe.MyVote, &recipe.VariantOfRecipeID,
-			&recipe.SourceType, &recipe.SourceURL, &recipe.CreatedAt, &recipe.Servings, &recipe.LastCookedAt, &recipe.ShareToken, &recipe.TotalMinutes)
+			&recipe.SourceType, &recipe.SourceURL, &recipe.CreatedAt, &recipe.Servings, &recipe.LastCookedAt, &recipe.CookedRating, &recipe.ShareToken, &recipe.Calories, &recipe.TotalMinutes,
+			&recipe.PantryTotal, &recipe.PantryHave)
 		if err != nil {
 			rows.Close()
 			slog.Error("Failed to scan recipe", "error", err)

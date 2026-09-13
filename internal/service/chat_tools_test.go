@@ -286,6 +286,8 @@ func TestResolvePlanDays(t *testing.T) {
 		{"no recipe", `[{"date":"2026-09-14"}]`},
 		{"bad date", `[{"date":"next tuesday","recipe_id":1}]`},
 		{"same day twice", `[{"date":"2026-09-14","recipe_id":1},{"date":"2026-09-14","recipe_id":2}]`},
+		{"same day and slot twice", `[{"date":"2026-09-14","recipe_id":1,"meal_slot":"lunch"},{"date":"2026-09-14","recipe_id":2,"meal_slot":"lunch"}]`},
+		{"bad slot", `[{"date":"2026-09-14","recipe_id":1,"meal_slot":"brunch"}]`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var days []planDayArg
@@ -365,6 +367,24 @@ func TestMergePreferences(t *testing.T) {
 	if merged.SkillLevel == nil || *merged.SkillLevel != "beginner" || merged.WeekStartDay != "monday" ||
 		len(merged.MealPlanNoCookDays) != 1 || merged.MealPlanBatchDays != 1 {
 		t.Errorf("patch clobbered untouched fields: %+v", merged)
+	}
+}
+
+// TestResolvePlanDaysSlots is BACKLOG 6.10's acceptance: one call can fill two slots of
+// the same day, and a day that names no slot still goes to dinner.
+func TestResolvePlanDaysSlots(t *testing.T) {
+	session := newTestSession(1, testDraft)
+	tomorrow := today().AddDate(0, 0, 1).Format(time.DateOnly)
+
+	days, _, err := session.resolvePlanDays(context.Background(), []planDayArg{
+		{Date: tomorrow, RecipeID: 1, MealSlot: "lunch"},
+		{Date: tomorrow, RecipeID: 2},
+	})
+	if err != nil {
+		t.Fatalf("lunch plus dinner on one day: %v", err)
+	}
+	if len(days) != 2 || days[0].MealSlot != "lunch" || days[1].MealSlot != storage.DefaultMealSlot {
+		t.Errorf("expected a lunch and a defaulted dinner, got %+v", days)
 	}
 }
 

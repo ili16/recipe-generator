@@ -154,3 +154,56 @@ func TestThreadToParamsLanguage(t *testing.T) {
 		t.Errorf("locale leaked into the user message: %q", user)
 	}
 }
+
+// TestCompaction checks the two things thread compaction must not get wrong: the cut
+// never leaves a tool result without the assistant message that requested it, and a
+// compacted thread's summary survives both the next read and the within-turn trim —
+// losing it is the silent forgetting compaction exists to remove (BACKLOG.md 2.6).
+func TestCompaction(t *testing.T) {
+	// An assistant message followed by a long run of its tool results, so the cut lands
+	// squarely inside them.
+	msgs := []model.ConversationMessage{{Role: "user", Content: "first"}}
+	for range maxThreadMessages {
+		msgs = append(msgs, model.ConversationMessage{Role: "assistant", ToolCalls: []model.ToolCall{{ID: "call_1"}}})
+	}
+	for range compactKeep + 2 {
+		msgs = append(msgs, model.ConversationMessage{Role: "tool", Content: "{}", ToolCallID: "call_1"})
+	}
+	msgs = append(msgs, model.ConversationMessage{Role: "user", Content: "last"})
+
+	cut := compactCut(msgs)
+	if cut == 0 {
+		t.Fatal("an over-long thread was not compacted")
+	}
+	if msgs[cut].Role == "tool" {
+		t.Errorf("cut at %d leaves an orphaned tool result", cut)
+	}
+	if compactCut(msgs[:maxThreadMessages]) != 0 {
+		t.Error("a thread within the cap was compacted anyway")
+	}
+
+	// The stored thread keeps the compacted span; a later read must resume at the summary.
+	summary := model.ConversationMessage{Role: "system", Content: "Earlier: a pasta recipe."}
+	stored := append(append([]model.ConversationMessage{}, msgs...), summary)
+	stored = append(stored, model.ConversationMessage{Role: "user", Content: "and the sauce?"})
+	resumed := sinceCompaction(stored)
+	if len(resumed) != 2 || resumed[0].Content != summary.Content {
+		t.Fatalf("read did not resume at the summary: %d messages", len(resumed))
+	}
+
+	// The backstop cut keeps the summary at the head and the newest message at the tail.
+	long := append([]model.ConversationMessage{summary}, msgs...)
+	trimmed := trimThread(long)
+	if len(trimmed) > maxThreadMessages {
+		t.Errorf("thread not capped: %d messages", len(trimmed))
+	}
+	if trimmed[0].Content != summary.Content {
+		t.Errorf("summary cut from the head: %+v", trimmed[0])
+	}
+	if trimmed[len(trimmed)-1].Content != "last" {
+		t.Errorf("the most recent message was trimmed away: %+v", trimmed[len(trimmed)-1])
+	}
+	if renderThread(msgs[:cut]) == "" {
+		t.Error("the summariser was handed an empty thread")
+	}
+}

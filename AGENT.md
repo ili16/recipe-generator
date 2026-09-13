@@ -54,6 +54,8 @@ graph LR
         COL[GET/POST /collections]
         COLD[DELETE /collections/:id]
         COLM[PUT/DELETE /collections/:id/recipes/:recipeId]
+        PAN[GET/POST /pantry]
+        PAND[DELETE /pantry/:id]
         UR[PATCH /update-recipe]
         UF[GET /user-info]
         US[GET /usage]
@@ -250,6 +252,11 @@ otherwise), rate-limited and budget-capped per the "Rate limiting + budget" note
 	  caps itself at 500 ms and treats any error or timeout as "no duplicate". Only this
 	  tool checks — `apply_week_plan` saves drafts through the same `saveDraft` and must
 	  not stop a week to ask.
+	- `search_my_recipes` filters on title text, tags, **and `ingredients`** — a recipe
+	  matches if it uses at least one of the named ones, and each hit says which
+	  (`uses`). That last filter is what "find recipes using these" on the Pantry screen
+	  becomes (BACKLOG 7.4); it is a second indexed lookup because the list payload
+	  carries no ingredient names.
 	- Tool catalog in `internal/service/chat_tools.go`. Two invariants: the user id comes
 	  from `auth.FromContext`, never from tool args (a recipe id in args only ever reaches
 	  a storage call already scoped to that user, so another user's id is not-found); and
@@ -290,6 +297,11 @@ Authenticated (Bearer token required):
 	  client renders as "From seriouseats.com · 8 Sep" (BACKLOG 3.7). `source_type` is NOT
 	  NULL with a `'text'` default, so a bare `'text'` means "nothing was recorded" as often
 	  as it means "typed", and the client shows nothing for it.
+	- `pantry_have` / `pantry_total` are the pantry match (BACKLOG 7.3): how many of the
+	  recipe's ingredients the caller already has, out of how many it lists. Matched on the
+	  normalised ingredient **name** only — comparing amounts would report a miss on
+	  "250 g flour" vs "2 cups flour", the very case the match exists for. Both 0 means
+	  "show no badge", not 0%.
 - POST /add-recipe
 	- JSON: `{"recipename":"...","recipe":"...","structured":<RecipeDocument>,`
 	  `"origin":{...},"history":[{"change_prompt":"","structured":<RecipeDocument>}, ...],`
@@ -338,6 +350,24 @@ Authenticated (Bearer token required):
 - PUT | DELETE /collections/{id}/recipes/{recipeId}
 	- 204. Adds/removes one recipe; a recipe may sit in several collections. Adding twice is
 	  a no-op. 404 when either id isn't the caller's, or when removing a non-member.
+- GET /pantry
+	- 200 with `[{"id":1,"name":"flour","quantity":1500,"unit":"g","category":"spices_dry",`
+	  `"expires_on":null}, ...]` — what the caller has in the house (BACKLOG 7.1), expiring
+	  items first and undated ones last. `name` and `unit` come back **normalised**
+	  (`model.NormalizeItem` / `NormalizeUnit`: lowercased, kg folded into g and l into ml,
+	  the quantity scaled to match), which is the same key the grocery list consolidates on
+	  and the only reason 7.3's match works at all.
+- POST /pantry
+	- JSON: `{"name":"Flour","quantity":1.5,"unit":"kg","category":"fridge",`
+	  `"expires_on":"2026-10-01"}` → 200 with the saved item. An **upsert** on
+	  `(user_id, normalised name, unit family)`: re-adding something you already have
+	  updates its quantity, category and expiry rather than creating a second line, so
+	  there is no PATCH. `category` is one of `fridge|freezer|produce|spices_dry` and
+	  anything else silently becomes `spices_dry` (same reasoning as an unknown grocery
+	  aisle becoming "other"). A blank name or an `expires_on` that isn't `YYYY-MM-DD` is
+	  400.
+- DELETE /pantry/{id}
+	- 204. 404 when the id isn't the caller's — indistinguishable from a missing one.
 - PATCH /update-recipe
 	- JSON: `{"id":1,"structured":<RecipeDocument>,"ai_sourced":false,"change_prompt":""}` —
 	  overwrites the recipe's header, ingredients, steps, and tags with `structured` (tags
@@ -427,13 +457,17 @@ Notes:
 
 See DATA_MODEL.md for the canonical schema and RECIPE_TAGS.md for the tagging taxonomy.
 Migrations `00001`–`00006` create it from scratch; there is no legacy database to preserve.
-`00020` adds `collections` + `recipe_collections` (BACKLOG 8.1). `recipes.deleted_at` has
+`00020` adds `collections` + `recipe_collections` (BACKLOG 8.1); `00026` adds `pantry_items`
+(BACKLOG 7.1). `recipes.deleted_at` has
 existed since `00001` but only became meaningful with BACKLOG 8.2's soft delete.
 
 ## Code Map
 
 - cmd/main.go: route registration, handlers for user info/recipes/usage/admin
 - cmd/mealplan.go: meal-plan handlers (range get / add / patch / delete item, variants)
+- cmd/backfill-aisles: one-off `make backfill-aisles` — classifies pre-BACKLOG-6.1
+  ingredients into shopping aisles in batched assist-model calls; re-running with nothing
+  NULL costs nothing
 - internal/auth: JWKS validation, introspection, JIT user provisioning, admin role, typed request context
 - internal/ratelimit: in-memory per-IP/per-user token-bucket request limiter
 - internal/worker: the periodic background pass — cooking-profile recompute, and purging
@@ -458,6 +492,10 @@ existed since `00001` but only became meaningful with BACKLOG 8.2's soft delete.
   (`ApplyMealPlanDays`; `AddMealPlanItem` is the one-day case), move (patch), delete
 - internal/storage/collections.go: collections CRUD and membership, every query scoped by
   `user_id` so another user's id is not-found (BACKLOG 8.1)
+- internal/storage/pantry.go: pantry CRUD (BACKLOG 7.1) and `RecipesUsingIngredients`, the
+  "what can I cook before it goes off" lookup behind `search_my_recipes`'s `ingredients`
+  filter (7.4). The pantry match itself (7.3) is two columns on `GetRecipes`, not a
+  function here — it has no caller that wants it separately
 - internal/storage/duplicates.go: the advisory, time-capped duplicate lookup behind
   `save_recipe`'s prompt (BACKLOG 8.3)
 - internal/storage/conversations.go: server-held chat threads for /chat, ownership-checked on

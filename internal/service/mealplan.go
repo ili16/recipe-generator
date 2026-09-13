@@ -79,6 +79,11 @@ func buildMealPlanContextText(candidates []model.Recipe, profile model.CookingPr
 			if r.Servings != nil {
 				fmt.Fprintf(&b, " (serves %d)", *r.Servings)
 			}
+			// How the last cook actually went (BACKLOG 6.7) — a soft signal, not a filter:
+			// prefer the 5s, don't refuse to ever plan a 2 again.
+			if r.CookedRating != nil {
+				fmt.Fprintf(&b, " (user rated their last cook %d/5)", *r.CookedRating)
+			}
 			b.WriteString("\n")
 		}
 	}

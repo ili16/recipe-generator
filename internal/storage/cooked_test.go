@@ -58,18 +58,51 @@ func TestMarkCooked(t *testing.T) {
 		return nil
 	}
 
+	rating := func() *int16 {
+		list, err := GetRecipes(userID)
+		if err != nil {
+			t.Fatalf("GetRecipes: %v", err)
+		}
+		for _, r := range list {
+			if r.ID == recipe.ID {
+				return r.CookedRating
+			}
+		}
+		t.Fatalf("recipe %d missing from list", recipe.ID)
+		return nil
+	}
+
 	if lastCooked() != nil {
 		t.Fatal("a fresh recipe should have no cooked mark")
 	}
-	if found, err := MarkCooked(ctx, userID, recipe.ID); err != nil || !found {
+	if found, err := MarkCooked(ctx, userID, recipe.ID, nil); err != nil || !found {
 		t.Fatalf("MarkCooked: found=%v err=%v", found, err)
 	}
 	if lastCooked() == nil {
 		t.Fatal("cooked mark did not reach the list payload")
 	}
+	if rating() != nil {
+		t.Fatal("marking cooked without a rating should not invent one")
+	}
+
+	// BACKLOG 6.7: the rating arrives as a second mark a moment later, and a later
+	// unrated mark (the next cook) must not wipe it.
+	four := int16(4)
+	if found, err := MarkCooked(ctx, userID, recipe.ID, &four); err != nil || !found {
+		t.Fatalf("MarkCooked (rated): found=%v err=%v", found, err)
+	}
+	if got := rating(); got == nil || *got != 4 {
+		t.Fatalf("rating did not reach the list payload: %v", got)
+	}
+	if _, err := MarkCooked(ctx, userID, recipe.ID, nil); err != nil {
+		t.Fatalf("MarkCooked (re-mark): %v", err)
+	}
+	if got := rating(); got == nil || *got != 4 {
+		t.Fatalf("an unrated re-mark cleared the rating: %v", got)
+	}
 
 	// Someone else's recipe is not-found, and does not clear the owner's mark.
-	if found, err := MarkCooked(ctx, otherUserID, recipe.ID); err != nil || found {
+	if found, err := MarkCooked(ctx, otherUserID, recipe.ID, nil); err != nil || found {
 		t.Fatalf("expected not-found for a foreign recipe: found=%v err=%v", found, err)
 	}
 	if err := UnmarkCooked(ctx, otherUserID, recipe.ID); err != nil {
@@ -84,5 +117,8 @@ func TestMarkCooked(t *testing.T) {
 	}
 	if lastCooked() != nil {
 		t.Fatal("unmark left the cooked mark in place")
+	}
+	if rating() != nil {
+		t.Fatal("unmark left the rating in place")
 	}
 }

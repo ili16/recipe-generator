@@ -95,10 +95,11 @@ var chatTools = map[string]tool{
 		Run: toolTransformRecipe,
 	},
 	"search_my_recipes": {
-		Description: "Search the user's saved recipes by title text and/or tags. Returns id, title and tags only.",
+		Description: "Search the user's saved recipes by title text, tags, and/or ingredients they use. Returns id, title and tags only.",
 		Params: obj(map[string]any{
-			"query": str("Text to match against recipe titles"),
-			"tags":  strList("Tag slugs a recipe must all carry"),
+			"query":       str("Text to match against recipe titles"),
+			"tags":        strList("Tag slugs a recipe must all carry"),
+			"ingredients": strList("Ingredient names; a recipe matches if it uses at least one of them. Use this to cook something up before it goes off."),
 		}),
 		NeedsAuth: true,
 		Run:       toolSearchMyRecipes,
@@ -141,6 +142,7 @@ var chatTools = map[string]tool{
 					"recipe_id": integer("A saved recipe's id"),
 					"draft_ref": str("A draft_ref (e.g. from plan_week's variant_drafts) to save first, then plan"),
 					"servings":  integer("Portions wanted that day; omit for the recipe as written"),
+					"meal_slot": str("Which meal of the day: breakfast, lunch, dinner or snack. Omit for dinner. A day can hold one entry per slot, so list a lunch and a dinner as two entries."),
 				}, "date"),
 			},
 			"confirm": map[string]any{"type": "boolean", "description": "Set true to go ahead and replace days that are already planned"},
@@ -155,13 +157,17 @@ var chatTools = map[string]tool{
 			"recipe_id": integer("A saved recipe's id"),
 			"draft_ref": str("A draft_ref to save first, then plan"),
 			"servings":  integer("Portions wanted that day; omit for the recipe as written"),
+			"meal_slot": str("Which meal of the day: breakfast, lunch, dinner or snack. Omit for dinner. This replaces only that slot, leaving the day's other meals alone."),
 		}, "date"),
 		NeedsAuth: true,
 		Run:       toolSetPlanDay,
 	},
 	"clear_plan_day": {
-		Description: "Remove everything planned on one day of the user's saved meal plan.",
-		Params:      obj(map[string]any{"date": str("The day to clear, YYYY-MM-DD")}, "date"),
+		Description: "Remove what is planned on one day of the user's saved meal plan. Pass meal_slot to clear only that meal; omit it to clear the whole day, every meal included.",
+		Params: obj(map[string]any{
+			"date":      str("The day to clear, YYYY-MM-DD"),
+			"meal_slot": str("Clear only this meal: breakfast, lunch, dinner or snack. Omit to clear the entire day."),
+		}, "date"),
 		NeedsAuth:   true,
 		Run:         toolClearPlanDay,
 	},
@@ -319,8 +325,9 @@ func toolTransformRecipe(ctx context.Context, s *chatSession, args json.RawMessa
 
 func toolSearchMyRecipes(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
 	var a struct {
-		Query string   `json:"query"`
-		Tags  []string `json:"tags"`
+		Query       string   `json:"query"`
+		Tags        []string `json:"tags"`
+		Ingredients []string `json:"ingredients"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, nil, errors.New("could not read the arguments")
@@ -330,10 +337,23 @@ func toolSearchMyRecipes(ctx context.Context, s *chatSession, args json.RawMessa
 		return nil, nil, errors.New("could not read your saved recipes")
 	}
 
+	// Ingredients are the one filter GetRecipes cannot answer from the list payload — it
+	// carries no ingredient names — so it is a second, indexed lookup (BACKLOG 7.4).
+	var usedBy map[int][]string
+	if len(a.Ingredients) > 0 {
+		usedBy, err = storage.RecipesUsingIngredients(ctx, s.userID, a.Ingredients)
+		if err != nil {
+			return nil, nil, errors.New("could not read your saved recipes")
+		}
+	}
+
 	type hit struct {
 		ID    int      `json:"id"`
 		Title string   `json:"title"`
 		Tags  []string `json:"tags"`
+		// Uses names which of the asked-for ingredients this recipe needs, so the model can
+		// say "this one uses the spinach and the feta" without loading the whole recipe.
+		Uses []string `json:"uses,omitempty"`
 	}
 	hits := []hit{}
 	query := strings.ToLower(strings.TrimSpace(a.Query))
@@ -344,7 +364,10 @@ func toolSearchMyRecipes(ctx context.Context, s *chatSession, args json.RawMessa
 		if !hasAllTags(r.Tags, a.Tags) {
 			continue
 		}
-		hits = append(hits, hit{ID: r.ID, Title: r.Recipename, Tags: r.Tags})
+		if usedBy != nil && len(usedBy[r.ID]) == 0 {
+			continue
+		}
+		hits = append(hits, hit{ID: r.ID, Title: r.Recipename, Tags: r.Tags, Uses: usedBy[r.ID]})
 	}
 	return map[string]any{"count": len(hits), "recipes": hits}, nil, nil
 }
@@ -501,15 +524,17 @@ type planDayArg struct {
 	// Servings is portions wanted that day (BACKLOG 6.2); 0 (omitted) means "as the
 	// recipe is written" and leaves the column NULL.
 	Servings int `json:"servings"`
+	// MealSlot is which meal of the day this fills (BACKLOG 6.10); "" means dinner.
+	MealSlot string `json:"meal_slot"`
 }
 
 // resolvePlanDays turns the model's day arguments into storage assignments, saving any
 // named drafts on the way (idempotently — see saveDraft). Drafts are saved before the
 // apply transaction opens, so a failed apply can leave a recipe saved but unplanned;
 // re-running reuses it rather than duplicating it.
-// ponytail: the planner writes one dinner per day, always 18:00. 6.4 made a day hold a
-// meal per slot, but nothing asks the model to fill breakfast or lunch yet — widen
-// planDayArg with a slot when a user actually asks for it. Per-day times are 4.4.
+// ponytail: every day is written at 18:00 whatever its slot — the same thing the REST
+// add endpoint does (cmd/mealplan.go's defaultMealStartTime), so a lunch reads 18:00 on
+// the week view. Per-day and per-slot times are 4.4.
 func (s *chatSession) resolvePlanDays(ctx context.Context, days []planDayArg) ([]storage.PlannedDay, []string, error) {
 	if len(days) == 0 {
 		return nil, nil, errors.New("give at least one day")
@@ -522,10 +547,19 @@ func (s *chatSession) resolvePlanDays(ctx context.Context, days []planDayArg) ([
 		if err != nil {
 			return nil, nil, errors.New("date must be a date like 2026-09-14")
 		}
-		if seen[d.Date] {
-			return nil, nil, errors.New("the same day is listed twice: " + d.Date)
+		slot := d.MealSlot
+		if slot == "" {
+			slot = storage.DefaultMealSlot
 		}
-		seen[d.Date] = true
+		if !storage.ValidMealSlot(slot) {
+			return nil, nil, errors.New("meal_slot must be one of breakfast, lunch, dinner, snack")
+		}
+		// Keyed by (date, slot): one call may plan Thursday's lunch *and* its dinner,
+		// but not the same slot twice (BACKLOG 6.10).
+		if seen[d.Date+" "+slot] {
+			return nil, nil, errors.New("the same day and meal is listed twice: " + d.Date + " " + slot)
+		}
+		seen[d.Date+" "+slot] = true
 		// A day before today has already been cooked — replanning the current week must
 		// leave it alone rather than rewrite history.
 		if plannedOn.Before(today()) {
@@ -543,7 +577,7 @@ func (s *chatSession) resolvePlanDays(ctx context.Context, days []planDayArg) ([
 				return nil, nil, err
 			}
 		}
-		day := storage.PlannedDay{RecipeID: recipeID, PlannedOn: plannedOn, StartTime: "18:00:00"}
+		day := storage.PlannedDay{RecipeID: recipeID, PlannedOn: plannedOn, StartTime: "18:00:00", MealSlot: slot}
 		if d.Servings > 0 {
 			servings := d.Servings
 			day.Servings = &servings
@@ -622,7 +656,7 @@ func (s *chatSession) wouldOverwrite(ctx context.Context, days []storage.Planned
 		}
 		item, ok := bySlot[d.PlannedOn.Format(time.DateOnly)+" "+slot]
 		if ok && item.RecipeID != d.RecipeID {
-			conflicts = append(conflicts, map[string]any{"date": item.PlannedOn, "current_recipe": item.RecipeTitle})
+			conflicts = append(conflicts, map[string]any{"date": item.PlannedOn, "meal_slot": item.MealSlot, "current_recipe": item.RecipeTitle})
 		}
 	}
 	return conflicts, nil
@@ -670,9 +704,15 @@ func toolSetPlanDay(ctx context.Context, s *chatSession, args json.RawMessage) (
 func toolClearPlanDay(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
 	var a struct {
 		Date string `json:"date"`
+		// MealSlot narrows the clear to one meal; "" clears the whole day (BACKLOG 6.10 —
+		// without it, "clear Thursday's lunch" deletes that day's dinner too).
+		MealSlot string `json:"meal_slot"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, nil, errors.New("could not read the arguments")
+	}
+	if a.MealSlot != "" && !storage.ValidMealSlot(a.MealSlot) {
+		return nil, nil, errors.New("meal_slot must be one of breakfast, lunch, dinner, snack")
 	}
 	day, err := time.Parse(time.DateOnly, a.Date)
 	if err != nil {
@@ -685,12 +725,17 @@ func toolClearPlanDay(ctx context.Context, s *chatSession, args json.RawMessage)
 	if err != nil {
 		return nil, nil, errors.New("could not read your plan")
 	}
+	removed := 0
 	for _, item := range items {
+		if a.MealSlot != "" && item.MealSlot != a.MealSlot {
+			continue
+		}
 		if err := storage.DeleteMealPlanItem(ctx, s.userID, item.ID); err != nil {
 			return nil, nil, errors.New("could not clear that day")
 		}
+		removed++
 	}
-	return map[string]any{"date": a.Date, "removed": len(items)}, nil, nil
+	return map[string]any{"date": a.Date, "removed": removed}, nil, nil
 }
 
 func toolGetPreferences(ctx context.Context, s *chatSession, _ json.RawMessage) (any, *artifact, error) {

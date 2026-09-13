@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -98,6 +99,10 @@ func main() {
 	mux.HandleFunc("DELETE /api/v1/collections/{id}", authenticator.Require(HandleDeleteCollection))
 	mux.HandleFunc("PUT /api/v1/collections/{id}/recipes/{recipeId}", authenticator.Require(HandleSetCollectionMembership))
 	mux.HandleFunc("DELETE /api/v1/collections/{id}/recipes/{recipeId}", authenticator.Require(HandleSetCollectionMembership))
+
+	mux.HandleFunc("GET /api/v1/pantry", authenticator.Require(HandleGetPantry))
+	mux.HandleFunc("POST /api/v1/pantry", authenticator.Require(HandleUpsertPantryItem))
+	mux.HandleFunc("DELETE /api/v1/pantry/{id}", authenticator.Require(HandleDeletePantryItem))
 
 	mux.HandleFunc("GET /api/v1/meal-plan", authenticator.Require(HandleGetMealPlan))
 	mux.HandleFunc("GET /api/v1/grocery-list", authenticator.Require(HandleGetGroceryList))
@@ -412,7 +417,10 @@ func HandleUnvoteRecipe(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleMarkCooked stamps a recipe the caller owns as cooked now (BACKLOG 6.3), which
-// holds it back from meal-plan candidates for service.CookedCooldown.
+// holds it back from meal-plan candidates for service.CookedCooldown. The body is
+// optional: `{"rating": 1..5}` also records how the cook went (BACKLOG 6.7), so the
+// automatic mark at the end of cooking mode and the rating tapped a moment later are
+// the same call. No body, or no rating in it, leaves any previous rating alone.
 func HandleMarkCooked(w http.ResponseWriter, r *http.Request) {
 	user, ok := auth.FromContext(r.Context())
 	if !ok {
@@ -424,7 +432,18 @@ func HandleMarkCooked(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid recipe id", http.StatusBadRequest)
 		return
 	}
-	found, err := storage.MarkCooked(r.Context(), user.ID, recipeID)
+	var body struct {
+		Rating *int16 `json:"rating"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if body.Rating != nil && (*body.Rating < 1 || *body.Rating > 5) {
+		http.Error(w, "rating must be between 1 and 5", http.StatusBadRequest)
+		return
+	}
+	found, err := storage.MarkCooked(r.Context(), user.ID, recipeID, body.Rating)
 	if err != nil {
 		slog.Error("Error marking cooked", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -811,6 +830,78 @@ func HandleSetCollectionMembership(w http.ResponseWriter, r *http.Request) {
 		}
 		slog.Error("Error updating collection membership", "error", err)
 		http.Error(w, "Error updating collection", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+/* ── Pantry (BACKLOG 7.1) ──────────────────────────────────────────────────── */
+
+func HandleGetPantry(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+
+	items, err := storage.ListPantryItems(r.Context(), user.ID)
+	if err != nil {
+		slog.Error("Error listing pantry items", "error", err)
+		http.Error(w, "Error listing pantry items", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+// HandleUpsertPantryItem adds an item or updates the one already held under the same
+// name and unit — there is no separate PATCH, because "I now have 2kg of flour" is the
+// same statement as "I have flour" with a different number.
+func HandleUpsertPantryItem(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+
+	var in model.PantryItem
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	item, err := storage.UpsertPantryItem(r.Context(), user.ID, in)
+	if err != nil {
+		if errors.Is(err, storage.ErrEmptyPantryItemName) || errors.Is(err, storage.ErrInvalidExpiry) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		slog.Error("Error saving pantry item", "error", err)
+		http.Error(w, "Error saving pantry item", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
+}
+
+func HandleDeletePantryItem(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+
+	itemID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || itemID <= 0 {
+		http.Error(w, "Invalid pantry item id", http.StatusBadRequest)
+		return
+	}
+
+	if err := storage.DeletePantryItem(r.Context(), user.ID, itemID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "Pantry item not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("Error deleting pantry item", "error", err)
+		http.Error(w, "Error deleting pantry item", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

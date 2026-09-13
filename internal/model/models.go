@@ -2,6 +2,7 @@ package model
 
 import (
 	"io"
+	"strings"
 	"time"
 )
 
@@ -79,9 +80,23 @@ type Recipe struct {
 	Servings     *int       `json:"servings,omitempty"`
 	TotalMinutes *int       `json:"total_minutes,omitempty"`
 	CreatedAt    *time.Time `json:"created_at,omitempty"`
+	// Calories is the per-serving estimate the card shows (BACKLOG 6.8). Only this one
+	// macro is denormalised — the other three have nothing rendering them. nil means the
+	// model had no estimate; the card must then show no badge, not "0 kcal".
+	Calories *int `json:"calories,omitempty"`
+	// PantryHave and PantryTotal are the pantry match (BACKLOG 7.3): how many of this
+	// recipe's ingredients the caller already has, out of how many it lists. Matched on
+	// the ingredient's normalised name only, so "250 g flour" in the recipe matches "2
+	// cups flour" in the pantry. Set by GetRecipes only; both 0 when the recipe lists no
+	// ingredients or the pantry is empty, which is the client's cue to show no badge.
+	PantryHave  int `json:"pantry_have"`
+	PantryTotal int `json:"pantry_total"`
 	// LastCookedAt is when the owner last marked this cooked (BACKLOG 6.3). nil means
 	// never. Recent ones are held back from meal-plan candidates for CookedCooldown.
 	LastCookedAt *time.Time `json:"last_cooked_at,omitempty"`
+	// CookedRating is how the owner rated their last cook, 1–5 (BACKLOG 6.7). nil means
+	// they never rated it — never 0. It rides into the meal-plan prompt as a soft signal.
+	CookedRating *int16 `json:"cooked_rating,omitempty"`
 	// ShareToken is the read-only share link's token (BACKLOG 8.4), or nil when the
 	// recipe isn't shared. Owner-only: the public read strips it.
 	ShareToken *string `json:"share_token,omitempty"`
@@ -166,6 +181,53 @@ type RecipeVersion struct {
 // GroceryCategories are the shopping aisles, in the order a list renders them. The
 // model picks one per ingredient; anything else (or nothing) is "other".
 var GroceryCategories = []string{"produce", "protein", "dairy", "pantry", "other"}
+
+// NormalizeItem is the one spelling of an ingredient name that everything keys on: the
+// grocery list consolidates on it (BACKLOG 6.1) and a pantry item is stored as it (7.1),
+// so "Flour" in a recipe and "flour" in the pantry are the same thing.
+func NormalizeItem(item string) string {
+	return strings.ToLower(strings.TrimSpace(item))
+}
+
+// NormalizeUnit canonicalises a unit to the one it is summed in — kg sums with g, l with
+// ml — and returns the factor to multiply the quantity by. Anything else is its own
+// family, and a missing unit ("2 eggs") is the empty family. The generation prompt
+// already normalises to metric-by-weight, so this only has to close the gap between a
+// recipe written in g and one written in kg.
+//
+// Used by both the grocery list and the pantry: a pantry item and a shopping line must
+// agree on units or nothing will ever match (BACKLOG 7.1, 7.3).
+func NormalizeUnit(unit *string) (family string, factor float64) {
+	u := ""
+	if unit != nil {
+		u = strings.ToLower(strings.TrimSpace(*unit))
+	}
+	switch u {
+	case "kg":
+		return "g", 1000
+	case "l":
+		return "ml", 1000
+	default:
+		return u, 1
+	}
+}
+
+// PantryCategories are where a pantry item lives, in render order (BACKLOG 7.1).
+// Anything else is treated as the default, "spices_dry".
+var PantryCategories = []string{"fridge", "freezer", "produce", "spices_dry"}
+
+// PantryItem is one thing the user has in the house. Name and Unit are normalised
+// (model.NormalizeItem / NormalizeUnit) on the way in, so they are directly comparable
+// with a recipe's ingredients. ExpiresOn is a date, not a timestamp — food expires on a
+// day, not at an instant (BACKLOG 7.4).
+type PantryItem struct {
+	ID        int      `json:"id"`
+	Name      string   `json:"name"`
+	Quantity  *float64 `json:"quantity"`
+	Unit      *string  `json:"unit"`
+	Category  string   `json:"category"`
+	ExpiresOn *string  `json:"expires_on"` // YYYY-MM-DD
+}
 
 // GroceryIngredient is one ingredient of one planned meal, as read for a week's grocery
 // list — the join of meal_plan_items × recipe_ingredients, before consolidation.
