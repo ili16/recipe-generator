@@ -46,6 +46,8 @@ graph LR
         MPV[POST /meal-plan/variants/:id]
     end
     subgraph required["Auth required"]
+        HH[GET/POST/DELETE /household]
+        HHJ[POST /household/join · /leave · /code]
         AR[POST /add-recipe]
         GR[GET /get-recipes]
         DR[DELETE /delete-recipe/:id]
@@ -89,6 +91,17 @@ graph LR
 > unlike those — their handlers explicitly 401 an anonymous caller (they operate on the
 > caller's own saved recipes, so there's nothing to suggest from without one). An
 > anonymous request still consumes one rate-limit slot before hitting that check.
+>
+> **`POST /api/v1/feedback` is the one non-LLM route with a limiter** (BACKLOG 9.16), and the
+> only optional-auth route whose handler *accepts* an anonymous caller rather than 401ing —
+> a tester who never signs in still hits bugs, so the report stores `user_id NULL`. It is
+> wrapped `Optional(feedbackRL.Guard(handler))` with its **own** limiter on an hourly window
+> (`RATE_LIMIT_FEEDBACK_ANON_PER_HOUR` / `_AUTH_PER_HOUR`), deliberately looser than `rl`:
+> the anon budget is per-IP so friends behind one NAT share it, and a rejected request
+> spends from it too. No `billing.Guard` — it calls no model. Body capped at 8 MB, because
+> an optional screenshot travels inline as base64; the image itself is capped at 5 MB
+> (`storage.MaxFeedbackScreenshot`, a 413) and must pass `service.DecodeInlineImage` — the
+> same sniffing a `/chat` photo gets, since it is the same trust boundary.
 
 ## What This Service Does
 
@@ -155,6 +168,9 @@ Optional rate limiting + budget tuning (internal/ratelimit, internal/billing):
   (chat/transcribe/meal-plan variants).
 - RATE_LIMIT_ANON_PER_10MIN (default: 5) / RATE_LIMIT_AUTH_PER_10MIN (default: 15) —
   request cap per client IP / per user ID.
+- RATE_LIMIT_FEEDBACK_ANON_PER_HOUR (default: 20) / RATE_LIMIT_FEEDBACK_AUTH_PER_HOUR
+  (default: 40) — a separate hourly limiter for `POST /feedback` (BACKLOG 9.16), which is
+  a form rather than a model call and so is not sized like one.
 - LLM_BUDGET_DEFAULT_USD (default: 2.00) — monthly per-user spend cap; overridable per
   user via `users.monthly_budget_usd_override` (`PATCH /admin/users/{id}/budget`).
 - LLM_TRANSCRIBE_COST_USD (default: 0.003) — flat per-call cost estimate for
@@ -212,6 +228,9 @@ otherwise), rate-limited and budget-capped per the "Rate limiting + budget" note
 	  `/generate` + `/generate/stream` went in 3.9 once nothing called them.
 	- JSON: `{"conversation_id":"<uuid>"|omitted,"message":"...","language":"de",`
 	  `"attachments":[…]}` → `text/event-stream`.
+	- **Or** `{"conversation_id":"…","approval":{"id":"…","approve":true}}` with **no
+	  message** — the answer to an `approval_request` from the previous turn (BACKLOG
+	  10.2). See the approval note below.
 	- `language` is optional (ISO 639-1, the caller's device locale): it is appended to the
 	  **system prompt for that turn only**, never stored on the thread, so a thread resumed
 	  on another device follows that device. It is the only locale signal the backend has
@@ -236,13 +255,22 @@ otherwise), rate-limited and budget-capped per the "Rate limiting + budget" note
 	- Events: `token` `{text}` (assistant prose, streamed) · `tool_start` `{name,args}` ·
 	  `tool_end` `{name,ok}` · `artifact` `{kind:"recipe"|"week_plan",data}` (the card the
 	  client renders inline, and the reason the reply itself does not repeat a recipe) ·
-	  `done` `{conversation_id}` · `error` `{code}` — a code, never `err.Error()`.
+	  `approval_request` `{id,name,args,replaces}` · `done` `{conversation_id}` · `error`
+	  `{code}` — a code, never `err.Error()`.
 	  Error codes: `conversation_not_found`, `budget_exceeded`, `iteration_limit`,
-	  `timeout`, `model_error`.
+	  `timeout`, `model_error`, `stopped`, `approval_expired`. `stopped` is the user pressing Stop (BACKLOG
+	  10.1): the request context is cancelled, the loop halts **before** the next model
+	  call or tool call rather than after it, and whatever the turn produced so far is
+	  still persisted. The client has hung up by then, so the code is for the log and the
+	  funnel counter (`outcome="abandoned"`), not for anyone to read.
 	- A draft carries the provenance of the ask that produced it: `toolGenerateRecipe` parks
 	  a `GenerationOrigin` on `draftInfo` (it is the only place that still knows whether the
 	  user gave a URL, a photo or a description), `transform_recipe` inherits it from its
 	  target draft, and `saveDraft` writes it as the recipe's `sources` row.
+	- `save_recipe` re-emits the draft's `artifact` carrying its new `recipe_id`, so the
+	  client's card flips from "unsaved draft" to saved. The client keys recipe artifacts on
+	  `draft_ref` across the whole thread, so this updates the existing card rather than
+	  appending a second copy of the same recipe.
 	- `save_recipe` checks for a look-alike first (BACKLOG 8.3): a live recipe of the
 	  caller's with the same source URL, or failing that the same normalised title, comes
 	  back as `{saved:false, duplicate_of:{recipe_id,title,matched_on}}` and **nothing is
@@ -257,12 +285,28 @@ otherwise), rate-limited and budget-capped per the "Rate limiting + budget" note
 	  (`uses`). That last filter is what "find recipes using these" on the Pantry screen
 	  becomes (BACKLOG 7.4); it is a second indexed lookup because the list payload
 	  carries no ingredient names.
+	- **Households (BACKLOG 15.1) widen the tools for free.** Every tool resolves its user id
+	  from `auth.FromContext` and hands it to a storage call, and the scope widening lives in the
+	  SQL — so inside a household the whole catalog already reads the shared library, pantry and
+	  week with no per-tool change. Two things the loop adds on top: a line in the system prompt
+	  naming the household and its size (and that another member's recipe can be cooked and
+	  planned but not edited), and `plan_week`'s context rendering the **union of every member's**
+	  dislikes and dietary prefs — a plan nobody can eat is worse than no plan. Writes still
+	  record the caller as owner.
 	- Tool catalog in `internal/service/chat_tools.go`. Two invariants: the user id comes
 	  from `auth.FromContext`, never from tool args (a recipe id in args only ever reaches
 	  a storage call already scoped to that user, so another user's id is not-found); and
 	  every tool returns JSON, never prose. Tools that touch durable per-user state refuse
-	  anonymous callers; `generate_recipe`, `fetch_url` and `answer_cooking_question` do
-	  not, so the anonymous acquisition funnel still works.
+	  anonymous callers; `generate_recipe`, `fetch_url`, `answer_cooking_question` and
+	  `review_cook_flow` do not, so the anonymous acquisition funnel still works.
+	- `review_cook_flow` (BACKLOG 12.0) re-plans how a recipe is cooked and nothing else:
+	  it merges steps too thin to be worth a screen, labels each `prep`/`cook`/`wait`, and
+	  marks the ones that run at the same time (`recipe_steps.phase` / `parallel_group`,
+	  migration `00032`). It is a steps-only rewrite over the full recipe schema, so
+	  `service.ReviewCookFlow` **verifies** the ingredients came back unchanged
+	  (`sameIngredients`) and errors if they moved — a flow review that quietly rewrote the
+	  shopping list would be a much worse bug than a bad flow. Like every other proposal it
+	  returns a draft; the user saves it.
 	- `plan_week` only proposes. Applying is **one** `apply_week_plan` call listing every
 	  day (`storage.ApplyMealPlanDays` — one transaction, all days or none), which is also
 	  the only apply path since the planner UI lost its Accept button (`../BACKLOG.md`
@@ -276,6 +320,31 @@ otherwise), rate-limited and budget-capped per the "Rate limiting + budget" note
 	  silently replaced — the model shows that list and calls again with `confirm:true`.
 	  `set_plan_day` remains for a single day the user named explicitly (same code path,
 	  pre-confirmed). Saved variants carry `variant_of_recipe_id` back to their parent.
+	- **Approval is structural, not prosaic** (BACKLOG 10.2). A tool marked
+	  `Mutating` in the catalog does not run when the model asks for it: the loop emits
+	  `approval_request` and **ends the turn**, and the call runs only when the client
+	  posts back `{"approval":{"id","approve"}}`. Gated on *scope*, not on "does it
+	  write" — `apply_week_plan` (multi-day), `clear_plan_day` (destructive) and
+	  `set_preferences` (changes every later turn) ask; `save_recipe` and `set_plan_day`
+	  write silently, because a single row the user named in their own message is its own
+	  confirmation and asking twice is noise.
+	  - `replaces` on the event is what those days already hold
+	    (`approvalPreview`, read-only — it must not resolve drafts, since saving one is
+	    itself a write). Empty means the call replaces nothing.
+	  - The parked assistant message is **not** appended to the thread while it waits: a
+	    stored reply whose `tool_calls` have no tool results is a thread the model API
+	    rejects. Approving appends the reply and one tool result per call together, so the
+	    thread is only ever valid; never resuming simply drops the reply.
+	  - Only the approved call runs. Calls after it in the same reply come back `not run`
+	    — the model wrote them expecting the gated write to have happened.
+	  - Approving an `apply_week_plan` forces its own `confirm` flag true
+	    (`approvedArgs`): that flag exists to make the *model* ask before replacing a
+	    planned day, which the approval just did, in a form the user actually saw.
+	  - Declining returns `{"approved":false}` to the model and writes nothing.
+	  - The pending call lives on the in-memory session (one per thread, same TTL and
+	    single-process caveat as drafts), so a restart answers `approval_expired`.
+	  - Anonymous callers are never gated: every mutating tool is `NeedsAuth`, so there
+	    is nothing to approve.
 	- Bounded three ways: `maxTurnIterations` (6) model calls per turn, a 4-minute
 	  wall-clock deadline off `r.Context()`, and a budget re-check **between** iterations
 	  — an agent turn is N model calls, so a runaway loop trips the cap mid-turn rather
@@ -290,6 +359,16 @@ otherwise), rate-limited and budget-capped per the "Rate limiting + budget" note
 	  found/owned; 422 if it has no structured data to vary.
 
 Authenticated (Bearer token required):
+- POST /chat/drafts/save
+	- `{"conversation_id":"…","draft_ref":"draft_1","tags":[…]}` → the saved `Recipe` (201).
+	  The client's "Save to my recipes" button on a chat recipe card: it resolves the draft
+	  out of the conversation's warm session and saves it through the **same** `saveDraft`
+	  the `save_recipe` tool calls, so a second tap — or a later "save it" — returns the
+	  recipe already written rather than a duplicate. It calls no model, which is why it
+	  sits here and not behind the LLM stack; unlike `/chat` it refuses anonymous callers,
+	  because it writes. A draft the session no longer holds (2h TTL, or a restart) is
+	  `404 {"code":"draft_expired"}` — its own answer, so the client can fall back to asking
+	  the assistant instead of offering a button that cannot work.
 - GET /user-info
 - GET /get-recipes
 	- Each recipe carries its provenance read-only: `source_type` (`recipes.source_type`),
@@ -441,6 +520,33 @@ Authenticated (Bearer token required):
 	  `household_size × (1 + len(days))`); it is the only place a leftover's quantity is
 	  ever edited, on the day that cooks. 404 if the item isn't the caller's; 400 if it is
 	  itself a leftover, or if a covered day is not after the cooking day.
+- GET /household
+	- 200 with `{"id","name","join_code","members":[{"id","name","email","is_me"}]}`, or **204**
+	  when the caller is in no household — that is a normal state, not an error, and the client
+	  renders a different screen for it (BACKLOG 15.1).
+- POST /household
+	- `{"name":"The Flat"}` → 201 with the household. Moves everything the caller already owns
+	  into it. 409 if they are already in one: leave first, so the exit rules run once and
+	  visibly.
+- POST /household/join
+	- `{"join_code":"ABCD2345"}` → 200 with the household. 404 for a code that does not resolve —
+	  a wrong code and a rotated one are deliberately indistinguishable. 409 if already in one.
+	  The code is upper-cased and trimmed before matching; it gets read aloud, so case is not
+	  part of the credential.
+- POST /household/leave
+	- 204. The caller's recipes and pantry lines revert to being private; the **week stays with
+	  the household**, and the plan rows they created are handed to the longest-standing
+	  remaining member — otherwise the week would survive as nobody's. The last member leaving
+	  **is** a disband.
+- DELETE /household
+	- 204. Disband, for everyone. **Any member may**: giving one person the power to hold the
+	  others in would be worse than giving each of them the power to end it. Recipes and pantry
+	  items revert to the `user_id` they never stopped carrying; planned days **after today** are
+	  deleted and earlier ones kept.
+- POST /household/code
+	- 200 `{"join_code":"…"}`. Rotates it, killing the old one. The only way to revoke access
+	  after somebody leaves, and the reason the code is a separate column from the household's id
+	  rather than being it.
 - GET /preferences
 	- 200 with `UserPreferences`: `{"skill_level":...,"dietary_prefs":[...],`
 	  `"disliked_ingredients":[...],"meal_plan_no_food_days":[...],`
@@ -448,6 +554,10 @@ Authenticated (Bearer token required):
 	  `"household_size":null}`. `household_size` is how many people the caller cooks for
 	  (BACKLOG 9.12) — **null means they never said**, which is not 1: with no number there
 	  is nothing to compare a recipe's yield against, so nothing claims a mismatch.
+	  **Inside a household `household_size` and `week_start_day` are read from and written to
+	  the household's creator** (`storage.kitchenOwner`, BACKLOG 15.1): they describe the table
+	  rather than the cook, and left per-caller two members would disagree about which day the
+	  same week starts on. Every other field stays personal.
 - PATCH /preferences
 	- JSON: full `UserPreferences` (server overwrites, not a merge — always send the
 	  complete object). `meal_plan_no_food_days`/`meal_plan_no_cook_days`/
@@ -478,6 +588,19 @@ Notes:
 - Ownership always comes from the token subject, never from the request body.
 
 ## Data Model
+
+> **Households (BACKLOG 15.1).** `00035` adds a `households` table and a nullable `household_id`
+> to `users`, `recipes`, `pantry_items` and `meal_plans` — `ON DELETE SET NULL` on every one,
+> never CASCADE, because dropping a household must orphan rows back to their owners rather than
+> destroy a member's recipes. Membership is a column on `users`, not a join table: a user is in
+> at most one household. **Nothing is re-owned** — `user_id` still records who made every row,
+> which is the single property the leave/disband contract rests on. `pantry_items`' uniqueness
+> moved from `(user_id, …)` to `(COALESCE(household_id::text, 'u' || user_id), …)`, so one
+> household is one fridge with one flour line. `collections` deliberately got none.
+>
+> **`specs/DATA_MODEL.md` is stale** and predates most of this — it still documents `meal_plans`
+> override columns dropped in `00018` and `meal_plan_items.start_time` dropped in `00028`, and
+> has no `pantry_items`, `conversations` or `user_cooking_profiles`. Read the migrations.
 
 See DATA_MODEL.md for the canonical schema and RECIPE_TAGS.md for the tagging taxonomy.
 Migrations `00001`–`00006` create it from scratch; there is no legacy database to preserve.
@@ -510,7 +633,19 @@ existed since `00001` but only became meaningful with BACKLOG 8.2's soft delete.
 - internal/service/chat_tools.go: the tool catalog the loop dispatches (specs/AGENT_CHAT.md §2.2)
 - internal/service/handlers.go: transcribe + add-recipe handlers
 - internal/storage/db.go: pgx pool and recipe queries
-- internal/storage/users.go: EnsureUser upsert keyed by OIDC subject
+- internal/storage/users.go: EnsureUser upsert keyed by OIDC subject, preferences read/write
+  (two of which are household-wide, see `/preferences`), and `KitchenDietary` — the union of
+  every member's dislikes and dietary prefs, which is what `plan_week` must plan against
+- internal/storage/households.go: households (BACKLOG 15.1) — create, join by code, leave,
+  disband, rotate the code. Holds the **exit contract**: recipes and pantry items revert to the
+  `user_id` they never stopped carrying, planned days after today are deleted and earlier ones
+  kept, and a leaver's plan rows change hands so the week does not survive as nobody's
+- internal/storage/scope.go: the **one** scope predicate (`inScope`) and the household stamp on
+  writes. A row is in scope when it carries the caller's household_id, or carries none and the
+  caller owns it — which for a caller with no household collapses to the plain `user_id` check
+  this code did before. **The whole feature is inert until somebody creates a household**, which
+  is what made it safe to ship against live data. Also `kitchenOwner`, which decides whose
+  personal settings stand for the whole kitchen
 - internal/storage/usage.go: LLM usage recording, spend lookup, admin usage listing, budget overrides
 - internal/storage/mealplan.go: meal-plan range queries, transactional upsert-by-day apply
   (`ApplyMealPlanDays`; `AddMealPlanItem` is the one-day case), move (patch), delete, and

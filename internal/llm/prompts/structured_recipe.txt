@@ -24,4 +24,25 @@ Shopping-aisle rule: set each ingredient's category to the aisle it is bought in
 
 ingredient_indices rule: for each step, set ingredient_indices to the list of 0-based indices (into the ingredients array) of every ingredient directly used in that step. Use an empty array if none apply.
 
-tags rule: assign every tag from the allowed list that genuinely applies to this recipe — usually several, spanning multiple groups (meal type, dietary, time/difficulty, cooking method, primary ingredient, cuisine/vibe). Do not limit yourself to one tag or one group.
+Step granularity rules — follow strictly:
+- A step is one thing a person stands at the counter and does, not one atomic action. Someone cooking reads a step, does it, and looks up again — a step they finish in under a minute was never worth looking up for.
+- Merge short consecutive actions in the same place into the step they belong to: "heat the oil, add the onion and garlic, and soften for 5 minutes" is ONE step, not three. "Add the salt" is never a step of its own.
+- Only split an action into its own step when it earns one: it has its own timer, it belongs to a different phase, it runs parallel to something else, or it is a genuine decision point the cook must not miss.
+- As a guide, a 30-minute recipe is about 5 to 8 steps, not 15. Prefer fewer, fuller steps over many thin ones.
+- timer_seconds is the real duration of that step — never set a timer under 60 seconds unless the recipe truly hinges on those seconds (searing, blanching, blooming spices).
+
+Step phase rule — set each step's phase to one of:
+- "prep" — mise en place: chopping, measuring, mixing, marinade assembly, anything done before or alongside the heat that is hands-on preparation.
+- "cook" — the heat is on and the food is being cooked: stovetop, oven, frying, simmering, baking.
+- "wait" — passive time where the cook does nothing: marinating, proofing, resting, chilling, cooling. Waiting for the oven to preheat or a pot to come to the boil is "wait" only when nothing else is happening; if there is prep to do alongside it, see the parallelism rule.
+This is the same three-way split as prep_minutes / cook_minutes / the waiting time inside total_minutes — keep them consistent.
+
+Parallelism rule — this is how a real cook works, so get it right:
+- Give consecutive steps that happen AT THE SAME TIME the same parallel_group integer (1, 2, 3, … counting up through the recipe). Steps that run alone get null.
+- The case to look for: a long step that does not need hands — water coming to the boil, the oven preheating, pasta cooking, a sauce reducing, something roasting — with hands-on work that fits inside it. Put both in one group: "bring a large pot of salted water to the boil" and "meanwhile, dice the onion and pepper" are one group, not two steps in sequence.
+- Only group steps that genuinely can overlap. If a step needs the previous one finished (you cannot sauce the pasta before it is drained), leave parallel_group null.
+- Write each step in a group so it stands on its own — do not start one with "meanwhile" or "while that cooks"; the group already says they are simultaneous.
+- Order the steps inside a group longest-first, so the step that must be started first is written first.
+- Do not put every step in the recipe into one group. Most recipes have one or two real parallel blocks.
+
+tags rule: assign every tag from the allowed list that genuinely applies to this recipe — usually several, spanning multiple groups (meal type, dietary, time/difficulty, cooking method, primary ingredient, cuisine/vibe). Do not limit yourself to one tag or one group. Always include exactly one of breakfast-brunch, lunch, dinner or snacks saying when the dish is eaten — pick the most likely one if it could be several — in addition to any other meal-type tag that applies (main-courses, side-dishes, desserts, beverages, sauces-dressings, appetizers-starters).

@@ -12,6 +12,10 @@ import (
 // ErrEmptyCollectionName is a 400, not a 500: the caller sent a blank name.
 var ErrEmptyCollectionName = errors.New("collection name is empty")
 
+// A collection stays private to its owner even inside a household (BACKLOG 15.1): sharing
+// a library does not mean sharing how you file it. What widens is only which recipes may
+// go in one — anything the caller's kitchen can see.
+//
 // Every function here scopes by user_id, so another user's collection id is
 // indistinguishable from a missing one (BACKLOG 8.1): they all return pgx.ErrNoRows,
 // which the handlers turn into 404.
@@ -100,7 +104,7 @@ func SetCollectionMembership(ctx context.Context, userID, collectionID, recipeID
 		INSERT INTO recipe_collections (collection_id, recipe_id)
 		SELECT $1, $2
 		WHERE EXISTS (SELECT 1 FROM collections WHERE id = $1 AND user_id = $3)
-		  AND EXISTS (SELECT 1 FROM recipes WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL)
+		  AND EXISTS (SELECT 1 FROM recipes r WHERE r.id = $2 AND `+inScope("r", "$3")+` AND r.deleted_at IS NULL)
 		ON CONFLICT DO NOTHING`,
 		collectionID, recipeID, userID)
 	if err != nil {

@@ -20,7 +20,7 @@ func GetMealPlanRange(ctx context.Context, userID int, startsOn, endsOn time.Tim
 		FROM meal_plan_items mpi
 		JOIN meal_plans mp ON mp.id = mpi.meal_plan_id
 		JOIN recipes r ON r.id = mpi.recipe_id
-		WHERE mp.user_id = $1 AND mpi.planned_on BETWEEN $2 AND $3
+		WHERE `+inScope("mp", "$1")+` AND mpi.planned_on BETWEEN $2 AND $3
 		ORDER BY mpi.planned_on, `+mealSlotOrder+`, mpi.id`,
 		userID, startsOn, endsOn,
 	)
@@ -99,7 +99,7 @@ type queryRower interface {
 func findOrCreateMealPlanRow(ctx context.Context, q queryRower, userID int, startsOn, endsOn time.Time) (int, error) {
 	var planID int
 	err := q.QueryRow(ctx,
-		`SELECT id FROM meal_plans WHERE user_id = $1 AND starts_on = $2`,
+		`SELECT id FROM meal_plans WHERE `+inScope("meal_plans", "$1")+` AND starts_on = $2`,
 		userID, startsOn,
 	).Scan(&planID)
 	if err == pgx.ErrNoRows {
@@ -108,8 +108,8 @@ func findOrCreateMealPlanRow(ctx context.Context, q queryRower, userID int, star
 		// since GetMealPlanRange reads by date range, not by plan id. Add the unique
 		// constraint + ON CONFLICT if this ever actually bites.
 		err = q.QueryRow(ctx,
-			`INSERT INTO meal_plans (user_id, title, starts_on, ends_on)
-			 VALUES ($1, $2, $3, $4) RETURNING id`,
+			`INSERT INTO meal_plans (user_id, household_id, title, starts_on, ends_on)
+			 VALUES ($1, `+stampHousehold+`, $2, $3, $4) RETURNING id`,
 			userID, "Week of "+startsOn.Format("2006-01-02"), startsOn, endsOn,
 		).Scan(&planID)
 	}
@@ -148,8 +148,11 @@ func ApplyMealPlanDays(ctx context.Context, userID int, weekStartDay string, day
 	// day — the picker, the agent, an applied week — comes through this function.
 	// NULL household_size means the user never said, and then the old meaning stands:
 	// no servings, "as the recipe is written".
+	// Inside a household this is the household's number, not the caller's, or two
+	// members planning the same table would size it differently (kitchenOwner, scope.go).
 	var household *int
-	if err = tx.QueryRow(ctx, `SELECT household_size FROM users WHERE id = $1`, userID).Scan(&household); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT household_size FROM users WHERE id = $1`,
+		kitchenOwner(ctx, tx, userID)).Scan(&household); err != nil {
 		return nil, err
 	}
 
@@ -176,8 +179,8 @@ func ApplyMealPlanDays(ctx context.Context, userID int, weekStartDay string, day
 		// abort the whole apply, not just skip its day.
 		var recipeTitle string
 		if err := tx.QueryRow(ctx,
-			`SELECT title FROM recipes WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
-			d.RecipeID, userID,
+			`SELECT title FROM recipes WHERE id = $2 AND `+inScope("recipes", "$1")+` AND deleted_at IS NULL`,
+			userID, d.RecipeID,
 		).Scan(&recipeTitle); err != nil {
 			return nil, err
 		}
@@ -200,7 +203,7 @@ func ApplyMealPlanDays(ctx context.Context, userID int, weekStartDay string, day
 		if _, err = tx.Exec(ctx, `
 			DELETE FROM meal_plan_items mpi
 			USING meal_plans mp
-			WHERE mpi.meal_plan_id = mp.id AND mp.user_id = $1 AND mpi.planned_on = $2
+			WHERE mpi.meal_plan_id = mp.id AND `+inScope("mp", "$1")+` AND mpi.planned_on = $2
 			  AND mpi.meal_slot = $3`,
 			userID, d.PlannedOn, slot,
 		); err != nil {
@@ -257,7 +260,7 @@ func findCookItem(ctx context.Context, tx pgx.Tx, userID int, day time.Time, slo
 		SELECT mpi.id, mpi.source_item_id
 		FROM meal_plan_items mpi
 		JOIN meal_plans mp ON mp.id = mpi.meal_plan_id
-		WHERE mp.user_id = $1 AND mpi.planned_on = $2 AND mpi.meal_slot = $3`,
+		WHERE `+inScope("mp", "$1")+` AND mpi.planned_on = $2 AND mpi.meal_slot = $3`,
 		userID, day, slot,
 	).Scan(&id, &source)
 	if err == pgx.ErrNoRows {
@@ -268,7 +271,7 @@ func findCookItem(ctx context.Context, tx pgx.Tx, userID int, day time.Time, slo
 			SELECT mpi.id, mpi.source_item_id, COUNT(*) OVER ()
 			FROM meal_plan_items mpi
 			JOIN meal_plans mp ON mp.id = mpi.meal_plan_id
-			WHERE mp.user_id = $1 AND mpi.planned_on = $2`,
+			WHERE `+inScope("mp", "$1")+` AND mpi.planned_on = $2`,
 			userID, day,
 		).Scan(&id, &source, &n)
 		if err == nil && n > 1 {
@@ -303,8 +306,8 @@ func DeleteMealPlanItem(ctx context.Context, userID, itemID int) error {
 	tag, err := Pool.Exec(ctx, `
 		DELETE FROM meal_plan_items mpi
 		USING meal_plans mp
-		WHERE mpi.id = $1 AND mpi.meal_plan_id = mp.id AND mp.user_id = $2`,
-		itemID, userID,
+		WHERE mpi.id = $2 AND mpi.meal_plan_id = mp.id AND `+inScope("mp", "$1"),
+		userID, itemID,
 	)
 	if err != nil {
 		return err
@@ -343,8 +346,8 @@ func SetBatchCook(ctx context.Context, userID, itemID int, days []time.Time, ser
 		FROM meal_plan_items mpi
 		JOIN meal_plans mp ON mp.id = mpi.meal_plan_id
 		JOIN recipes r ON r.id = mpi.recipe_id
-		WHERE mpi.id = $1 AND mp.user_id = $2`,
-		itemID, userID,
+		WHERE mpi.id = $2 AND `+inScope("mp", "$1"),
+		userID, itemID,
 	).Scan(&cook.ID, &cook.RecipeID, &cook.RecipeTitle, &cookDate, &cook.Servings, &cook.MealSlot, &source); err != nil {
 		return nil, err
 	}
@@ -380,7 +383,7 @@ func SetBatchCook(ctx context.Context, userID, itemID int, days []time.Time, ser
 		if _, err = tx.Exec(ctx, `
 			DELETE FROM meal_plan_items mpi
 			USING meal_plans mp
-			WHERE mpi.meal_plan_id = mp.id AND mp.user_id = $1 AND mpi.planned_on = $2
+			WHERE mpi.meal_plan_id = mp.id AND `+inScope("mp", "$1")+` AND mpi.planned_on = $2
 			  AND mpi.meal_slot = $3 AND mpi.source_item_id IS DISTINCT FROM $4`,
 			userID, d, cook.MealSlot, itemID,
 		); err != nil {
@@ -433,7 +436,8 @@ func SetBatchCook(ctx context.Context, userID, itemID int, days []time.Time, ser
 // a day is filed under.
 func weekStartOf(ctx context.Context, q queryRower, userID int) string {
 	var day string
-	if err := q.QueryRow(ctx, `SELECT week_start_day FROM users WHERE id = $1`, userID).Scan(&day); err != nil {
+	if err := q.QueryRow(ctx, `SELECT week_start_day FROM users WHERE id = $1`,
+		kitchenOwner(ctx, q, userID)).Scan(&day); err != nil {
 		return "monday"
 	}
 	return day

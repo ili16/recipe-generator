@@ -82,10 +82,10 @@ func insertIngredientsAndSteps(ctx context.Context, tx pgx.Tx, recipeID int, doc
 	for _, step := range doc.Steps {
 		var stepID int64
 		err := tx.QueryRow(ctx, `
-			INSERT INTO recipe_steps (recipe_id, sort_order, step_text, timer_seconds, temperature_c)
-			VALUES ($1,$2,$3,$4,$5)
+			INSERT INTO recipe_steps (recipe_id, sort_order, step_text, timer_seconds, temperature_c, phase, parallel_group)
+			VALUES ($1,$2,$3,$4,$5,$6,$7)
 			RETURNING id`,
-			recipeID, step.SortOrder, step.StepText, step.TimerSeconds, step.TemperatureC,
+			recipeID, step.SortOrder, step.StepText, step.TimerSeconds, step.TemperatureC, step.Phase, step.ParallelGroup,
 		).Scan(&stepID)
 		if err != nil {
 			return err
@@ -131,11 +131,11 @@ func AddRecipeStructured(ctx context.Context, userID int, doc model.RecipeDocume
 	var recipeID int
 	err = tx.QueryRow(ctx, `
 		INSERT INTO recipes
-			(user_id, title, summary, language, servings, total_minutes, prep_minutes, cook_minutes,
+			(user_id, household_id, title, summary, language, servings, total_minutes, prep_minutes, cook_minutes,
 			 difficulty, calories, protein_g, carbs_g, fat_g,
 			 source_type, content, ai_model, ai_prompt_version, current_version,
 			 variant_of_recipe_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+		VALUES ($1,`+stampHousehold+`,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
 		RETURNING id`,
 		userID, doc.Title, doc.Summary, doc.Language,
 		doc.Servings, doc.TotalMinutes, doc.PrepMinutes, doc.CookMinutes, doc.Difficulty,
@@ -383,7 +383,7 @@ func GetRecipeByID(ctx context.Context, userID, recipeID int) (model.Recipe, err
 		       rv.vote
 		FROM recipes r
 		LEFT JOIN recipe_votes rv ON rv.recipe_id = r.id AND rv.user_id = $2
-		WHERE r.id = $1 AND r.user_id = $2 AND r.deleted_at IS NULL`,
+		WHERE r.id = $1 AND `+inScope("r", "$2")+` AND r.deleted_at IS NULL`,
 		recipeID, userID,
 	).Scan(
 		&recipe.ID, &recipe.Recipename, &recipe.Recipe, &recipe.ManuallyEdited,
@@ -416,13 +416,13 @@ func GetRecipeByID(ctx context.Context, userID, recipeID int) (model.Recipe, err
 	}
 
 	stepRows, err := Pool.Query(ctx, `
-		SELECT sort_order, step_text, timer_seconds, temperature_c
+		SELECT sort_order, step_text, timer_seconds, temperature_c, phase, parallel_group
 		FROM recipe_steps WHERE recipe_id = $1 ORDER BY sort_order`, recipeID)
 	if err == nil {
 		defer stepRows.Close()
 		for stepRows.Next() {
 			var step model.RecipeStep
-			if scanErr := stepRows.Scan(&step.SortOrder, &step.StepText, &step.TimerSeconds, &step.TemperatureC); scanErr == nil {
+			if scanErr := stepRows.Scan(&step.SortOrder, &step.StepText, &step.TimerSeconds, &step.TemperatureC, &step.Phase, &step.ParallelGroup); scanErr == nil {
 				doc.Steps = append(doc.Steps, step)
 			}
 		}
@@ -465,7 +465,7 @@ func GetRecipeByID(ctx context.Context, userID, recipeID int) (model.Recipe, err
 func GetRecipeVersions(ctx context.Context, userID, recipeID int) ([]model.RecipeVersion, error) {
 	var exists bool
 	if err := Pool.QueryRow(ctx, `
-		SELECT EXISTS(SELECT 1 FROM recipes WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL)`,
+		SELECT EXISTS(SELECT 1 FROM recipes r WHERE r.id = $1 AND `+inScope("r", "$2")+` AND r.deleted_at IS NULL)`,
 		recipeID, userID,
 	).Scan(&exists); err != nil {
 		return nil, err
@@ -509,8 +509,9 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 		       -- Same prep+cook fallback the client used to do per-recipe; NULLIF keeps
 		       -- "unknown" distinct from "zero minutes".
 		       NULLIF(COALESCE(r.total_minutes, COALESCE(r.prep_minutes, 0) + COALESCE(r.cook_minutes, 0)), 0),
-		       pm.total, pm.have
+		       pm.total, pm.have, r.user_id = $1, COALESCE(owner.name, '')
 		FROM recipes r
+		JOIN users owner ON owner.id = r.user_id
 		LEFT JOIN recipe_votes rv ON rv.recipe_id = r.id AND rv.user_id = $1
 		-- Pantry match (BACKLOG 7.3): how many of this recipe's ingredients the caller
 		-- already has. Matched on the normalised *name* only — "250 g flour" and "2 cups
@@ -521,12 +522,12 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 			SELECT count(*) AS total,
 			       count(*) FILTER (
 			           WHERE EXISTS (SELECT 1 FROM pantry_items p
-			                         WHERE p.user_id = $1 AND p.name = lower(btrim(ri.item)))
+			                         WHERE `+inScope("p", "$1")+` AND p.name = lower(btrim(ri.item)))
 			       ) AS have
 			FROM recipe_ingredients ri
 			WHERE ri.recipe_id = r.id AND btrim(ri.item) <> ''
 		) pm ON TRUE
-		WHERE r.user_id = $1 AND r.deleted_at IS NULL ORDER BY r.updated_at DESC`, userid)
+		WHERE `+inScope("r", "$1")+` AND r.deleted_at IS NULL ORDER BY r.updated_at DESC`, userid)
 	if err != nil {
 		slog.Error("Failed to query recipes", "error", err)
 		return nil, err
@@ -537,7 +538,7 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 		var recipe model.Recipe
 		err := rows.Scan(&recipe.ID, &recipe.Recipename, &recipe.Recipe, &recipe.ManuallyEdited, &recipe.MyVote, &recipe.VariantOfRecipeID,
 			&recipe.SourceType, &recipe.SourceURL, &recipe.CreatedAt, &recipe.Servings, &recipe.LastCookedAt, &recipe.CookedRating, &recipe.ShareToken, &recipe.Calories, &recipe.TotalMinutes,
-			&recipe.PantryTotal, &recipe.PantryHave)
+			&recipe.PantryTotal, &recipe.PantryHave, &recipe.OwnedByMe, &recipe.OwnerName)
 		if err != nil {
 			rows.Close()
 			slog.Error("Failed to scan recipe", "error", err)
@@ -551,7 +552,7 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 		SELECT rt.recipe_id, t.slug
 		FROM recipe_tags rt
 		JOIN tags t ON t.id = rt.tag_id
-		WHERE rt.recipe_id = ANY(SELECT id FROM recipes WHERE user_id = $1 AND deleted_at IS NULL)`, userid)
+		WHERE rt.recipe_id = ANY(SELECT r.id FROM recipes r WHERE `+inScope("r", "$1")+` AND r.deleted_at IS NULL)`, userid)
 	if err != nil {
 		slog.Error("Failed to query recipe tags", "error", err)
 		return nil, err

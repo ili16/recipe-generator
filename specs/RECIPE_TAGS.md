@@ -6,7 +6,11 @@ number of groups (e.g. `main-courses` + `vegan` + `30-minute-meals` + `air-fryer
 
 ## Taxonomy
 
-Fixed vocabulary, ~38 tags across 6 groups. This list is the single source of truth — mirrored
+Fixed vocabulary, ~40 tags across 6 groups. Generation always assigns **exactly one** of
+`breakfast-brunch` / `lunch` / `dinner` / `snacks` — when the dish is eaten, which is what the
+library card's category badge reads — on top of whatever else in `meal_type` applies (a soup can
+be `lunch` + `main-courses`). Recipes saved before migration `00031` have no slot tag; the badge
+falls back to their other meal-type tag. This list is the single source of truth — mirrored
 as a Go constant (`internal/service` schema/validation) and a TS constant
 (`src/constants/tags.ts`, frontend filter UI). It is not user-editable and has no admin
 endpoint; adding a tag means updating both constants plus a migration seed row.
@@ -14,6 +18,8 @@ endpoint; adding a tag means updating both constants plus a migration seed row.
 | Group (`tag_group`) | Label | Slug |
 |---|---|---|
 | meal_type | Breakfast & Brunch | `breakfast-brunch` |
+| meal_type | Lunch | `lunch` |
+| meal_type | Dinner | `dinner` |
 | meal_type | Appetizers & Starters | `appetizers-starters` |
 | meal_type | Main Courses | `main-courses` |
 | meal_type | Side Dishes | `side-dishes` |

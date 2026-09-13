@@ -18,15 +18,19 @@ var (
 
 const dateLayout = "2006-01-02"
 
-// Every function here scopes by user_id, so another user's item id is indistinguishable
-// from a missing one (BACKLOG 7.1): pgx.ErrNoRows, which the handlers turn into 404.
+// Every function here scopes by the caller's kitchen -- their household when they are in
+// one, themselves otherwise (inScope, scope.go) -- so an item outside it is
+// indistinguishable from a missing one (BACKLOG 7.1): pgx.ErrNoRows, which the handlers
+// turn into 404. A household has one fridge, so a member sees and edits every line in it;
+// the user_id on the row only records who put it there, and is what it reverts to when
+// the household ends.
 
-// ListPantryItems returns userID's pantry, expiring items first so 7.4's "use first" is
+// ListPantryItems returns the caller's kitchen's pantry, expiring items first so 7.4's "use first" is
 // the natural reading order; items with no expiry sort last.
 func ListPantryItems(ctx context.Context, userID int) ([]model.PantryItem, error) {
 	rows, err := Pool.Query(ctx, `
 		SELECT id, name, quantity, unit, category, expires_on
-		FROM pantry_items WHERE user_id = $1
+		FROM pantry_items WHERE `+inScope("pantry_items", "$1")+`
 		ORDER BY expires_on ASC NULLS LAST, name`, userID)
 	if err != nil {
 		return nil, err
@@ -78,9 +82,9 @@ func UpsertPantryItem(ctx context.Context, userID int, in model.PantryItem) (mod
 	}
 
 	row := Pool.QueryRow(ctx, `
-		INSERT INTO pantry_items (user_id, name, quantity, unit, category, expires_on)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		ON CONFLICT (user_id, name, COALESCE(unit, '')) DO UPDATE
+		INSERT INTO pantry_items (user_id, household_id, name, quantity, unit, category, expires_on)
+		VALUES ($1, `+stampHousehold+`, $2, $3, $4, $5, $6)
+		ON CONFLICT (COALESCE(household_id::text, 'u' || user_id), name, COALESCE(unit, '')) DO UPDATE
 		SET quantity = EXCLUDED.quantity, category = EXCLUDED.category,
 		    expires_on = EXCLUDED.expires_on, updated_at = NOW()
 		RETURNING id, name, quantity, unit, category, expires_on`,
@@ -88,9 +92,10 @@ func UpsertPantryItem(ctx context.Context, userID int, in model.PantryItem) (mod
 	return scanPantryItem(row)
 }
 
-// DeletePantryItem removes one item of userID's. Anyone else's id is not-found.
+// DeletePantryItem removes one item from the caller's kitchen. Anything outside it is
+// not-found.
 func DeletePantryItem(ctx context.Context, userID, itemID int) error {
-	tag, err := Pool.Exec(ctx, `DELETE FROM pantry_items WHERE id = $1 AND user_id = $2`, itemID, userID)
+	tag, err := Pool.Exec(ctx, `DELETE FROM pantry_items WHERE id = $2 AND `+inScope("pantry_items", "$1"), userID, itemID)
 	if err != nil {
 		return err
 	}
@@ -128,8 +133,8 @@ func parseDatePtr(s *string) (*time.Time, error) {
 	return &d, nil
 }
 
-// RecipesUsingIngredients maps recipe id → which of names that recipe uses, for userID's
-// live recipes. names are matched as normalised ingredient names (model.NormalizeItem), the
+// RecipesUsingIngredients maps recipe id → which of names that recipe uses, across the
+// live recipes the caller can see. names are matched as normalised ingredient names (model.NormalizeItem), the
 // same key the pantry and the grocery list use — so "use up the spinach" finds the recipe
 // that lists "Spinach", whatever amount it asks for (BACKLOG 7.4).
 //
@@ -149,7 +154,7 @@ func RecipesUsingIngredients(ctx context.Context, userID int, names []string) (m
 		SELECT DISTINCT ri.recipe_id, lower(btrim(ri.item))
 		FROM recipe_ingredients ri
 		JOIN recipes r ON r.id = ri.recipe_id
-		WHERE r.user_id = $1 AND r.deleted_at IS NULL
+		WHERE `+inScope("r", "$1")+` AND r.deleted_at IS NULL
 		  AND lower(btrim(ri.item)) = ANY($2::text[])`, userID, normalised)
 	if err != nil {
 		return nil, err

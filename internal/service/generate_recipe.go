@@ -148,8 +148,15 @@ func recipeJSONSchema() map[string]any {
 			"timer_seconds":      llm.Nullable("integer"),
 			"temperature_c":      llm.Nullable("integer"),
 			"ingredient_indices": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}},
+			"phase": map[string]any{
+				"anyOf": []any{
+					map[string]any{"type": "string", "enum": []string{"prep", "cook", "wait"}},
+					map[string]any{"type": "null"},
+				},
+			},
+			"parallel_group": llm.Nullable("integer"),
 		},
-		"required":             []string{"sort_order", "step_text", "timer_seconds", "temperature_c", "ingredient_indices"},
+		"required":             []string{"sort_order", "step_text", "timer_seconds", "temperature_c", "ingredient_indices", "phase", "parallel_group"},
 		"additionalProperties": false,
 	}
 	return map[string]any{
@@ -230,6 +237,59 @@ func generateRefineFromMessages(ctx context.Context, messages []openai.ChatCompl
 		return model.RefineResult{}, errors.New("applied status missing recipe")
 	}
 	return result, nil
+}
+
+// ReviewCookFlow re-plans how a recipe is cooked: it merges steps too thin to be worth a
+// screen, labels each one prep/cook/wait, and marks the steps a cook does at the same
+// time. Only the steps array (and the timings that follow from it) changes — the
+// ingredients come back untouched, which this verifies rather than trusts, since a flow
+// review that quietly rewrote the shopping list would be a much worse bug than a bad flow.
+func ReviewCookFlow(ctx context.Context, doc model.RecipeDocument) (model.RecipeDocument, error) {
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		return model.RecipeDocument{}, fmt.Errorf("marshal document: %w", err)
+	}
+	messages := []openai.ChatCompletionMessageParamUnion{
+		openai.SystemMessage(buildSystemPrompt(doc.Language) + llm.CookFlowAddendum),
+		openai.UserMessage(string(raw)),
+	}
+	out, err := generateStructuredFromMessages(ctx, "cook_flow", messages)
+	if err != nil {
+		return model.RecipeDocument{}, err
+	}
+	if !sameIngredients(doc.Ingredients, out.Ingredients) {
+		return model.RecipeDocument{}, errors.New("cook flow review changed the ingredients")
+	}
+	// The model is told to return these as given; a stray edit to the title or the
+	// nutrition is not worth a second round-trip, so pin them back instead.
+	out.Ingredients = doc.Ingredients
+	out.Title, out.Tags, out.Servings = doc.Title, doc.Tags, doc.Servings
+	out.Calories, out.ProteinG, out.CarbsG, out.FatG = doc.Calories, doc.ProteinG, doc.CarbsG, doc.FatG
+	return out, nil
+}
+
+// sameIngredients reports whether two ingredient lists name the same things in the same
+// amounts. Compared on what a shopper would notice — item, quantity, unit — not on the
+// nullable annotations (section, category) a regeneration may legitimately fill in.
+func sameIngredients(a, b []model.RecipeIngredient) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	eqNum := func(x, y *float64) bool {
+		return (x == nil) == (y == nil) && (x == nil || *x == *y)
+	}
+	eqStr := func(x, y *string) bool {
+		return (x == nil) == (y == nil) && (x == nil || *x == *y)
+	}
+	for i := range a {
+		if !strings.EqualFold(strings.TrimSpace(a[i].Item), strings.TrimSpace(b[i].Item)) ||
+			!eqNum(a[i].Quantity, b[i].Quantity) ||
+			!eqStr(a[i].Unit, b[i].Unit) ||
+			a[i].Optional != b[i].Optional {
+			return false
+		}
+	}
+	return true
 }
 
 // generateStructured runs the structured-recipe completion for a fresh generation (a

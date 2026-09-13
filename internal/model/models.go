@@ -35,6 +35,14 @@ type RecipeStep struct {
 	TimerSeconds      *int   `json:"timer_seconds"`
 	TemperatureC      *int   `json:"temperature_c"`
 	IngredientIndices []int  `json:"ingredient_indices,omitempty"`
+	// Phase is which part of the cook this step belongs to: "prep" (mise en place),
+	// "cook" (the heat is on and it wants attention) or "wait" (passive — marinating,
+	// proofing, resting, cooling). nil on everything generated before this existed;
+	// cooking mode then renders one unlabelled run of steps, exactly as it always did.
+	Phase *string `json:"phase"`
+	// ParallelGroup marks steps a cook does at the same time: consecutive steps sharing a
+	// non-nil value are one concurrent block. nil means the step runs on its own.
+	ParallelGroup *int `json:"parallel_group"`
 }
 
 type RecipeDocument struct {
@@ -91,6 +99,13 @@ type Recipe struct {
 	// ingredients or the pantry is empty, which is the client's cue to show no badge.
 	PantryHave  int `json:"pantry_have"`
 	PantryTotal int `json:"pantry_total"`
+	// OwnedByMe and OwnerName describe a household's shared library (BACKLOG 15.3): a
+	// recipe is personal property lent to the household, so every member can open, cook
+	// and plan it and only the owner can rewrite it. The client uses these to name the
+	// owner on the card and to leave out the actions it must not offer. Set by GetRecipes
+	// only; outside a household OwnedByMe is always true and the name goes unused.
+	OwnedByMe bool   `json:"owned_by_me"`
+	OwnerName string `json:"owner_name,omitempty"`
 	// LastCookedAt is when the owner last marked this cooked (BACKLOG 6.3). nil means
 	// never. Recent ones are held back from meal-plan candidates for CookedCooldown.
 	LastCookedAt *time.Time `json:"last_cooked_at,omitempty"`
@@ -112,6 +127,27 @@ type Collection struct {
 	ID        int    `json:"id"`
 	Name      string `json:"name"`
 	RecipeIDs []int  `json:"recipe_ids"`
+}
+
+// Household is a closed group sharing one kitchen (BACKLOG 15.1): one pantry, one week,
+// one grocery list, and a library everyone can cook from but only the owner can rewrite.
+//
+// ID is stable identity; JoinCode is the credential and is rotatable, so a member who
+// leaves does not keep a permanent key back in. Both are sent only to members.
+type Household struct {
+	ID       string            `json:"id"`
+	Name     string            `json:"name"`
+	JoinCode string            `json:"join_code"`
+	Members  []HouseholdMember `json:"members"`
+}
+
+// HouseholdMember is one person in it. Deliberately thin — a household has no roles and
+// no admin, so there is nothing to say about a member beyond who they are.
+type HouseholdMember struct {
+	ID    int    `json:"id"`
+	Name  string `json:"name"`
+	Email string `json:"email"`
+	IsMe  bool   `json:"is_me"`
 }
 
 // UserPreferences is the explicit profile settings a user can set about themselves:

@@ -54,7 +54,17 @@ type tool struct {
 	Description string
 	Params      map[string]any
 	NeedsAuth   bool
-	Run         toolFunc
+	// Mutating gates the call behind the user's explicit approval instead of the
+	// model's prose (BACKLOG.md 10.2): the loop emits event: approval_request and
+	// stops, and the call only runs once the user says Apply.
+	//
+	// The gate is on *scope*, not on "does it write". A single row the user named in
+	// their own message is its own confirmation — save_recipe ("save it") and
+	// set_plan_day ("put the curry on Thursday") write silently, because asking again
+	// is noise. What asks is the multi-day write, the destructive one, and the one
+	// that changes every future turn: apply_week_plan, clear_plan_day, set_preferences.
+	Mutating bool
+	Run      toolFunc
 }
 
 // obj builds a JSON-schema object for a tool's parameters. Only required lists names the
@@ -93,6 +103,11 @@ var chatTools = map[string]tool{
 			"instruction": str("The change to make, in the user's own words"),
 		}, "target", "instruction"),
 		Run: toolTransformRecipe,
+	},
+	"review_cook_flow": {
+		Description: "Re-plan how a recipe is cooked, without changing the recipe. Merges steps too small to be worth their own screen, labels each step as mise en place / cook / wait, and marks the steps that should run at the same time (chopping while the water boils). Ingredients, quantities and the dish itself are never touched. Use it when a recipe's steps are fiddly, out of order, or written as a list of one-line actions, and when the user asks how to actually cook something. target is a draft_ref or a saved recipe id.",
+		Params:      obj(map[string]any{"target": str("A draft_ref, or the id of a saved recipe")}, "target"),
+		Run:         toolReviewCookFlow,
 	},
 	"search_my_recipes": {
 		Description: "Search the user's saved recipes by title text, tags, and/or ingredients they use. Returns id, title and tags only.",
@@ -138,27 +153,28 @@ var chatTools = map[string]tool{
 				"type":        "array",
 				"description": "One entry per day to write",
 				"items": obj(map[string]any{
-					"date":      str("The day to fill, YYYY-MM-DD"),
-					"recipe_id": integer("A saved recipe's id"),
-					"draft_ref": str("A draft_ref (e.g. from plan_week's variant_drafts) to save first, then plan"),
-					"servings":  integer("Portions wanted that day; omit for the recipe as written"),
-					"meal_slot": str("Which meal of the day: breakfast, lunch, dinner or snack. Omit for dinner. A day can hold one entry per slot, so list a lunch and a dinner as two entries."),
+					"date":        str("The day to fill, YYYY-MM-DD"),
+					"recipe_id":   integer("A saved recipe's id"),
+					"draft_ref":   str("A draft_ref (e.g. from plan_week's variant_drafts) to save first, then plan"),
+					"servings":    integer("Portions wanted that day; omit for the recipe as written"),
+					"meal_slot":   str("Which meal of the day: breakfast, lunch, dinner or snack. Omit for dinner. A day can hold one entry per slot, so list a lunch and a dinner as two entries."),
 					"leftover_of": str("The YYYY-MM-DD day whose cooking this meal eats again — set it on every day that is leftovers of an earlier day's pot, and give that day the same recipe_id. Omit when the meal is cooked fresh. Clearing the cooking day clears its leftovers with it."),
 				}, "date"),
 			},
 			"confirm": map[string]any{"type": "boolean", "description": "Set true to go ahead and replace days that are already planned"},
 		}, "days"),
 		NeedsAuth: true,
+		Mutating:  true,
 		Run:       toolApplyWeekPlan,
 	},
 	"set_plan_day": {
 		Description: "Put one recipe on one day of the user's saved meal plan. Only call this when the user has asked for that one specific day to change; to apply a whole plan use apply_week_plan.",
 		Params: obj(map[string]any{
-			"date":      str("The day to fill, YYYY-MM-DD"),
-			"recipe_id": integer("A saved recipe's id"),
-			"draft_ref": str("A draft_ref to save first, then plan"),
-			"servings":  integer("Portions wanted that day; omit for the recipe as written"),
-			"meal_slot": str("Which meal of the day: breakfast, lunch, dinner or snack. Omit for dinner. This replaces only that slot, leaving the day's other meals alone."),
+			"date":        str("The day to fill, YYYY-MM-DD"),
+			"recipe_id":   integer("A saved recipe's id"),
+			"draft_ref":   str("A draft_ref to save first, then plan"),
+			"servings":    integer("Portions wanted that day; omit for the recipe as written"),
+			"meal_slot":   str("Which meal of the day: breakfast, lunch, dinner or snack. Omit for dinner. This replaces only that slot, leaving the day's other meals alone."),
 			"leftover_of": str("The YYYY-MM-DD day whose cooking this meal eats again, with the same recipe_id. Omit when it is cooked fresh."),
 		}, "date"),
 		NeedsAuth: true,
@@ -171,6 +187,7 @@ var chatTools = map[string]tool{
 			"meal_slot": str("Clear only this meal: breakfast, lunch, dinner or snack. Omit to clear the entire day."),
 		}, "date"),
 		NeedsAuth: true,
+		Mutating:  true,
 		Run:       toolClearPlanDay,
 	},
 	"get_preferences": {
@@ -185,6 +202,7 @@ var chatTools = map[string]tool{
 			"patch": map[string]any{"type": "object", "description": "Fields to change, e.g. {\"dietary_prefs\": [\"vegetarian\"]}"},
 		}, "patch"),
 		NeedsAuth: true,
+		Mutating:  true,
 		Run:       toolSetPreferences,
 	},
 	"fetch_url": {
@@ -325,6 +343,29 @@ func toolTransformRecipe(ctx context.Context, s *chatSession, args json.RawMessa
 	return s.addDraft(*result.Recipe, s.draftInfo[strings.TrimSpace(a.Target)].origin)
 }
 
+func toolReviewCookFlow(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
+	var a struct {
+		Target string `json:"target"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return nil, nil, errors.New("could not read the arguments")
+	}
+	doc, err := s.resolveRecipe(ctx, a.Target)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(doc.Steps) == 0 {
+		return nil, nil, errors.New("that recipe has no steps to re-plan")
+	}
+	out, err := ReviewCookFlow(ctx, doc)
+	if err != nil {
+		return nil, nil, errors.New("could not re-plan the cooking flow for that recipe")
+	}
+	// The result is a new draft, not a write: like every other proposal in this catalog it
+	// is the user's to save. A saved-id target has no provenance to inherit.
+	return s.addDraft(out, s.draftInfo[strings.TrimSpace(a.Target)].origin)
+}
+
 func toolSearchMyRecipes(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
 	var a struct {
 		Query       string   `json:"query"`
@@ -440,7 +481,15 @@ func toolSaveRecipe(ctx context.Context, s *chatSession, args json.RawMessage) (
 	if err != nil {
 		return nil, nil, err
 	}
-	return map[string]any{"recipe_id": id, "title": doc.Title}, nil, nil
+	// Re-emit the draft's card carrying its new recipe_id. The client folds artifacts by
+	// draft_ref, so this replaces the "unsaved draft" card rather than adding a second —
+	// without it a recipe the model just saved keeps offering to save itself.
+	return map[string]any{"recipe_id": id, "title": doc.Title},
+		&artifact{Kind: "recipe", Data: map[string]any{
+			"draft_ref": strings.TrimSpace(a.DraftRef),
+			"recipe_id": id,
+			"document":  doc,
+		}}, nil
 }
 
 func toolPlanWeek(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
@@ -996,4 +1045,83 @@ func (s *chatSession) saveDraft(ctx context.Context, ref string, tags []string) 
 	s.draftInfo[ref] = info
 	s.drafts[ref] = doc
 	return created.ID, doc, nil
+}
+
+// approvalPreview is what a mutating call will replace, read before it runs so the
+// approval card can mark it (BACKLOG.md 10.2). Read-only by construction — it must not
+// resolve drafts the way resolvePlanDays does, because nothing has been approved yet and
+// saving a draft is itself a write.
+//
+// An empty list is not a failure: it means the call replaces nothing, and the card shows
+// only what will be written. Errors are swallowed for the same reason — a failed preview
+// must not block the approval, only leave it unannotated.
+func approvalPreview(ctx context.Context, s *chatSession, name string, args json.RawMessage) []map[string]any {
+	switch name {
+	case "apply_week_plan":
+		var a struct {
+			Days []planDayArg `json:"days"`
+		}
+		if json.Unmarshal(args, &a) != nil || len(a.Days) == 0 {
+			return nil
+		}
+		wanted := map[string]int{} // (date, slot) -> recipe id the plan wants there, 0 for a draft
+		var first, last time.Time
+		for _, d := range a.Days {
+			day, err := time.Parse(time.DateOnly, d.Date)
+			if err != nil || day.Before(today()) {
+				continue
+			}
+			slot := d.MealSlot
+			if slot == "" {
+				slot = storage.DefaultMealSlot
+			}
+			wanted[d.Date+" "+slot] = d.RecipeID
+			if first.IsZero() || day.Before(first) {
+				first = day
+			}
+			if day.After(last) {
+				last = day
+			}
+		}
+		if first.IsZero() {
+			return nil
+		}
+		return replacedItems(ctx, s, first, last, func(item model.MealPlanItem) bool {
+			id, ok := wanted[item.PlannedOn+" "+item.MealSlot]
+			// A draft (id 0) has no saved recipe yet, so it always replaces what is there.
+			return ok && item.RecipeID != id
+		})
+	case "clear_plan_day":
+		var a struct {
+			Date     string `json:"date"`
+			MealSlot string `json:"meal_slot"`
+		}
+		if json.Unmarshal(args, &a) != nil {
+			return nil
+		}
+		day, err := time.Parse(time.DateOnly, a.Date)
+		if err != nil {
+			return nil
+		}
+		return replacedItems(ctx, s, day, day, func(item model.MealPlanItem) bool {
+			return a.MealSlot == "" || item.MealSlot == a.MealSlot
+		})
+	}
+	return nil
+}
+
+// replacedItems renders the planned items in [first, last] that keep matches, in the
+// shape wouldOverwrite uses — one vocabulary for "this day already holds something".
+func replacedItems(ctx context.Context, s *chatSession, first, last time.Time, keep func(model.MealPlanItem) bool) []map[string]any {
+	existing, err := storage.GetMealPlanRange(ctx, s.userID, first, last)
+	if err != nil {
+		return nil
+	}
+	out := []map[string]any{}
+	for _, item := range existing {
+		if keep(item) {
+			out = append(out, map[string]any{"date": item.PlannedOn, "meal_slot": item.MealSlot, "current_recipe": item.RecipeTitle})
+		}
+	}
+	return out
 }

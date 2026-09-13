@@ -28,6 +28,15 @@ var RefineJudgmentAddendum string
 //go:embed prompts/variant_addendum.txt
 var VariantAddendum string
 
+// CookFlowAddendum turns the structured-recipe prompt into a steps-only rewrite: group
+// the steps into mise en place / cook / wait, merge the ones too thin to stand on a
+// screen, and mark what runs at the same time. Appended after StructuredRecipePrompt
+// (never interleaved) because it leans on that file's granularity/phase/parallelism rules
+// rather than restating them.
+//
+//go:embed prompts/cook_flow.txt
+var CookFlowAddendum string
+
 //go:embed prompts/meal_plan_suggest_base.txt
 var MealPlanSuggestBase string
 
@@ -63,4 +72,4 @@ func promptHash(parts ...string) string {
 // embedded files. Replaces the old hand-bumped promptVersion = "v4" constant (which
 // covered only 2 of them): this one changes when, and only when, one of these files
 // changes, with no commit-time discipline required.
-var PromptVersion = promptHash(StructuredRecipePrompt, NoCarryOverTimeNote, RefineJudgmentAddendum, VariantAddendum)
+var PromptVersion = promptHash(StructuredRecipePrompt, NoCarryOverTimeNote, RefineJudgmentAddendum, VariantAddendum, CookFlowAddendum)

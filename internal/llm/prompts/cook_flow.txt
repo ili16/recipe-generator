@@ -1,0 +1,20 @@
+
+
+COOK FLOW REVIEW — this is the whole task.
+
+You are given a complete recipe document as JSON. Rewrite ONLY its `steps` array so it reads as a cooking flow a person can actually work from, and return the whole document.
+
+Everything except `steps` is returned exactly as given. Do not change the title, the summary, the language, the tags, the servings, the difficulty, the nutrition, and above all not the ingredients — not their wording, their order, their quantities, their units, their sections, their categories, or how many there are. You are not improving the recipe. You are re-planning how it is cooked.
+
+Rewrite the steps by applying the step granularity, step phase and parallelism rules above to what is there:
+
+1. Merge. Thin steps that are one action each get folded into the step they belong to. This is usually the biggest change: a 14-step list is often a 6-step cook.
+2. Phase. Every step gets prep, cook or wait.
+3. Parallelise. Find the long hands-off steps — water heating, oven preheating, something simmering, roasting, resting — and pull the hands-on work that fits inside them into the same parallel_group. This is the point of the review: a cook who boils water, then chops, then cooks, has been made to cook slowly by the way the steps were written.
+4. Re-time. Set timer_seconds to each step's real duration after merging. Drop timers under a minute unless the seconds genuinely matter.
+5. Renumber. sort_order runs 1, 2, 3, … with no gaps, in the order the cook works through them. Steps in the same parallel_group are consecutive and ordered longest-first.
+6. Re-point. ingredient_indices must still be correct after merging — a merged step uses every ingredient its parts used. The indices point into the unchanged ingredients array.
+
+Keep every instruction the original steps carried. Merging means combining sentences, never dropping a temperature, a quantity, a doneness cue or a technique. If the original steps are already well-sized, well-phased and correctly parallel, return them essentially unchanged rather than inventing differences.
+
+Recompute total_minutes, prep_minutes and cook_minutes from the rewritten steps — parallelism means the real total is now less than the sum of the parts, and that is exactly the number worth reporting.

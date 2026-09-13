@@ -118,6 +118,16 @@ into "Dough" / "Sauce" blocks.
 `recipe_steps` carries `timer_seconds` and `temperature_c` so the mobile app can render
 in-step timers without re-parsing prose.
 
+Since migration `00032` it also carries the **cook flow** (BACKLOG 12.0): `phase`
+(`prep|cook|wait`, CHECK-constrained) and `parallel_group` (an integer; **consecutive** steps
+sharing a non-null value happen at the same time). Both are nullable and were **not backfilled**
+— nothing in a stored step says which phase it is, and a guess would write a fact the model never
+asserted. NULL in both is therefore meaningful and must stay renderable: it is what every recipe
+saved before 12.0 has, and the client walks it as a flat one-step-per-screen list exactly as
+before. Note that a `parallel_group` value is only meaningful against its neighbours — the same
+integer reused later in the recipe is a *second* block of parallel work, not a continuation of
+the first.
+
 ## Tags
 
 `recipes.category` (a single `main|starter|bread|dessert|other` value) was replaced in

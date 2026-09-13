@@ -41,7 +41,7 @@ func FindDuplicate(ctx context.Context, userID int, title, sourceURL string) (*D
 		       CASE WHEN $3 <> '' AND s.source_url = $3 THEN 'url' ELSE 'title' END AS matched_on
 		FROM recipes r
 		LEFT JOIN sources s ON s.recipe_id = r.id
-		WHERE r.user_id = $1
+		WHERE `+inScope("r", "$1")+`
 		  AND r.deleted_at IS NULL
 		  AND (($3 <> '' AND s.source_url = $3)
 		       OR lower(btrim(r.title)) = lower(btrim($2)))

@@ -319,6 +319,11 @@ func LoadMealPlanSignal(ctx context.Context, userID int, startsOn time.Time) ([]
 	if err != nil {
 		return nil, model.CookingProfile{}, model.UserPreferences{}, err
 	}
+	// What may be served is the whole table's business, not the caller's (BACKLOG 15.1).
+	// Solo this returns the caller's own two arrays unchanged.
+	if dietary, disliked, err := storage.KitchenDietary(ctx, userID); err == nil {
+		prefs.DietaryPrefs, prefs.DislikedIngredients = dietary, disliked
+	}
 	return candidates, profile, prefs, nil
 }
 

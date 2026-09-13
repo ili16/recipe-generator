@@ -3,12 +3,14 @@ package service
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ili16/recipe-generator/internal/model"
+	"github.com/openai/openai-go"
 )
 
 // TestThreadToParamsShape checks the stored thread converts to the message shape the API
@@ -21,7 +23,7 @@ func TestThreadToParamsShape(t *testing.T) {
 		{Role: "assistant", ToolCalls: []model.ToolCall{{ID: "call_1", Name: "generate_recipe", Args: `{"description":"pasta"}`}}},
 		{Role: "tool", Content: `{"draft_ref":"draft_1"}`, ToolCallID: "call_1"},
 		{Role: "assistant", Content: "Here you go."},
-	}, "")
+	}, "", "")
 	if len(params) != 5 {
 		t.Fatalf("expected system + 4 messages, got %d", len(params))
 	}
@@ -89,7 +91,7 @@ func TestDecodeInlineImage(t *testing.T) {
 		{"malformed data url", "data:image/gif;base64" + gif, 0},
 		{"empty", "", 0},
 	} {
-		got, err := decodeInlineImage(tc.in)
+		got, err := DecodeInlineImage(tc.in)
 		switch {
 		case tc.wantN == 0 && err == nil:
 			t.Errorf("%s: accepted %d bytes, want a rejection", tc.name, len(got))
@@ -142,12 +144,12 @@ func TestEmitterTransports(t *testing.T) {
 func TestThreadToParamsLanguage(t *testing.T) {
 	msgs := []model.ConversationMessage{{Role: "user", Content: "cacio e pepe"}}
 
-	plain := threadToParams(msgs, "")
+	plain := threadToParams(msgs, "", "")
 	if got := plain[0].OfSystem.Content.OfString.Value; strings.Contains(got, "device language") {
 		t.Error("no language sent, but the system prompt mentions one")
 	}
 
-	withLang := threadToParams(msgs, "de")
+	withLang := threadToParams(msgs, "de", "")
 	sys := withLang[0].OfSystem.Content.OfString.Value
 	if !strings.Contains(sys, `device language is "de"`) {
 		t.Errorf("system prompt does not carry the locale: %q", sys)
@@ -238,4 +240,99 @@ func TestTurnOutcome(t *testing.T) {
 			t.Errorf("%s: turnOutcome(_, %q) = %q, want %q", c.name, c.code, got, c.want)
 		}
 	}
+}
+
+// Stop (BACKLOG.md 10.1) and the turn deadline are the same cancellation to the loop, and
+// they mean opposite things to the user — one is "I changed my mind", the other "we were
+// too slow".
+func TestHaltCode(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := haltCode(canceled); got != "stopped" {
+		t.Errorf("cancelled: haltCode = %q, want %q", got, "stopped")
+	}
+
+	expired, stop := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer stop()
+	if got := haltCode(expired); got != "timeout" {
+		t.Errorf("deadline: haltCode = %q, want %q", got, "timeout")
+	}
+}
+
+// The approval gate (BACKLOG.md 10.2). Three properties, and the third is the one that
+// breaks the thread if it is wrong: every tool call the parked reply asked for must come
+// back with exactly one tool message, or the next model call is rejected outright.
+func TestApprovalGate(t *testing.T) {
+	call := func(id, name, args string) openai.ChatCompletionMessageToolCall {
+		c := openai.ChatCompletionMessageToolCall{ID: id}
+		c.Function.Name, c.Function.Arguments = name, args
+		return c
+	}
+
+	t.Run("gates on scope, not on writing", func(t *testing.T) {
+		cases := []struct {
+			calls []openai.ChatCompletionMessageToolCall
+			want  int
+		}{
+			{[]openai.ChatCompletionMessageToolCall{call("a", "generate_recipe", "{}")}, -1},
+			// A single row the user named is its own confirmation — neither asks.
+			{[]openai.ChatCompletionMessageToolCall{call("a", "save_recipe", "{}"), call("b", "set_plan_day", "{}")}, -1},
+			{[]openai.ChatCompletionMessageToolCall{call("a", "apply_week_plan", "{}")}, 0},
+			// The first one found, so the calls after it never run against a state the
+			// user has not agreed to.
+			{[]openai.ChatCompletionMessageToolCall{call("a", "get_recipe", "{}"), call("b", "clear_plan_day", "{}"), call("c", "set_preferences", "{}")}, 1},
+		}
+		for _, tc := range cases {
+			if got := firstMutating(tc.calls); got != tc.want {
+				t.Errorf("firstMutating(%v) = %d, want %d", tc.calls, got, tc.want)
+			}
+		}
+	})
+
+	t.Run("approval is the confirmation", func(t *testing.T) {
+		got := approvedArgs(call("a", "apply_week_plan", `{"days":[{"date":"2026-09-20"}]}`))
+		var args map[string]any
+		if err := json.Unmarshal([]byte(got), &args); err != nil {
+			t.Fatalf("approvedArgs produced unparseable JSON: %v", err)
+		}
+		if args["confirm"] != true {
+			t.Errorf("approvedArgs did not set confirm: %s", got)
+		}
+		if args["days"] == nil {
+			t.Errorf("approvedArgs dropped the arguments: %s", got)
+		}
+		// Every other tool is passed through untouched — confirm means nothing to them.
+		if got := approvedArgs(call("a", "clear_plan_day", `{"date":"x"}`)); got != `{"date":"x"}` {
+			t.Errorf("approvedArgs rewrote a non-plan call: %s", got)
+		}
+	})
+
+	// Declining is the case that runs no tool at all, so it is the one where a missing
+	// tool message would go unnoticed until the *next* turn failed.
+	t.Run("declining answers every call and writes nothing", func(t *testing.T) {
+		calls := []openai.ChatCompletionMessageToolCall{
+			call("c1", "clear_plan_day", `{"date":"2026-09-20"}`),
+			call("c2", "get_recipe", `{"id":1}`),
+		}
+		session := &chatSession{}
+		pending := &pendingApproval{id: "p1", assistant: model.ConversationMessage{Role: "assistant", ToolCalls: []model.ToolCall{{ID: "c1"}, {ID: "c2"}}}, calls: calls, index: 0}
+		resumeApproval(context.Background(), func(string, any) {}, session, pending, false)
+
+		if len(session.messages) != 3 {
+			t.Fatalf("got %d messages, want the assistant reply plus one tool result per call", len(session.messages))
+		}
+		for i, want := range []string{"c1", "c2"} {
+			if msg := session.messages[i+1]; msg.Role != "tool" || msg.ToolCallID != want {
+				t.Errorf("message %d = %+v, want a tool result for %s", i+1, msg, want)
+			}
+		}
+		if !strings.Contains(session.messages[1].Content, "did not approve") {
+			t.Errorf("declined call: %s", session.messages[1].Content)
+		}
+		// The call *after* the gated one is reported un-run rather than executed: the
+		// model wrote it expecting the gated write to have happened.
+		if !strings.Contains(session.messages[2].Content, "not run") {
+			t.Errorf("trailing call: %s", session.messages[2].Content)
+		}
+	})
 }

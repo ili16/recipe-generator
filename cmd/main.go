@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,6 +25,11 @@ import (
 	"github.com/jackc/pgx/v5"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
+
+// maxFeedbackBodyBytes bounds the one unauthenticated write in the app. Sized for an
+// attached screenshot travelling inline as base64 (which inflates bytes by ~4/3) plus the
+// prose around it, and still far too small to be worth abusing.
+const maxFeedbackBodyBytes = 8 << 20
 
 func main() {
 	if os.Getenv("LOG_LEVEL") == "debug" {
@@ -72,6 +78,9 @@ func main() {
 	// The one conversational endpoint (specs/AGENT_CHAT.md §2). Every per-capability
 	// AI route it replaced is gone (BACKLOG.md 3.5, 3.9, 3.13).
 	mux.HandleFunc("POST /api/v1/chat", llm(rl, service.HandleChat))
+	// Saving a draft the agent already wrote calls no model, so it is not behind the LLM
+	// stack — but it writes a recipe, so unlike /chat it needs a real user.
+	mux.HandleFunc("POST /api/v1/chat/drafts/save", authenticator.Require(service.HandleSaveChatDraft))
 
 	mux.HandleFunc("GET /api/v1/recipes/trash", authenticator.Require(HandleGetTrash))
 	mux.HandleFunc("POST /api/v1/recipes/{id}/restore", authenticator.Require(HandleRestoreRecipe))
@@ -100,6 +109,14 @@ func main() {
 	mux.HandleFunc("PUT /api/v1/collections/{id}/recipes/{recipeId}", authenticator.Require(HandleSetCollectionMembership))
 	mux.HandleFunc("DELETE /api/v1/collections/{id}/recipes/{recipeId}", authenticator.Require(HandleSetCollectionMembership))
 
+	// Households (BACKLOG 15.1) — no model call, so no rate limiter and no budget guard.
+	mux.HandleFunc("GET /api/v1/household", authenticator.Require(HandleGetHousehold))
+	mux.HandleFunc("POST /api/v1/household", authenticator.Require(HandleCreateHousehold))
+	mux.HandleFunc("POST /api/v1/household/join", authenticator.Require(HandleJoinHousehold))
+	mux.HandleFunc("POST /api/v1/household/leave", authenticator.Require(HandleLeaveHousehold))
+	mux.HandleFunc("POST /api/v1/household/code", authenticator.Require(HandleRotateJoinCode))
+	mux.HandleFunc("DELETE /api/v1/household", authenticator.Require(HandleDisbandHousehold))
+
 	mux.HandleFunc("GET /api/v1/pantry", authenticator.Require(HandleGetPantry))
 	mux.HandleFunc("POST /api/v1/pantry", authenticator.Require(HandleUpsertPantryItem))
 	mux.HandleFunc("DELETE /api/v1/pantry/{id}", authenticator.Require(HandleDeletePantryItem))
@@ -110,6 +127,21 @@ func main() {
 	mux.HandleFunc("DELETE /api/v1/meal-plan/items/{id}", authenticator.Require(HandleDeleteMealPlanItem))
 	mux.HandleFunc("POST /api/v1/meal-plan/items/{id}/covers", authenticator.Require(HandleSetBatchCook))
 	mux.HandleFunc("POST /api/v1/meal-plan/variants/{id}", llm(rl, HandleGenerateVariant))
+
+	// Feedback is deliberately optional-auth (BACKLOG 9.16) — the alpha's testers include
+	// people who never sign in, and a bug report from them is worth the same as anyone's.
+	// Its own limiter, not rl: that budget (5 per 10 min) is sized for LLM calls, and this
+	// is a form. No billing.Guard either — it calls no model. Optional must wrap Guard so
+	// the limiter can see the user and give them the higher budget.
+	// The anon budget is per-IP, so friends behind one NAT share it, and a rejected
+	// request spends from it too — keep it loose enough that an enthusiastic tester
+	// filing several bugs in one sitting never hits it. It is still a hard ceiling.
+	feedbackRL := ratelimit.New(
+		envIntOrDefault("RATE_LIMIT_FEEDBACK_ANON_PER_HOUR", 20),
+		envIntOrDefault("RATE_LIMIT_FEEDBACK_AUTH_PER_HOUR", 40),
+		time.Hour,
+	)
+	mux.HandleFunc("POST /api/v1/feedback", authenticator.Optional(feedbackRL.Guard(HandleCreateFeedback)))
 
 	mux.HandleFunc("GET /api/v1/admin/users", authenticator.RequireAdmin(HandleAdminListUsers))
 	mux.HandleFunc("PATCH /api/v1/admin/users/{id}/budget", authenticator.RequireAdmin(HandleAdminSetBudget))
@@ -951,6 +983,63 @@ func HandleUpdateRecipe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, updated)
+}
+
+// HandleCreateFeedback files a bug report, an idea, or a one-tap "pulse" answer (BACKLOG
+// 9.16). Unlike every other write in this app it does not require a user: a friend testing
+// the alpha who never signed in still hits bugs, and losing those reports is worse than
+// storing a row with a NULL user_id. Being unauthenticated is also why the body is capped
+// and the route is rate limited.
+func HandleCreateFeedback(w http.ResponseWriter, r *http.Request) {
+	// auth.Optional puts a user in the context when there is a valid token and says nothing
+	// when there isn't, so !ok is the anonymous signal, not an error.
+	var userID *int
+	if u, ok := auth.FromContext(r.Context()); ok {
+		userID = &u.ID
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxFeedbackBodyBytes)
+	var req struct {
+		Kind      string          `json:"kind"`
+		Message   string          `json:"message"`
+		Contact   string          `json:"contact"`
+		Sentiment *int16          `json:"sentiment"`
+		Context   json.RawMessage `json:"context"`
+		// A data: URL or bare base64, the same shape /chat takes for a photo.
+		Screenshot string `json:"screenshot"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Same trust boundary as a chat attachment, so the same decoder: it must sniff as an
+	// image or it does not go in the database. A bad image fails the whole report rather
+	// than being dropped silently — the reporter thinks they attached something.
+	var shot []byte
+	if strings.TrimSpace(req.Screenshot) != "" {
+		decoded, err := service.DecodeInlineImage(req.Screenshot)
+		if err != nil {
+			http.Error(w, "Screenshot is not a readable image", http.StatusBadRequest)
+			return
+		}
+		shot = decoded
+	}
+
+	if err := storage.CreateFeedback(r.Context(), userID, req.Kind, req.Message, req.Contact, req.Sentiment, req.Context, shot); err != nil {
+		if errors.Is(err, storage.ErrInvalidFeedback) {
+			http.Error(w, "Feedback needs a message or a rating", http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, storage.ErrScreenshotTooLarge) {
+			http.Error(w, "Screenshot is too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		slog.Error("Error saving feedback", "error", err)
+		http.Error(w, "Error saving feedback", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

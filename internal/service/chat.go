@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -84,6 +85,16 @@ type chatSession struct {
 	// thread resumed from another device should follow that device. Empty when the
 	// client sends none.
 	language string
+	// household is the caller's household name and member count when they are in one
+	// (BACKLOG 15.1), rendered into the system prompt so the assistant knows it is
+	// cooking for a table rather than a person. Empty for everyone else, including every
+	// anonymous caller. One line, not a profile dump — the aggregated household memory
+	// file is 15.6 and is deliberately not this.
+	household string
+	// pending is runTurn's way out: set when the turn stopped on a mutating call the
+	// user has to approve (BACKLOG.md 10.2), and written back to the session state by
+	// the handler. Nil on every turn that ran to completion.
+	pending *pendingApproval
 }
 
 // draftInfo is what a draft carries besides its document: the saved recipe it is a
@@ -112,6 +123,27 @@ type sessionState struct {
 	draftInfo map[string]draftInfo
 	nextDraft int
 	seen      time.Time
+	// pending is the mutating call this thread is waiting on the user to approve
+	// (BACKLOG.md 10.2). At most one: the turn stops at the first one, so a reply
+	// asking for three writes queues the first and reports the rest un-run.
+	pending *pendingApproval
+}
+
+// pendingApproval is a turn parked mid-reply, waiting for Apply or Change it.
+//
+// The assistant message is held here rather than appended to the thread, because a stored
+// assistant message whose tool_calls have no matching tool results is a thread the model
+// API refuses. Approving appends the assistant message and every tool result together, so
+// the thread is only ever valid; abandoning the approval drops the reply entirely, which
+// is also why the model's prose for it is re-generated rather than resumed.
+type pendingApproval struct {
+	// id is what the client echoes back, so a stale card cannot approve a newer call.
+	id string
+	// assistant is the reply that asked for the call, tool_calls included.
+	assistant model.ConversationMessage
+	// calls is that reply's tool calls; index marks the one awaiting approval.
+	calls []openai.ChatCompletionMessageToolCall
+	index int
 }
 
 var sessions = struct {
@@ -192,7 +224,14 @@ func HandleChat(w http.ResponseWriter, r *http.Request) {
 		// Language is the caller's device locale (ISO 639-1). Optional; it only breaks
 		// the tie when the message itself carries no clear language signal — a short
 		// foreign dish name like "cacio e pepe" should not hijack the output language.
-		Language    string `json:"language"`
+		Language string `json:"language"`
+		// Approval answers an event: approval_request from the previous turn on this
+		// thread (BACKLOG.md 10.2). It arrives *instead* of a message: the decision is
+		// the whole turn, and the parked tool call resumes the loop from it.
+		Approval *struct {
+			ID      string `json:"id"`
+			Approve bool   `json:"approve"`
+		} `json:"approval"`
 		Attachments []struct {
 			Type string `json:"type"`
 			URL  string `json:"url"`
@@ -201,7 +240,8 @@ func HandleChat(w http.ResponseWriter, r *http.Request) {
 		} `json:"attachments"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxChatBodyBytes)
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Message) == "" {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil ||
+		(strings.TrimSpace(req.Message) == "" && req.Approval == nil) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -220,7 +260,7 @@ func HandleChat(w http.ResponseWriter, r *http.Request) {
 			if len(images) >= maxChatImages {
 				continue
 			}
-			data, err := decodeInlineImage(a.Data)
+			data, err := DecodeInlineImage(a.Data)
 			if err != nil {
 				http.Error(w, "bad request", http.StatusBadRequest)
 				return
@@ -251,6 +291,29 @@ func HandleChat(w http.ResponseWriter, r *http.Request) {
 	session.images = images
 	session.language = req.Language
 
+	// An approval decision resumes the parked reply instead of starting a turn: no new
+	// user message, no compaction (the thread has not grown since it was compacted for
+	// the turn that parked), and the pending call is consumed whichever way it went.
+	if req.Approval != nil {
+		pending := takePending(state, req.Approval.ID)
+		if pending == nil {
+			emit("error", map[string]string{"code": "approval_expired"})
+			return
+		}
+		mark := len(session.messages)
+		resumeApproval(ctx, emit, session, pending, req.Approval.Approve)
+		_, code := runTurn(ctx, emit, session)
+		telemetry.RecordChatTurn(ctx, turnOutcome(ctx, code))
+		storePending(state, session.pending)
+		persistTurn(ctx, session, state, mark)
+		if code != "" {
+			emit("error", map[string]string{"code": code})
+			return
+		}
+		emit("done", map[string]string{"conversation_id": session.id})
+		return
+	}
+
 	// Compact before the turn, not during it: the summary has to be written to the
 	// thread ahead of this turn's messages to keep the stored order readable, and the
 	// loop below then runs against a thread that already fits.
@@ -262,14 +325,18 @@ func HandleChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	mark := len(session.messages)
 	session.messages = append(session.messages, model.ConversationMessage{Role: "user", Content: req.Message})
 
-	produced, code := runTurn(ctx, emit, session)
+	_, code := runTurn(ctx, emit, session)
 	telemetry.RecordChatTurn(ctx, turnOutcome(ctx, code))
+	// A reply parked on an approval is the one thing that outlives the turn; anything
+	// already stored is stale the moment a new turn runs.
+	storePending(state, session.pending)
 
 	// Persist whatever the turn produced even when it ended on an error — a half-done
 	// turn the user can see must be a half-done turn the next turn can read.
-	persistTurn(ctx, session, state, produced)
+	persistTurn(ctx, session, state, mark)
 
 	if code != "" {
 		emit("error", map[string]string{"code": code})
@@ -319,10 +386,13 @@ func newEmitter(w http.ResponseWriter, r *http.Request) (emit, func(), error) {
 	return func(event string, payload any) { utils.WriteSSE(w, flusher, event, payload) }, func() {}, nil
 }
 
-// decodeInlineImage turns an attachment's `data` into image bytes. It accepts a data:
+// DecodeInlineImage turns an attachment's `data` into image bytes. It accepts a data:
 // URL or bare base64, and rejects anything that doesn't sniff as an image — this is a
 // trust boundary, and the bytes go straight to the model as an image part.
-func decodeInlineImage(s string) ([]byte, error) {
+//
+// Exported because /feedback's screenshot (BACKLOG 9.16) is the same trust boundary with
+// the same two failure modes. One decoder, so a fix to the sniffing applies to both.
+func DecodeInlineImage(s string) ([]byte, error) {
 	if strings.HasPrefix(s, "data:") {
 		_, after, ok := strings.Cut(s, ",")
 		if !ok {
@@ -367,6 +437,12 @@ func openSession(ctx context.Context, r *http.Request, conversationID string) (*
 		session.id = newConversationID()
 	}
 
+	if userID != 0 {
+		if h, err := storage.GetHousehold(ctx, userID); err == nil {
+			session.household = fmt.Sprintf("%s (%d people)", h.Name, len(h.Members))
+		}
+	}
+
 	state := loadSessionState(sessionKey(r, userID, session.id))
 	session.drafts, session.draftInfo = snapshotDrafts(state)
 	session.nextDraft = state.nextDraft
@@ -376,19 +452,111 @@ func openSession(ctx context.Context, r *http.Request, conversationID string) (*
 	return session, state, nil
 }
 
-// persistTurn appends the turn's new messages to wherever this thread lives.
-func persistTurn(ctx context.Context, session *chatSession, state *sessionState, produced int) {
+// storeDrafts writes the session's drafts back to the shared state. Separate from
+// persistTurn because a draft can now be saved outside a turn (HandleSaveChatDraft), and
+// that write has to mark the draft saved or the next "save it" would duplicate it.
+func storeDrafts(session *chatSession, state *sessionState) {
 	sessions.Lock()
+	defer sessions.Unlock()
 	state.drafts, state.draftInfo, state.nextDraft = session.drafts, session.draftInfo, session.nextDraft
-	if session.userID == 0 {
-		state.messages = session.messages
-	}
-	sessions.Unlock()
-	if session.userID == 0 {
+}
+
+// HandleSaveChatDraft saves a recipe the agent drafted in this conversation, without
+// asking the model to do it — the client's "Save to my recipes" button. It is the same
+// saveDraft the save_recipe tool calls, so saving twice (button then "save it", or two
+// taps) returns the one recipe rather than making a second.
+func HandleSaveChatDraft(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
 		return
 	}
-	// produced counts the messages the loop added on top of the user's; +1 for it.
-	added := session.messages[len(session.messages)-(produced+1):]
+
+	var req struct {
+		ConversationID string   `json:"conversation_id"`
+		DraftRef       string   `json:"draft_ref"`
+		Tags           []string `json:"tags"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil ||
+		strings.TrimSpace(req.ConversationID) == "" || strings.TrimSpace(req.DraftRef) == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	id, err := saveConversationDraft(r.Context(), sessionKey(r, user.ID, req.ConversationID), user.ID, req.DraftRef, req.Tags)
+	if errors.Is(err, errDraftExpired) {
+		writeJSONError(w, http.StatusNotFound, "draft_expired")
+		return
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "save_failed")
+		return
+	}
+
+	// The full row, not just the id: the client drops it straight into its recipe cache
+	// so My Recipes shows it without a refetch.
+	saved, err := storage.GetRecipeByID(r.Context(), user.ID, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "save_failed")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	if err := json.NewEncoder(w).Encode(saved); err != nil {
+		slog.Error("chat: encode saved draft failed", "error", err)
+	}
+}
+
+// errDraftExpired is a draft the session no longer holds: swept after anonThreadTTL, or
+// lost to a restart. Distinct from a failed write so the client can fall back to asking
+// the assistant rather than offering a button that cannot work.
+var errDraftExpired = errors.New("draft expired")
+
+// saveConversationDraft is HandleSaveChatDraft without the HTTP: it takes the same
+// in-memory half of openSession the turn does, saves through the same idempotent
+// saveDraft the save_recipe tool calls, and writes the drafts back so the draft is marked
+// saved — without that last step a later "save it" would write a second copy.
+func saveConversationDraft(ctx context.Context, key string, userID int, ref string, tags []string) (int, error) {
+	state := loadSessionState(key)
+	session := &chatSession{userID: userID}
+	session.drafts, session.draftInfo = snapshotDrafts(state)
+	session.nextDraft = state.nextDraft
+
+	if _, held := session.drafts[strings.TrimSpace(ref)]; !held {
+		return 0, errDraftExpired
+	}
+	id, _, err := session.saveDraft(ctx, ref, tags)
+	if err != nil {
+		return 0, err
+	}
+	storeDrafts(session, state)
+	return id, nil
+}
+
+func writeJSONError(w http.ResponseWriter, status int, code string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{"code": code})
+}
+
+// persistTurn appends the turn's new messages to wherever this thread lives. mark is the
+// thread length before the turn added anything — taken by the caller rather than counted
+// here, because an approval resumes with several messages at once and an ordinary turn
+// starts with exactly one.
+func persistTurn(ctx context.Context, session *chatSession, state *sessionState, mark int) {
+	storeDrafts(session, state)
+	if session.userID == 0 {
+		// An anonymous thread has no conversations row to append to: the session map is
+		// where it lives, so storing the messages there is the whole of persisting it.
+		sessions.Lock()
+		state.messages = session.messages
+		sessions.Unlock()
+		return
+	}
+	added := session.messages[mark:]
+	if len(added) == 0 {
+		return
+	}
 	// Detached from the request context: a client that hung up mid-turn still paid for
 	// the tokens, so the thread must still record them.
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -406,6 +574,14 @@ func runTurn(ctx context.Context, send emit, session *chatSession) (int, string)
 	produced := func() int { return len(session.messages) - before }
 
 	for i := range maxTurnIterations {
+		// A stop (BACKLOG.md 10.1) cancels the request context, and it has to land
+		// here rather than inside the next model call: without this the loop would
+		// start another iteration and run its tools against a dead context — writes
+		// that half-fail instead of never happening.
+		if ctx.Err() != nil {
+			return produced(), haltCode(ctx)
+		}
+
 		// An agent turn is N model calls, so the budget has to be re-read between
 		// iterations: a runaway loop must trip the cap mid-turn, not after the whole
 		// turn has been paid for (BACKLOG.md 2.4). The tool calls inside the previous
@@ -417,16 +593,34 @@ func runTurn(ctx context.Context, send emit, session *chatSession) (int, string)
 		msg, _, err := llm.CallMessage(ctx, llm.Spec{
 			Model:    recipeModel,
 			CallType: "chat",
-			Messages: threadToParams(session.messages, session.language),
+			Messages: threadToParams(session.messages, session.language, session.household),
 			Tools:    toolDefinitions(),
 			OnDelta:  func(delta string) { send("token", map[string]string{"text": delta}) },
 		})
 		if err != nil {
 			if ctx.Err() != nil {
-				return produced(), "timeout"
+				return produced(), haltCode(ctx)
 			}
 			slog.ErrorContext(ctx, "chat: model call failed", "error", err)
 			return produced(), "model_error"
+		}
+
+		// A mutating call is gated on the user, not on the model's prose (BACKLOG.md
+		// 10.2) — and the check comes *before* the assistant message is appended: a
+		// stored reply whose tool_calls have no tool results is a thread the model API
+		// refuses, so the whole reply is parked and appended on approval instead.
+		// Anonymous callers are skipped: every mutating tool is NeedsAuth, so there is
+		// nothing to approve — asking would only lead to a sign-in error after Apply.
+		if at := firstMutating(msg.ToolCalls); at >= 0 && session.userID != 0 {
+			call := msg.ToolCalls[at]
+			session.pending = &pendingApproval{id: newConversationID(), assistant: fromOpenAIMessage(msg), calls: msg.ToolCalls, index: at}
+			send("approval_request", map[string]any{
+				"id":       session.pending.id,
+				"name":     call.Function.Name,
+				"args":     call.Function.Arguments,
+				"replaces": approvalPreview(ctx, session, call.Function.Name, json.RawMessage(call.Function.Arguments)),
+			})
+			return produced(), ""
 		}
 
 		// An assistant message with neither prose nor tool calls is not a turn — and
@@ -438,13 +632,117 @@ func runTurn(ctx context.Context, send emit, session *chatSession) (int, string)
 			return produced(), ""
 		}
 
+		// Checked per call, not just per iteration: one model reply can ask for
+		// several tools, and a stop during the first must not run the rest.
 		for _, call := range msg.ToolCalls {
+			if ctx.Err() != nil {
+				return produced(), haltCode(ctx)
+			}
 			session.messages = append(session.messages, runToolCall(ctx, send, session, call))
 		}
 	}
 	// Out of iterations with the model still asking for tools: surface it as a code
 	// rather than silently truncating a turn the user thinks completed.
 	return produced(), "iteration_limit"
+}
+
+// haltCode names why a cancelled turn stopped: the user pressed Stop (BACKLOG.md 10.1),
+// or the turn ran past turnDeadline. Same cancellation, different thing to tell the user
+// — and turnOutcome already separates the two for the funnel counter.
+func haltCode(ctx context.Context) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "stopped"
+}
+
+// firstMutating is the index of the first call in this reply that needs the user's
+// approval, or -1 when none does.
+func firstMutating(calls []openai.ChatCompletionMessageToolCall) int {
+	for i, c := range calls {
+		if chatTools[c.Function.Name].Mutating {
+			return i
+		}
+	}
+	return -1
+}
+
+// resumeApproval turns the user's decision into the tool results the parked reply is
+// missing, so the thread the loop continues from is a valid one: the assistant message,
+// then exactly one tool message per tool call it asked for.
+//
+// Only the approved call runs. The calls after it are reported un-run rather than
+// executed, because the model wrote them expecting the gated one to have already
+// happened — it can ask again now that it knows the answer.
+func resumeApproval(ctx context.Context, send emit, session *chatSession, p *pendingApproval, approved bool) {
+	session.messages = append(session.messages, p.assistant)
+	for i, call := range p.calls {
+		switch {
+		case i == p.index && approved:
+			call.Function.Arguments = approvedArgs(call)
+			session.messages = append(session.messages, runToolCall(ctx, send, session, call))
+		case i == p.index:
+			session.messages = append(session.messages, toolResult(call, map[string]any{
+				"approved": false,
+				"note":     "the user did not approve this; nothing was written. Ask what they would like changed.",
+			}))
+		default:
+			session.messages = append(session.messages, toolResult(call, map[string]any{
+				"error": "not run — an earlier call in the same reply was waiting on the user. Call it again if it is still what you want.",
+			}))
+		}
+	}
+}
+
+// approvedArgs is the gated call's arguments as they should run now that the user has
+// said yes. apply_week_plan's own `confirm` flag asks the *model* to get the user's
+// agreement before replacing a planned day — which is exactly what the approval just
+// was, in a form the user actually saw. Leaving it unset would refuse the write and send
+// the model back to ask a second time, in prose, for the thing already approved.
+func approvedArgs(call openai.ChatCompletionMessageToolCall) string {
+	if call.Function.Name != "apply_week_plan" {
+		return call.Function.Arguments
+	}
+	var args map[string]any
+	if json.Unmarshal([]byte(call.Function.Arguments), &args) != nil {
+		return call.Function.Arguments
+	}
+	args["confirm"] = true
+	patched, err := json.Marshal(args)
+	if err != nil {
+		return call.Function.Arguments
+	}
+	return string(patched)
+}
+
+// takePending consumes the thread's awaiting-approval call if it is the one the client
+// answered. Nil means there is nothing to resume — an expired session, a restart, or a
+// stale card from a turn that has since been superseded.
+func takePending(state *sessionState, id string) *pendingApproval {
+	sessions.Lock()
+	defer sessions.Unlock()
+	p := state.pending
+	if p == nil || p.id != id {
+		return nil
+	}
+	state.pending = nil
+	return p
+}
+
+// storePending parks (or clears) the thread's awaiting-approval call.
+func storePending(state *sessionState, p *pendingApproval) {
+	sessions.Lock()
+	defer sessions.Unlock()
+	state.pending = p
+}
+
+// toolResult is the tool message for one call, already JSON-encoded.
+func toolResult(call openai.ChatCompletionMessageToolCall, result any) model.ConversationMessage {
+	payload, err := json.Marshal(result)
+	if err != nil {
+		payload = []byte(`{"error":"the tool returned something unreadable"}`)
+	}
+	return model.ConversationMessage{Role: "tool", Content: string(payload), ToolCallID: call.ID}
 }
 
 // runToolCall executes one tool call, emits its client events, and returns the tool
@@ -459,17 +757,12 @@ func runToolCall(ctx context.Context, send emit, session *chatSession, call open
 		slog.WarnContext(ctx, "chat: tool failed", "tool", name, "error", err)
 		result = map[string]string{"error": err.Error()}
 	}
-	payload, marshalErr := json.Marshal(result)
-	if marshalErr != nil {
-		payload = []byte(`{"error":"the tool returned something unreadable"}`)
-	}
-
 	telemetry.RecordChatTool(ctx, name, err == nil)
 	send("tool_end", map[string]any{"name": name, "ok": err == nil})
 	if art != nil {
 		send("artifact", art)
 	}
-	return model.ConversationMessage{Role: "tool", Content: string(payload), ToolCallID: call.ID}
+	return toolResult(call, result)
 }
 
 // overBudget reports whether the caller has reached their monthly cap. Anonymous callers
@@ -499,12 +792,15 @@ func fromOpenAIMessage(msg openai.ChatCompletionMessage) model.ConversationMessa
 // capped to the most recent maxThreadMessages. language (the caller's device locale, if
 // sent) is appended to the system prompt rather than the thread, so it follows the
 // device making the request instead of being frozen into the conversation.
-func threadToParams(msgs []model.ConversationMessage, language string) []openai.ChatCompletionMessageParamUnion {
+func threadToParams(msgs []model.ConversationMessage, language, household string) []openai.ChatCompletionMessageParamUnion {
 	msgs = trimThread(msgs)
 	system := llm.ChatAgentSystemPrompt
 	// Without the date the model guesses starts_on, which is how "plan this week" ended up
 	// naming days that were already cooked (the plan tools also refuse those, see today()).
 	system += "- Today is " + time.Now().Format("Monday, 2006-01-02") + ". Resolve every date you pass to a tool against it, and never plan, change or clear a day before today — those meals have already been cooked.\n"
+	if household != "" {
+		system += "- The user shares a household: " + household + ". Recipes, the pantry and the week are shared with them, so \"our recipes\" and \"what's in the fridge\" mean the household's, and a saved recipe someone else owns can be cooked and planned but not edited.\n"
+	}
 	if language != "" {
 		system += "- The user's device language is \"" + language + "\" (ISO 639-1). Write in it, and pass it as generate_recipe's `language`, unless the user's own message is clearly in another language.\n"
 	}
