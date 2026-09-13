@@ -43,7 +43,7 @@ func TestGetPlannedIngredients(t *testing.T) {
 	t.Cleanup(func() { Pool.Exec(ctx, `DELETE FROM recipes WHERE id = $1`, created.ID) })
 
 	day := time.Date(2026, 9, 14, 0, 0, 0, 0, time.UTC)
-	if _, err := AddMealPlanItem(ctx, userID, created.ID, day, "18:00:00", "monday", "", nil); err != nil {
+	if _, err := AddMealPlanItem(ctx, userID, created.ID, day, "monday", "", nil); err != nil {
 		t.Fatalf("AddMealPlanItem: %v", err)
 	}
 

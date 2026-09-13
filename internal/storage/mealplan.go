@@ -14,12 +14,12 @@ import (
 // races into two plan rows for the same week.
 func GetMealPlanRange(ctx context.Context, userID int, startsOn, endsOn time.Time) ([]model.MealPlanItem, error) {
 	rows, err := Pool.Query(ctx, `
-		SELECT mpi.id, mpi.recipe_id, r.title, mpi.planned_on, mpi.start_time, mpi.servings, mpi.meal_slot
+		SELECT mpi.id, mpi.recipe_id, r.title, mpi.planned_on, mpi.servings, mpi.meal_slot
 		FROM meal_plan_items mpi
 		JOIN meal_plans mp ON mp.id = mpi.meal_plan_id
 		JOIN recipes r ON r.id = mpi.recipe_id
 		WHERE mp.user_id = $1 AND mpi.planned_on BETWEEN $2 AND $3
-		ORDER BY mpi.planned_on, `+mealSlotOrder+`, mpi.start_time`,
+		ORDER BY mpi.planned_on, `+mealSlotOrder+`, mpi.id`,
 		userID, startsOn, endsOn,
 	)
 	if err != nil {
@@ -31,12 +31,10 @@ func GetMealPlanRange(ctx context.Context, userID int, startsOn, endsOn time.Tim
 	for rows.Next() {
 		var item model.MealPlanItem
 		var plannedOn time.Time
-		var startTime time.Time
-		if err := rows.Scan(&item.ID, &item.RecipeID, &item.RecipeTitle, &plannedOn, &startTime, &item.Servings, &item.MealSlot); err != nil {
+		if err := rows.Scan(&item.ID, &item.RecipeID, &item.RecipeTitle, &plannedOn, &item.Servings, &item.MealSlot); err != nil {
 			return nil, err
 		}
 		item.PlannedOn = plannedOn.Format("2006-01-02")
-		item.StartTime = startTime.Format("15:04:05")
 		items = append(items, item)
 	}
 	return items, rows.Err()
@@ -120,7 +118,6 @@ func findOrCreateMealPlanRow(ctx context.Context, q queryRower, userID int, star
 type PlannedDay struct {
 	RecipeID  int
 	PlannedOn time.Time
-	StartTime string
 	// Servings is how many portions are wanted that day; nil leaves it unset, meaning
 	// "as the recipe is written" (BACKLOG 6.2).
 	Servings *int
@@ -179,9 +176,9 @@ func ApplyMealPlanDays(ctx context.Context, userID int, weekStartDay string, day
 
 		var itemID int
 		if err = tx.QueryRow(ctx,
-			`INSERT INTO meal_plan_items (meal_plan_id, recipe_id, planned_on, start_time, servings, meal_slot)
-			 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-			planID, d.RecipeID, d.PlannedOn, d.StartTime, d.Servings, slot,
+			`INSERT INTO meal_plan_items (meal_plan_id, recipe_id, planned_on, servings, meal_slot)
+			 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+			planID, d.RecipeID, d.PlannedOn, d.Servings, slot,
 		).Scan(&itemID); err != nil {
 			return nil, err
 		}
@@ -191,7 +188,6 @@ func ApplyMealPlanDays(ctx context.Context, userID int, weekStartDay string, day
 			RecipeID:    d.RecipeID,
 			RecipeTitle: recipeTitle,
 			PlannedOn:   d.PlannedOn.Format("2006-01-02"),
-			StartTime:   d.StartTime,
 			Servings:    d.Servings,
 			MealSlot:    slot,
 		})
@@ -205,9 +201,9 @@ func ApplyMealPlanDays(ctx context.Context, userID int, weekStartDay string, day
 
 // AddMealPlanItem assigns one recipe to one slot of one day — ApplyMealPlanDays with a
 // single entry.
-func AddMealPlanItem(ctx context.Context, userID, recipeID int, plannedOn time.Time, startTime, weekStartDay, mealSlot string, servings *int) (model.MealPlanItem, error) {
+func AddMealPlanItem(ctx context.Context, userID, recipeID int, plannedOn time.Time, weekStartDay, mealSlot string, servings *int) (model.MealPlanItem, error) {
 	items, err := ApplyMealPlanDays(ctx, userID, weekStartDay,
-		[]PlannedDay{{RecipeID: recipeID, PlannedOn: plannedOn, StartTime: startTime, Servings: servings, MealSlot: mealSlot}})
+		[]PlannedDay{{RecipeID: recipeID, PlannedOn: plannedOn, Servings: servings, MealSlot: mealSlot}})
 	if err != nil {
 		return model.MealPlanItem{}, err
 	}

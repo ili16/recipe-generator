@@ -25,10 +25,9 @@ func mealPlanAssignmentSchema() map[string]any {
 			"variant":              map[string]any{"anyOf": []any{recipeJSONSchema(), map[string]any{"type": "null"}}},
 			"variant_of_recipe_id": llm.Nullable("integer"),
 			"planned_on":           map[string]any{"type": "string"},
-			"start_time":           map[string]any{"type": "string"},
 			"servings":             llm.Nullable("integer"),
 		},
-		"required":             []string{"recipe_id", "variant", "variant_of_recipe_id", "planned_on", "start_time", "servings"},
+		"required":             []string{"recipe_id", "variant", "variant_of_recipe_id", "planned_on", "servings"},
 		"additionalProperties": false,
 	}
 }
@@ -166,7 +165,7 @@ func enforceNoCookCarryover(result *model.MealPlanSuggestion, prefs model.UserPr
 
 	var lastCooked *model.MealPlanAssignment
 	if priorMeal != nil {
-		lastCooked = &model.MealPlanAssignment{RecipeID: &priorMeal.RecipeID, PlannedOn: priorMeal.PlannedOn, StartTime: priorMeal.StartTime}
+		lastCooked = &model.MealPlanAssignment{RecipeID: &priorMeal.RecipeID, PlannedOn: priorMeal.PlannedOn}
 	}
 
 	appended := false
@@ -180,9 +179,7 @@ func enforceNoCookCarryover(result *model.MealPlanSuggestion, prefs model.UserPr
 			}
 			carried := *lastCooked
 			carried.PlannedOn = dateStr
-			carried.StartTime = "18:00:00"
 			if exists {
-				carried.StartTime = result.Assignments[idx].StartTime
 				if !sameAssignment(result.Assignments[idx], carried) {
 					// Say what was overridden. A silent revert lets the model reply
 					// "Done!" about a change this just undid (BACKLOG.md 2.5).
@@ -326,6 +323,6 @@ func LoadPriorMeal(ctx context.Context, userID int, startsOn time.Time) (*model.
 	if err != nil || len(items) == 0 {
 		return nil, err
 	}
-	last := items[len(items)-1] // GetMealPlanRange orders by planned_on, start_time
+	last := items[len(items)-1] // GetMealPlanRange orders by planned_on, then meal slot
 	return &last, nil
 }

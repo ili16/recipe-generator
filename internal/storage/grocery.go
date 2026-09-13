@@ -21,7 +21,7 @@ func GetPlannedIngredients(ctx context.Context, userID int, startsOn, endsOn tim
 		JOIN recipes r ON r.id = mpi.recipe_id
 		JOIN recipe_ingredients ri ON ri.recipe_id = r.id
 		WHERE mp.user_id = $1 AND mpi.planned_on BETWEEN $2 AND $3 AND r.deleted_at IS NULL
-		ORDER BY mpi.planned_on, mpi.start_time, ri.sort_order`,
+		ORDER BY mpi.planned_on, mpi.id, ri.sort_order`,
 		userID, startsOn, endsOn,
 	)
 	if err != nil {

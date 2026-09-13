@@ -61,15 +61,15 @@ func TestMealPlanWeekAssignAndRemove(t *testing.T) {
 	nextMonday := monday.AddDate(0, 0, 7)
 
 	// Ownership enforced on add: another user can't assign someone else's recipe.
-	if _, err := AddMealPlanItem(ctx, otherUserID, recipe.ID, tuesday, "18:00:00", "monday", "", nil); !errors.Is(err, pgx.ErrNoRows) {
+	if _, err := AddMealPlanItem(ctx, otherUserID, recipe.ID, tuesday, "monday", "", nil); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("expected pgx.ErrNoRows adding another user's recipe, got %v", err)
 	}
 
-	item, err := AddMealPlanItem(ctx, userID, recipe.ID, tuesday, "18:00:00", "monday", "", nil)
+	item, err := AddMealPlanItem(ctx, userID, recipe.ID, tuesday, "monday", "", nil)
 	if err != nil {
 		t.Fatalf("AddMealPlanItem: %v", err)
 	}
-	if item.RecipeTitle != "Test Curry" || item.PlannedOn != "2026-09-08" || item.StartTime != "18:00:00" {
+	if item.RecipeTitle != "Test Curry" || item.PlannedOn != "2026-09-08" {
 		t.Errorf("unexpected item: %+v", item)
 	}
 
@@ -77,11 +77,11 @@ func TestMealPlanWeekAssignAndRemove(t *testing.T) {
 	// the first,
 	// rather than stacking a second item.
 	six := 6
-	replaced, err := AddMealPlanItem(ctx, userID, recipe2.ID, tuesday, "19:30:00", "monday", "", &six)
+	replaced, err := AddMealPlanItem(ctx, userID, recipe2.ID, tuesday, "monday", "", &six)
 	if err != nil {
 		t.Fatalf("AddMealPlanItem (replace): %v", err)
 	}
-	if replaced.RecipeTitle != "Test Stir Fry" || replaced.StartTime != "19:30:00" {
+	if replaced.RecipeTitle != "Test Stir Fry" {
 		t.Errorf("unexpected replaced item: %+v", replaced)
 	}
 	// BACKLOG 6.2: servings are written and read back, not silently dropped.
@@ -91,7 +91,7 @@ func TestMealPlanWeekAssignAndRemove(t *testing.T) {
 
 	// BACKLOG 6.4: a second *slot* on the same day is an addition, not a replacement —
 	// the day's dinner survives planning its lunch.
-	lunch, err := AddMealPlanItem(ctx, userID, recipe.ID, tuesday, "12:00:00", "monday", "lunch", nil)
+	lunch, err := AddMealPlanItem(ctx, userID, recipe.ID, tuesday, "monday", "lunch", nil)
 	if err != nil {
 		t.Fatalf("AddMealPlanItem (lunch): %v", err)
 	}
@@ -108,7 +108,7 @@ func TestMealPlanWeekAssignAndRemove(t *testing.T) {
 	}
 
 	// An item planned for the following week must not leak into this week's range.
-	if _, err := AddMealPlanItem(ctx, userID, recipe.ID, nextMonday, "18:00:00", "monday", "", nil); err != nil {
+	if _, err := AddMealPlanItem(ctx, userID, recipe.ID, nextMonday, "monday", "", nil); err != nil {
 		t.Fatalf("AddMealPlanItem (next week): %v", err)
 	}
 

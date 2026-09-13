@@ -90,7 +90,7 @@ func TestBuildMealPlanContextTextPriorMeal(t *testing.T) {
 // silently break the live call rather than fail at build time.
 func TestMealPlanSchemasCoverStructFields(t *testing.T) {
 	assignmentSchema := mealPlanAssignmentSchema()
-	wantAssignmentFields := []string{"recipe_id", "variant", "variant_of_recipe_id", "planned_on", "start_time", "servings"}
+	wantAssignmentFields := []string{"recipe_id", "variant", "variant_of_recipe_id", "planned_on", "servings"}
 	assertSchemaFields(t, "mealPlanAssignmentSchema", assignmentSchema, wantAssignmentFields)
 
 	suggestionSchema := mealPlanSuggestionJSONSchema()
@@ -148,10 +148,10 @@ func TestEnforceNoCookCarryover(t *testing.T) {
 
 	t.Run("mid-range no-cook day is overwritten with the prior cooked day's dish", func(t *testing.T) {
 		result := model.MealPlanSuggestion{Status: "applied", Assignments: []model.MealPlanAssignment{
-			{RecipeID: id(1), PlannedOn: day(0), StartTime: "18:00:00"},  // Mon, cooked
-			{RecipeID: id(2), PlannedOn: day(1), StartTime: "18:00:00"},  // Tue, cooked
-			{RecipeID: id(99), PlannedOn: day(2), StartTime: "18:00:00"}, // Wed, no-cook — model got it wrong
-			{RecipeID: id(3), PlannedOn: day(3), StartTime: "18:00:00"},  // Thu, cooked
+			{RecipeID: id(1), PlannedOn: day(0)},  // Mon, cooked
+			{RecipeID: id(2), PlannedOn: day(1)},  // Tue, cooked
+			{RecipeID: id(99), PlannedOn: day(2)}, // Wed, no-cook — model got it wrong
+			{RecipeID: id(3), PlannedOn: day(3)},  // Thu, cooked
 		}}
 		enforceNoCookCarryover(&result, model.UserPreferences{MealPlanNoCookDays: []string{weekday(2)}}, startsOn, endsOn, nil)
 
@@ -167,8 +167,8 @@ func TestEnforceNoCookCarryover(t *testing.T) {
 		// so whoever renders the reply tells the user what actually happened.
 		msg := "Done!"
 		result := model.MealPlanSuggestion{Status: "applied", Message: &msg, Assignments: []model.MealPlanAssignment{
-			{RecipeID: id(1), PlannedOn: day(0), StartTime: "18:00:00"},  // Mon, cooked
-			{RecipeID: id(99), PlannedOn: day(3), StartTime: "18:00:00"}, // Thu, no-cook — user asked for this
+			{RecipeID: id(1), PlannedOn: day(0)},  // Mon, cooked
+			{RecipeID: id(99), PlannedOn: day(3)}, // Thu, no-cook — user asked for this
 		}}
 		enforceNoCookCarryover(&result, model.UserPreferences{MealPlanNoCookDays: []string{weekday(3)}}, startsOn, endsOn, nil)
 
@@ -185,8 +185,8 @@ func TestEnforceNoCookCarryover(t *testing.T) {
 
 	t.Run("a day the model already got right is not reported as an override", func(t *testing.T) {
 		result := model.MealPlanSuggestion{Status: "applied", Assignments: []model.MealPlanAssignment{
-			{RecipeID: id(1), PlannedOn: day(0), StartTime: "18:00:00"}, // Mon, cooked
-			{RecipeID: id(1), PlannedOn: day(3), StartTime: "18:00:00"}, // Thu, no-cook, already carried
+			{RecipeID: id(1), PlannedOn: day(0)}, // Mon, cooked
+			{RecipeID: id(1), PlannedOn: day(3)}, // Thu, no-cook, already carried
 		}}
 		enforceNoCookCarryover(&result, model.UserPreferences{MealPlanNoCookDays: []string{weekday(3)}}, startsOn, endsOn, nil)
 
@@ -197,10 +197,10 @@ func TestEnforceNoCookCarryover(t *testing.T) {
 
 	t.Run("chained no-cook days all carry the same original cooked dish", func(t *testing.T) {
 		result := model.MealPlanSuggestion{Status: "applied", Assignments: []model.MealPlanAssignment{
-			{RecipeID: id(1), PlannedOn: day(0), StartTime: "18:00:00"},   // Mon, cooked
-			{RecipeID: id(2), PlannedOn: day(1), StartTime: "18:00:00"},   // Tue, cooked
-			{RecipeID: id(99), PlannedOn: day(2), StartTime: "18:00:00"},  // Wed, no-cook
-			{RecipeID: id(100), PlannedOn: day(3), StartTime: "18:00:00"}, // Thu, no-cook
+			{RecipeID: id(1), PlannedOn: day(0)},   // Mon, cooked
+			{RecipeID: id(2), PlannedOn: day(1)},   // Tue, cooked
+			{RecipeID: id(99), PlannedOn: day(2)},  // Wed, no-cook
+			{RecipeID: id(100), PlannedOn: day(3)}, // Thu, no-cook
 		}}
 		enforceNoCookCarryover(&result, model.UserPreferences{MealPlanNoCookDays: []string{weekday(2), weekday(3)}}, startsOn, endsOn, nil)
 
@@ -213,9 +213,9 @@ func TestEnforceNoCookCarryover(t *testing.T) {
 
 	t.Run("no-cook day at the start of the range carries forward from priorMeal", func(t *testing.T) {
 		result := model.MealPlanSuggestion{Status: "applied", Assignments: []model.MealPlanAssignment{
-			{RecipeID: id(99), PlannedOn: day(0), StartTime: "18:00:00"}, // Mon, no-cook, model got it wrong
+			{RecipeID: id(99), PlannedOn: day(0)}, // Mon, no-cook, model got it wrong
 		}}
-		priorMeal := &model.MealPlanItem{RecipeID: 42, PlannedOn: "2026-09-06", StartTime: "18:00:00"}
+		priorMeal := &model.MealPlanItem{RecipeID: 42, PlannedOn: "2026-09-06"}
 		enforceNoCookCarryover(&result, model.UserPreferences{MealPlanNoCookDays: []string{weekday(0)}}, startsOn, endsOn, priorMeal)
 
 		if mon := findAssignment(t, result.Assignments, day(0)); mon.RecipeID == nil || *mon.RecipeID != 42 {
@@ -225,9 +225,9 @@ func TestEnforceNoCookCarryover(t *testing.T) {
 
 	t.Run("missing assignment on a no-cook day is inserted, not just fixed", func(t *testing.T) {
 		result := model.MealPlanSuggestion{Status: "applied", Assignments: []model.MealPlanAssignment{
-			{RecipeID: id(1), PlannedOn: day(0), StartTime: "18:00:00"}, // Mon, cooked
+			{RecipeID: id(1), PlannedOn: day(0)}, // Mon, cooked
 			// Tue (no-cook) has no assignment at all — model treated it like a no-food day.
-			{RecipeID: id(3), PlannedOn: day(2), StartTime: "18:00:00"}, // Wed, cooked
+			{RecipeID: id(3), PlannedOn: day(2)}, // Wed, cooked
 		}}
 		enforceNoCookCarryover(&result, model.UserPreferences{MealPlanNoCookDays: []string{weekday(1)}}, startsOn, endsOn, nil)
 
@@ -241,7 +241,7 @@ func TestEnforceNoCookCarryover(t *testing.T) {
 
 	t.Run("no reference to carry forward leaves the model's assignment untouched", func(t *testing.T) {
 		result := model.MealPlanSuggestion{Status: "applied", Assignments: []model.MealPlanAssignment{
-			{RecipeID: id(7), PlannedOn: day(0), StartTime: "18:00:00"}, // Mon, no-cook, nothing to reference
+			{RecipeID: id(7), PlannedOn: day(0)}, // Mon, no-cook, nothing to reference
 		}}
 		enforceNoCookCarryover(&result, model.UserPreferences{MealPlanNoCookDays: []string{weekday(0)}}, startsOn, endsOn, nil)
 
@@ -252,7 +252,7 @@ func TestEnforceNoCookCarryover(t *testing.T) {
 
 	t.Run("no-op when there are no no-cook days", func(t *testing.T) {
 		result := model.MealPlanSuggestion{Status: "applied", Assignments: []model.MealPlanAssignment{
-			{RecipeID: id(1), PlannedOn: day(0), StartTime: "18:00:00"},
+			{RecipeID: id(1), PlannedOn: day(0)},
 		}}
 		before := result.Assignments[0]
 		enforceNoCookCarryover(&result, model.UserPreferences{}, startsOn, endsOn, nil)

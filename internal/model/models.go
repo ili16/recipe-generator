@@ -259,13 +259,12 @@ type GroceryLine struct {
 	For      []string `json:"for"`
 }
 
-// MealPlanItem is one recipe assigned to one day (and time) in a user's meal plan.
+// MealPlanItem is one recipe assigned to one meal slot of one day in a user's meal plan.
 type MealPlanItem struct {
 	ID          int    `json:"id"`
 	RecipeID    int    `json:"recipe_id"`
 	RecipeTitle string `json:"recipe_title"`
 	PlannedOn   string `json:"planned_on"` // YYYY-MM-DD
-	StartTime   string `json:"start_time"` // HH:MM:SS
 	// MealSlot is which meal of the day this is: breakfast|lunch|dinner|snack. It is the
 	// second half of the plan's upsert key, so a day holds up to one item per slot
 	// (BACKLOG 6.4). Anything that doesn't say defaults to dinner.
@@ -284,7 +283,6 @@ type MealPlanAssignment struct {
 	Variant           *RecipeDocument `json:"variant"`
 	VariantOfRecipeID *int            `json:"variant_of_recipe_id"`
 	PlannedOn         string          `json:"planned_on"`
-	StartTime         string          `json:"start_time"`
 	Servings          *int            `json:"servings"`
 }
 

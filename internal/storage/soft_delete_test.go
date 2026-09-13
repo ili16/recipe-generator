@@ -46,7 +46,7 @@ func TestSoftDeleteAndRestore(t *testing.T) {
 	t.Cleanup(func() { Pool.Exec(ctx, `DELETE FROM recipes WHERE id = $1`, recipe.ID) })
 
 	monday := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
-	if _, err := AddMealPlanItem(ctx, userID, recipe.ID, monday, "18:00:00", "monday", "", nil); err != nil {
+	if _, err := AddMealPlanItem(ctx, userID, recipe.ID, monday, "monday", "", nil); err != nil {
 		t.Fatalf("AddMealPlanItem: %v", err)
 	}
 
@@ -68,7 +68,7 @@ func TestSoftDeleteAndRestore(t *testing.T) {
 		t.Fatalf("expected pgx.ErrNoRows from GetRecipeByID, got %v", err)
 	}
 	// ...and unassignable to a new day (the picker's ownership check).
-	if _, err := AddMealPlanItem(ctx, userID, recipe.ID, monday.AddDate(0, 0, 1), "18:00:00", "monday", "", nil); !errors.Is(err, pgx.ErrNoRows) {
+	if _, err := AddMealPlanItem(ctx, userID, recipe.ID, monday.AddDate(0, 0, 1), "monday", "", nil); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("expected pgx.ErrNoRows planning a deleted recipe, got %v", err)
 	}
 

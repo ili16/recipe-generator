@@ -17,8 +17,6 @@ import (
 )
 
 const dateLayout = "2006-01-02"
-const timeLayout = "15:04:05"
-const defaultMealStartTime = "18:00:00"
 const maxMealPlanRangeDays = 42
 
 // HandleGetMealPlan returns every meal-plan item in [starts_on, ends_on]. ends_on
@@ -117,7 +115,6 @@ func HandleAddMealPlanItem(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		RecipeID  int    `json:"recipe_id"`
 		PlannedOn string `json:"planned_on"`
-		StartTime string `json:"start_time,omitempty"`
 		// Servings is how many portions are wanted that day; omit to leave it as the
 		// recipe is written. Since this endpoint upserts by day, re-POSTing the same
 		// recipe with a new servings is how a day's servings get changed (BACKLOG 6.2).
@@ -145,22 +142,13 @@ func HandleAddMealPlanItem(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid planned_on (YYYY-MM-DD)", http.StatusBadRequest)
 		return
 	}
-	startTime := defaultMealStartTime
-	if req.StartTime != "" {
-		if _, err := time.Parse(timeLayout, req.StartTime); err != nil {
-			http.Error(w, "invalid start_time (HH:MM:SS)", http.StatusBadRequest)
-			return
-		}
-		startTime = req.StartTime
-	}
-
 	globalPrefs, err := storage.GetPreferences(r.Context(), user.ID)
 	if err != nil {
 		slog.Error("Error loading preferences", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	item, err := storage.AddMealPlanItem(r.Context(), user.ID, req.RecipeID, plannedOn, startTime, globalPrefs.WeekStartDay, req.MealSlot, req.Servings)
+	item, err := storage.AddMealPlanItem(r.Context(), user.ID, req.RecipeID, plannedOn, globalPrefs.WeekStartDay, req.MealSlot, req.Servings)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			http.Error(w, "recipe not found", http.StatusNotFound)

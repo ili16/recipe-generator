@@ -168,8 +168,8 @@ var chatTools = map[string]tool{
 			"date":      str("The day to clear, YYYY-MM-DD"),
 			"meal_slot": str("Clear only this meal: breakfast, lunch, dinner or snack. Omit to clear the entire day."),
 		}, "date"),
-		NeedsAuth:   true,
-		Run:         toolClearPlanDay,
+		NeedsAuth: true,
+		Run:       toolClearPlanDay,
 	},
 	"get_preferences": {
 		Description: "Read the user's dietary preferences, disliked ingredients, skill level and meal-plan scheduling settings.",
@@ -532,9 +532,6 @@ type planDayArg struct {
 // named drafts on the way (idempotently — see saveDraft). Drafts are saved before the
 // apply transaction opens, so a failed apply can leave a recipe saved but unplanned;
 // re-running reuses it rather than duplicating it.
-// ponytail: every day is written at 18:00 whatever its slot — the same thing the REST
-// add endpoint does (cmd/mealplan.go's defaultMealStartTime), so a lunch reads 18:00 on
-// the week view. Per-day and per-slot times are 4.4.
 func (s *chatSession) resolvePlanDays(ctx context.Context, days []planDayArg) ([]storage.PlannedDay, []string, error) {
 	if len(days) == 0 {
 		return nil, nil, errors.New("give at least one day")
@@ -577,7 +574,7 @@ func (s *chatSession) resolvePlanDays(ctx context.Context, days []planDayArg) ([
 				return nil, nil, err
 			}
 		}
-		day := storage.PlannedDay{RecipeID: recipeID, PlannedOn: plannedOn, StartTime: "18:00:00", MealSlot: slot}
+		day := storage.PlannedDay{RecipeID: recipeID, PlannedOn: plannedOn, MealSlot: slot}
 		if d.Servings > 0 {
 			servings := d.Servings
 			day.Servings = &servings
@@ -973,6 +970,7 @@ func (s *chatSession) saveDraft(ctx context.Context, ref string, tags []string) 
 	if s.draftInfo == nil {
 		s.draftInfo = map[string]draftInfo{}
 	}
+	telemetry.RecordChatRecipeSaved(ctx)
 	info.savedID = created.ID
 	s.draftInfo[ref] = info
 	s.drafts[ref] = doc
