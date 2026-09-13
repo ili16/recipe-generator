@@ -98,6 +98,9 @@ func buildMealPlanContextText(candidates []model.Recipe, profile model.CookingPr
 	if len(prefs.DislikedIngredients) > 0 {
 		fmt.Fprintf(&b, "Disliked ingredients (avoid): %v\n", prefs.DislikedIngredients)
 	}
+	if prefs.HouseholdSize != nil {
+		fmt.Fprintf(&b, "The user cooks for %d people (BACKLOG 9.12) — a day's servings should cover that unless the user says otherwise, and a recipe yielding less needs scaling up.\n", *prefs.HouseholdSize)
+	}
 	if len(prefs.MealPlanNoFoodDays) > 0 {
 		fmt.Fprintf(&b, "The user needs no food planned on: %v (skip these days entirely — no assignment)\n", prefs.MealPlanNoFoodDays)
 	}
@@ -179,6 +182,11 @@ func enforceNoCookCarryover(result *model.MealPlanSuggestion, prefs model.UserPr
 			}
 			carried := *lastCooked
 			carried.PlannedOn = dateStr
+			// Say it in the data, not just by repeating the recipe id: the client used
+			// to re-derive "this is a leftover" from the repeat, and got it wrong
+			// whenever a dish was deliberately cooked twice (BACKLOG 9.11).
+			source := lastCooked.PlannedOn
+			carried.LeftoverOf = &source
 			if exists {
 				if !sameAssignment(result.Assignments[idx], carried) {
 					// Say what was overridden. A silent revert lets the model reply

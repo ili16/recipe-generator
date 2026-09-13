@@ -108,6 +108,7 @@ func main() {
 	mux.HandleFunc("GET /api/v1/grocery-list", authenticator.Require(HandleGetGroceryList))
 	mux.HandleFunc("POST /api/v1/meal-plan/items", authenticator.Require(HandleAddMealPlanItem))
 	mux.HandleFunc("DELETE /api/v1/meal-plan/items/{id}", authenticator.Require(HandleDeleteMealPlanItem))
+	mux.HandleFunc("POST /api/v1/meal-plan/items/{id}/covers", authenticator.Require(HandleSetBatchCook))
 	mux.HandleFunc("POST /api/v1/meal-plan/variants/{id}", llm(rl, HandleGenerateVariant))
 
 	mux.HandleFunc("GET /api/v1/admin/users", authenticator.RequireAdmin(HandleAdminListUsers))
@@ -348,6 +349,10 @@ func HandlePatchPreferences(w http.ResponseWriter, r *http.Request) {
 	case 1, 2, 3:
 	default:
 		http.Error(w, "meal_plan_batch_days must be 1, 2, or 3", http.StatusBadRequest)
+		return
+	}
+	if prefs.HouseholdSize != nil && (*prefs.HouseholdSize < 1 || *prefs.HouseholdSize > 20) {
+		http.Error(w, "household_size must be between 1 and 20", http.StatusBadRequest)
 		return
 	}
 	if prefs.WeekStartDay == "" {

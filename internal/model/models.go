@@ -136,6 +136,11 @@ type UserPreferences struct {
 	// WeekStartDay is the lowercase weekday name the user's meal-plan week begins on
 	// (default "monday").
 	WeekStartDay string `json:"week_start_day"`
+	// HouseholdSize is how many people the user cooks for (BACKLOG 9.12) — a property of
+	// the household, not of a recipe, and the default a newly planned day's servings
+	// starts from. nil means they never said, which is not 1: nothing to compare a
+	// recipe's yield against, so no mismatch is claimed.
+	HouseholdSize *int `json:"household_size"`
 }
 
 // CookingProfile is a behavioral profile derived from a user's saved recipe history by
@@ -273,6 +278,10 @@ type MealPlanItem struct {
 	// nil means "as the recipe is written" — it scales the grocery list only when both it
 	// and the recipe's own servings are known.
 	Servings *int `json:"servings,omitempty"`
+	// SourceItemID, when set, names the item whose cooking produced this meal: this is
+	// that pot, eaten again here (BACKLOG 9.11). nil means it is cooked on the day. The
+	// row is deleted with its source (ON DELETE CASCADE) — no cook, no leftover.
+	SourceItemID *int `json:"source_item_id,omitempty"`
 }
 
 // MealPlanAssignment is one proposed day in an AI-suggested meal plan. Exactly one of
@@ -284,6 +293,10 @@ type MealPlanAssignment struct {
 	VariantOfRecipeID *int            `json:"variant_of_recipe_id"`
 	PlannedOn         string          `json:"planned_on"`
 	Servings          *int            `json:"servings"`
+	// LeftoverOf, when set, is the YYYY-MM-DD day whose pot this day eats again
+	// (BACKLOG 9.11). Filled server-side by enforceNoCookCarryover, not by the model —
+	// it is not part of the suggestion's JSON schema.
+	LeftoverOf *string `json:"leftover_of,omitempty"`
 }
 
 // MealPlanSuggestion is the outcome of POST /meal-plan/suggest or /meal-plan/chat.

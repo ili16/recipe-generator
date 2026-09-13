@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/ili16/recipe-generator/internal/model"
@@ -14,7 +16,7 @@ import (
 // races into two plan rows for the same week.
 func GetMealPlanRange(ctx context.Context, userID int, startsOn, endsOn time.Time) ([]model.MealPlanItem, error) {
 	rows, err := Pool.Query(ctx, `
-		SELECT mpi.id, mpi.recipe_id, r.title, mpi.planned_on, mpi.servings, mpi.meal_slot
+		SELECT mpi.id, mpi.recipe_id, r.title, mpi.planned_on, mpi.servings, mpi.meal_slot, mpi.source_item_id
 		FROM meal_plan_items mpi
 		JOIN meal_plans mp ON mp.id = mpi.meal_plan_id
 		JOIN recipes r ON r.id = mpi.recipe_id
@@ -31,7 +33,7 @@ func GetMealPlanRange(ctx context.Context, userID int, startsOn, endsOn time.Tim
 	for rows.Next() {
 		var item model.MealPlanItem
 		var plannedOn time.Time
-		if err := rows.Scan(&item.ID, &item.RecipeID, &item.RecipeTitle, &plannedOn, &item.Servings, &item.MealSlot); err != nil {
+		if err := rows.Scan(&item.ID, &item.RecipeID, &item.RecipeTitle, &plannedOn, &item.Servings, &item.MealSlot, &item.SourceItemID); err != nil {
 			return nil, err
 		}
 		item.PlannedOn = plannedOn.Format("2006-01-02")
@@ -123,6 +125,10 @@ type PlannedDay struct {
 	Servings *int
 	// MealSlot is which meal of the day this fills; "" means dinner (BACKLOG 6.4).
 	MealSlot string
+	// LeftoverOf, when set, is the day whose cooking this meal eats again (BACKLOG
+	// 9.11). Resolved to that day's item id inside the apply transaction, so a caller
+	// can write the cook and its leftovers in one call without knowing ids.
+	LeftoverOf *time.Time
 }
 
 // ApplyMealPlanDays writes every day in days for userID in **one transaction**, creating
@@ -137,8 +143,35 @@ func ApplyMealPlanDays(ctx context.Context, userID int, weekStartDay string, day
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	items := make([]model.MealPlanItem, 0, len(days))
-	for _, d := range days {
+	// A newly planned day starts from how many people eat, not from whatever the recipe
+	// happens to yield (BACKLOG 9.12). Read once, here, because every path that plans a
+	// day — the picker, the agent, an applied week — comes through this function.
+	// NULL household_size means the user never said, and then the old meaning stands:
+	// no servings, "as the recipe is written".
+	var household *int
+	if err = tx.QueryRow(ctx, `SELECT household_size FROM users WHERE id = $1`, userID).Scan(&household); err != nil {
+		return nil, err
+	}
+
+	// Cooks first, leftovers second: a leftover's source_item_id is resolved by reading
+	// the day it points at, and that day may be written by this very call (BACKLOG 9.13
+	// writes a cook and its covered days together). Order in `items` still mirrors
+	// `days`, so callers can keep indexing by position.
+	items := make([]model.MealPlanItem, len(days))
+	order := make([]int, 0, len(days))
+	for i, d := range days {
+		if d.LeftoverOf == nil {
+			order = append(order, i)
+		}
+	}
+	for i, d := range days {
+		if d.LeftoverOf != nil {
+			order = append(order, i)
+		}
+	}
+
+	for _, idx := range order {
+		d := days[idx]
 		// Ownership is checked inside the transaction, per recipe: an unowned id must
 		// abort the whole apply, not just skip its day.
 		var recipeTitle string
@@ -174,29 +207,84 @@ func ApplyMealPlanDays(ctx context.Context, userID int, weekStartDay string, day
 			return nil, err
 		}
 
+		servings := d.Servings
+		if servings == nil {
+			servings = household
+		}
+
+		var sourceID *int
+		if d.LeftoverOf != nil {
+			if sourceID, err = findCookItem(ctx, tx, userID, *d.LeftoverOf, slot); err != nil {
+				return nil, err
+			}
+		}
+
 		var itemID int
 		if err = tx.QueryRow(ctx,
-			`INSERT INTO meal_plan_items (meal_plan_id, recipe_id, planned_on, servings, meal_slot)
-			 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-			planID, d.RecipeID, d.PlannedOn, d.Servings, slot,
+			`INSERT INTO meal_plan_items (meal_plan_id, recipe_id, planned_on, servings, meal_slot, source_item_id)
+			 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+			planID, d.RecipeID, d.PlannedOn, servings, slot, sourceID,
 		).Scan(&itemID); err != nil {
 			return nil, err
 		}
 
-		items = append(items, model.MealPlanItem{
-			ID:          itemID,
-			RecipeID:    d.RecipeID,
-			RecipeTitle: recipeTitle,
-			PlannedOn:   d.PlannedOn.Format("2006-01-02"),
-			Servings:    d.Servings,
-			MealSlot:    slot,
-		})
+		items[idx] = model.MealPlanItem{
+			ID:           itemID,
+			RecipeID:     d.RecipeID,
+			RecipeTitle:  recipeTitle,
+			PlannedOn:    d.PlannedOn.Format("2006-01-02"),
+			Servings:     servings,
+			MealSlot:     slot,
+			SourceItemID: sourceID,
+		}
 	}
 
 	if err = tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return items, nil
+}
+
+// findCookItem resolves "the meal cooked on day" to an item id, for a leftover that
+// names its source by date (which is all the agent and the week view can cheaply say).
+// Same slot wins; failing that, a day holding exactly one meal is unambiguous. A source
+// that is itself a leftover resolves to *its* cook, so chains stay one level deep and
+// deleting the pot deletes every portion of it.
+func findCookItem(ctx context.Context, tx pgx.Tx, userID int, day time.Time, slot string) (*int, error) {
+	var id int
+	var source *int
+	err := tx.QueryRow(ctx, `
+		SELECT mpi.id, mpi.source_item_id
+		FROM meal_plan_items mpi
+		JOIN meal_plans mp ON mp.id = mpi.meal_plan_id
+		WHERE mp.user_id = $1 AND mpi.planned_on = $2 AND mpi.meal_slot = $3`,
+		userID, day, slot,
+	).Scan(&id, &source)
+	if err == pgx.ErrNoRows {
+		// No meal in that slot: a day holding exactly one meal is still unambiguous.
+		// COUNT(*) OVER () is how we tell "the only one" from "the first of several".
+		var n int
+		err = tx.QueryRow(ctx, `
+			SELECT mpi.id, mpi.source_item_id, COUNT(*) OVER ()
+			FROM meal_plan_items mpi
+			JOIN meal_plans mp ON mp.id = mpi.meal_plan_id
+			WHERE mp.user_id = $1 AND mpi.planned_on = $2`,
+			userID, day,
+		).Scan(&id, &source, &n)
+		if err == nil && n > 1 {
+			return nil, fmt.Errorf("%s holds more than one meal — say which slot the leftovers come from", day.Format("2006-01-02"))
+		}
+	}
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("nothing is cooked on %s to eat again", day.Format("2006-01-02"))
+	}
+	if err != nil {
+		return nil, err
+	}
+	if source != nil {
+		return source, nil
+	}
+	return &id, nil
 }
 
 // AddMealPlanItem assigns one recipe to one slot of one day — ApplyMealPlanDays with a
@@ -225,4 +313,128 @@ func DeleteMealPlanItem(ctx context.Context, userID, itemID int) error {
 		return pgx.ErrNoRows
 	}
 	return nil
+}
+
+// SetBatchCook makes one cooking day cover a set of later days, in one transaction
+// (BACKLOG 9.13). days is the **complete** set of days this pot covers, so the same call
+// undoes the arrangement: a day that drops out of the list has its leftover row cleared,
+// and an empty list takes it back to an ordinary single-day cook.
+//
+// It is deliberately not a caller of ApplyMealPlanDays: that upserts by deleting the
+// existing row first, and deleting the cook cascades away the very leftovers this is
+// writing. Here the cook is updated in place, so its id — which every leftover points at
+// — survives.
+//
+// Returns the cook and its leftovers as they now stand.
+func SetBatchCook(ctx context.Context, userID, itemID int, days []time.Time, servings *int) ([]model.MealPlanItem, error) {
+	tx, err := Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// The cook, scoped to the caller. A leftover may not itself become a cook: the pot it
+	// came from is the one that gets scaled (BACKLOG 9.11).
+	var cook model.MealPlanItem
+	var cookDate time.Time
+	var source *int
+	if err = tx.QueryRow(ctx, `
+		SELECT mpi.id, mpi.recipe_id, r.title, mpi.planned_on, mpi.servings, mpi.meal_slot, mpi.source_item_id
+		FROM meal_plan_items mpi
+		JOIN meal_plans mp ON mp.id = mpi.meal_plan_id
+		JOIN recipes r ON r.id = mpi.recipe_id
+		WHERE mpi.id = $1 AND mp.user_id = $2`,
+		itemID, userID,
+	).Scan(&cook.ID, &cook.RecipeID, &cook.RecipeTitle, &cookDate, &cook.Servings, &cook.MealSlot, &source); err != nil {
+		return nil, err
+	}
+	cook.PlannedOn = cookDate.Format("2006-01-02")
+	if source != nil {
+		return nil, errors.New("that meal is leftovers — scale the day it was cooked on instead")
+	}
+	for _, d := range days {
+		if !d.After(cookDate) {
+			return nil, errors.New("leftovers are eaten after the day they are cooked")
+		}
+	}
+
+	// Days that dropped out of the list are no longer covered.
+	if _, err = tx.Exec(ctx,
+		`DELETE FROM meal_plan_items WHERE source_item_id = $1 AND planned_on <> ALL($2::date[])`,
+		itemID, days,
+	); err != nil {
+		return nil, err
+	}
+
+	if servings != nil {
+		if _, err = tx.Exec(ctx, `UPDATE meal_plan_items SET servings = $2 WHERE id = $1`, itemID, *servings); err != nil {
+			return nil, err
+		}
+		cook.Servings = servings
+	}
+
+	items := []model.MealPlanItem{cook}
+	for _, d := range days {
+		// Whatever else was in that slot goes — the client confirms that first, exactly
+		// as an ordinary reassignment does (BACKLOG 9.10).
+		if _, err = tx.Exec(ctx, `
+			DELETE FROM meal_plan_items mpi
+			USING meal_plans mp
+			WHERE mpi.meal_plan_id = mp.id AND mp.user_id = $1 AND mpi.planned_on = $2
+			  AND mpi.meal_slot = $3 AND mpi.source_item_id IS DISTINCT FROM $4`,
+			userID, d, cook.MealSlot, itemID,
+		); err != nil {
+			return nil, err
+		}
+
+		startsOn := StartOfWeek(d, weekStartOf(ctx, tx, userID))
+		planID, err := findOrCreateMealPlanRow(ctx, tx, userID, startsOn, startsOn.AddDate(0, 0, 6))
+		if err != nil {
+			return nil, err
+		}
+		var id int
+		// A day already covered by this cook stays as it is, id included, so re-confirming
+		// the same set of days changes nothing.
+		if err = tx.QueryRow(ctx, `
+			INSERT INTO meal_plan_items (meal_plan_id, recipe_id, planned_on, meal_slot, source_item_id)
+			SELECT $1, $2, $3, $4, $5
+			WHERE NOT EXISTS (
+				SELECT 1 FROM meal_plan_items
+				WHERE planned_on = $3 AND meal_slot = $4 AND source_item_id = $5)
+			RETURNING id`,
+			planID, cook.RecipeID, d, cook.MealSlot, itemID,
+		).Scan(&id); err == pgx.ErrNoRows {
+			err = tx.QueryRow(ctx,
+				`SELECT id FROM meal_plan_items WHERE planned_on = $1 AND meal_slot = $2 AND source_item_id = $3`,
+				d, cook.MealSlot, itemID,
+			).Scan(&id)
+		}
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, model.MealPlanItem{
+			ID:           id,
+			RecipeID:     cook.RecipeID,
+			RecipeTitle:  cook.RecipeTitle,
+			PlannedOn:    d.Format("2006-01-02"),
+			MealSlot:     cook.MealSlot,
+			SourceItemID: &cook.ID,
+		})
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// weekStartOf reads the user's week_start_day, falling back to Monday — StartOfWeek's own
+// fallback — if it can't be read, since a week's start only decides which meal_plans row
+// a day is filed under.
+func weekStartOf(ctx context.Context, q queryRower, userID int) string {
+	var day string
+	if err := q.QueryRow(ctx, `SELECT week_start_day FROM users WHERE id = $1`, userID).Scan(&day); err != nil {
+		return "monday"
+	}
+	return day
 }

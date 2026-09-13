@@ -143,6 +143,7 @@ var chatTools = map[string]tool{
 					"draft_ref": str("A draft_ref (e.g. from plan_week's variant_drafts) to save first, then plan"),
 					"servings":  integer("Portions wanted that day; omit for the recipe as written"),
 					"meal_slot": str("Which meal of the day: breakfast, lunch, dinner or snack. Omit for dinner. A day can hold one entry per slot, so list a lunch and a dinner as two entries."),
+					"leftover_of": str("The YYYY-MM-DD day whose cooking this meal eats again — set it on every day that is leftovers of an earlier day's pot, and give that day the same recipe_id. Omit when the meal is cooked fresh. Clearing the cooking day clears its leftovers with it."),
 				}, "date"),
 			},
 			"confirm": map[string]any{"type": "boolean", "description": "Set true to go ahead and replace days that are already planned"},
@@ -158,6 +159,7 @@ var chatTools = map[string]tool{
 			"draft_ref": str("A draft_ref to save first, then plan"),
 			"servings":  integer("Portions wanted that day; omit for the recipe as written"),
 			"meal_slot": str("Which meal of the day: breakfast, lunch, dinner or snack. Omit for dinner. This replaces only that slot, leaving the day's other meals alone."),
+			"leftover_of": str("The YYYY-MM-DD day whose cooking this meal eats again, with the same recipe_id. Omit when it is cooked fresh."),
 		}, "date"),
 		NeedsAuth: true,
 		Run:       toolSetPlanDay,
@@ -526,6 +528,10 @@ type planDayArg struct {
 	Servings int `json:"servings"`
 	// MealSlot is which meal of the day this fills (BACKLOG 6.10); "" means dinner.
 	MealSlot string `json:"meal_slot"`
+	// LeftoverOf names the day whose pot this meal eats again (BACKLOG 9.11). A date
+	// rather than an item id: the model has the dates in front of it and would have to
+	// look an id up. "" means cooked fresh.
+	LeftoverOf string `json:"leftover_of"`
 }
 
 // resolvePlanDays turns the model's day arguments into storage assignments, saving any
@@ -575,6 +581,16 @@ func (s *chatSession) resolvePlanDays(ctx context.Context, days []planDayArg) ([
 			}
 		}
 		day := storage.PlannedDay{RecipeID: recipeID, PlannedOn: plannedOn, MealSlot: slot}
+		if d.LeftoverOf != "" {
+			src, err := time.Parse(time.DateOnly, d.LeftoverOf)
+			if err != nil {
+				return nil, nil, errors.New("leftover_of must be a date like 2026-09-14")
+			}
+			if !src.Before(plannedOn) {
+				return nil, nil, errors.New("leftover_of must be an earlier day than the day eating the leftovers")
+			}
+			day.LeftoverOf = &src
+		}
 		if d.Servings > 0 {
 			servings := d.Servings
 			day.Servings = &servings
@@ -757,6 +773,11 @@ func toolSetPreferences(ctx context.Context, s *chatSession, args json.RawMessag
 	merged, err := mergePreferences(current, a.Patch)
 	if err != nil {
 		return nil, nil, errors.New("could not apply that change to your preferences")
+	}
+	// Same bound the DB CHECK and PATCH /preferences enforce — said here so the model
+	// gets "20 is the most" back rather than an opaque save failure.
+	if merged.HouseholdSize != nil && (*merged.HouseholdSize < 1 || *merged.HouseholdSize > 20) {
+		return nil, nil, errors.New("household_size must be between 1 and 20")
 	}
 	if err := storage.UpdatePreferences(ctx, s.userID, merged); err != nil {
 		return nil, nil, errors.New("could not save your preferences")

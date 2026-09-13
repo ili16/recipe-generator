@@ -260,3 +260,57 @@ func HandleGenerateVariant(w http.ResponseWriter, r *http.Request) {
 		"structured":           variant,
 	})
 }
+
+// HandleSetBatchCook makes one cooking day cover a set of later days: the cook scales up,
+// each covered day gets a leftover row pointing at it, and the whole thing is one atomic
+// write (BACKLOG 9.13). `days` is the complete set of covered days, so the same call is
+// also the undo — drop a day from the list and its leftover is cleared.
+func HandleSetBatchCook(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	itemID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || itemID <= 0 {
+		http.Error(w, "Invalid item id", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		// Days is every day this pot covers, YYYY-MM-DD. Empty means "only the day it is
+		// cooked on" — which is how the control undoes itself.
+		Days []string `json:"days"`
+		// Servings is what the cooking day scales to. Omit to leave it alone.
+		Servings *int `json:"servings,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+	if req.Servings != nil && (*req.Servings < 1 || *req.Servings > 99) {
+		http.Error(w, "servings must be between 1 and 99", http.StatusBadRequest)
+		return
+	}
+	days := make([]time.Time, 0, len(req.Days))
+	for _, raw := range req.Days {
+		d, err := time.Parse(dateLayout, raw)
+		if err != nil {
+			http.Error(w, "invalid day (YYYY-MM-DD): "+raw, http.StatusBadRequest)
+			return
+		}
+		days = append(days, d)
+	}
+
+	items, err := storage.SetBatchCook(r.Context(), user.ID, itemID, days, req.Servings)
+	if errors.Is(err, pgx.ErrNoRows) {
+		http.Error(w, "Meal plan item not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		slog.Error("Error setting batch cook", "error", err, "itemID", itemID)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}

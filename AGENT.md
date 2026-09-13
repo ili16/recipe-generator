@@ -404,31 +404,55 @@ Authenticated (Bearer token required):
 	- `starts_on` required; `ends_on` optional, defaults to `starts_on+6d` (a week). Range
 	  capped at 42 days; 400 if missing/unparseable/out of range.
 	- 200 with `{"starts_on":"...","ends_on":"...","items":[{"id":...,"recipe_id":...,`
-	  `"recipe_title":"...","planned_on":"...","start_time":"18:00:00","meal_slot":"dinner"},`
+	  `"recipe_title":"...","planned_on":"...","meal_slot":"dinner","servings":4,`
+	  `"source_item_id":null},`
 	  `...]}` — every item planned in that range, **up to one per (day, `meal_slot`)**,
-	  ordered by day then by the order a day is eaten (BACKLOG 6.4). Used by all three calendar views: Week
+	  ordered by day then by the order a day is eaten (BACKLOG 6.4). `source_item_id` names
+	  the item whose pot this meal eats again (BACKLOG 9.11); null means it is cooked that
+	  day. It is what makes a leftover a stored fact rather than a client-side guess from
+	  "yesterday held the same recipe_id" — which was wrong whenever a dish was deliberately
+	  cooked twice. Used by all three calendar views: Week
 	  passes a 7-day range, Day a single day, Month the full displayed grid (up to 42
 	  days).
 - POST /meal-plan/items
-	- JSON: `{"recipe_id":7,"planned_on":"2026-09-09","start_time":"18:00:00",`
+	- JSON: `{"recipe_id":7,"planned_on":"2026-09-09","servings":4,`
 	  `"meal_slot":"lunch"}` → 201 with the created item (same shape as one entry in
-	  `GET /meal-plan`'s `items`). `start_time` optional, defaults to `18:00:00`;
-	  `meal_slot` optional, defaults to `dinner`, 400 if it isn't one of
+	  `GET /meal-plan`'s `items`). `meal_slot` optional, defaults to `dinner`, 400 if it isn't one of
 	  `breakfast|lunch|dinner|snack`. 404 if `recipe_id` doesn't belong to the caller.
 	  Upserts by **(day, slot)** — replaces whatever was in that slot and leaves the
 	  day's other meals alone (BACKLOG 6.4), so reassigning a filled slot needs no
 	  separate delete. Creates that week's `meal_plans` row implicitly on first use.
+	  Omitting `servings` no longer means "as the recipe is written": a newly planned day
+	  starts from the caller's `household_size` when they have set one (BACKLOG 9.12).
+	  That default lives in `storage.ApplyMealPlanDays`, so every path that plans a day —
+	  this endpoint, the agent's `set_plan_day`/`apply_week_plan` — gets it.
 - DELETE /meal-plan/items/{id}
-	- 204 on success, 404 if the item doesn't exist or isn't owned by the caller.
+	- 204 on success, 404 if the item doesn't exist or isn't owned by the caller. Deleting a
+	  *cook* deletes every leftover of it too (`meal_plan_items.source_item_id` is
+	  `ON DELETE CASCADE`) — you did not cook it, so nothing eats it (BACKLOG 9.11).
+- POST /meal-plan/items/{id}/covers
+	- JSON: `{"days":["2026-09-21","2026-09-22"],"servings":12}` → 200 with the cooking item
+	  plus its leftovers. Makes one cooking day cover a set of later days in one transaction
+	  (BACKLOG 9.13): each day in `days` becomes a row in the cook's own meal slot with
+	  `source_item_id` set, and whatever was in that slot is replaced. **`days` is the
+	  complete set**, so the same call is the undo — a day dropped from the list has its
+	  leftover cleared, and `[]` takes it back to an ordinary single-day cook.
+	  `servings` is optional and scales the cooking day (the caller sends
+	  `household_size × (1 + len(days))`); it is the only place a leftover's quantity is
+	  ever edited, on the day that cooks. 404 if the item isn't the caller's; 400 if it is
+	  itself a leftover, or if a covered day is not after the cooking day.
 - GET /preferences
 	- 200 with `UserPreferences`: `{"skill_level":...,"dietary_prefs":[...],`
 	  `"disliked_ingredients":[...],"meal_plan_no_food_days":[...],`
-	  `"meal_plan_no_cook_days":[...],"meal_plan_batch_days":1,"week_start_day":"monday"}`.
+	  `"meal_plan_no_cook_days":[...],"meal_plan_batch_days":1,"week_start_day":"monday",`
+	  `"household_size":null}`. `household_size` is how many people the caller cooks for
+	  (BACKLOG 9.12) — **null means they never said**, which is not 1: with no number there
+	  is nothing to compare a recipe's yield against, so nothing claims a mismatch.
 - PATCH /preferences
 	- JSON: full `UserPreferences` (server overwrites, not a merge — always send the
 	  complete object). `meal_plan_no_food_days`/`meal_plan_no_cook_days`/
 	  `week_start_day` entries validated against `weekdayNames`; `meal_plan_batch_days`
-	  must be 1/2/3; a day may not appear in **both** `meal_plan_no_food_days` and
+	  must be 1/2/3; `household_size` must be null or 1–20; a day may not appear in **both** `meal_plan_no_food_days` and
 	  `meal_plan_no_cook_days` (400 — the two are contradictory, see BACKLOG 4.4).
 	  → 200 with the saved object.
 
@@ -489,7 +513,11 @@ existed since `00001` but only became meaningful with BACKLOG 8.2's soft delete.
 - internal/storage/users.go: EnsureUser upsert keyed by OIDC subject
 - internal/storage/usage.go: LLM usage recording, spend lookup, admin usage listing, budget overrides
 - internal/storage/mealplan.go: meal-plan range queries, transactional upsert-by-day apply
-  (`ApplyMealPlanDays`; `AddMealPlanItem` is the one-day case), move (patch), delete
+  (`ApplyMealPlanDays`; `AddMealPlanItem` is the one-day case), move (patch), delete, and
+  `SetBatchCook` — one cooking day covering a set of later days (BACKLOG 9.13).
+  `SetBatchCook` deliberately does **not** go through `ApplyMealPlanDays`: that upserts by
+  deleting the existing row first, and deleting a cook cascades away the very leftovers it
+  would be writing
 - internal/storage/collections.go: collections CRUD and membership, every query scoped by
   `user_id` so another user's id is not-found (BACKLOG 8.1)
 - internal/storage/pantry.go: pantry CRUD (BACKLOG 7.1) and `RecipesUsingIngredients`, the
