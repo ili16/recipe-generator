@@ -51,6 +51,9 @@ var (
 	refineDuration   = mustHistogram("recipe.refine.duration_ms", "ms", "recipe refinement latency")
 	saveCount        = mustCounter("recipe.save.count", "recipe save calls")
 	saveIterations   = mustHistogram("recipe.save.iterations", "1", "chat edits applied before a recipe was saved")
+	chatTurnCount    = mustCounter("chat.turn.count", "agent turns, by how they ended")
+	chatToolCount    = mustCounter("chat.tool.count", "agent tool calls, by tool and outcome")
+	chatRecipeSaved  = mustCounter("chat.recipe.saved", "recipes saved from an agent turn")
 	llmTokenUsage    = mustCounter("llm.tokens", "LLM tokens consumed, by prompt/completion")
 	llmCallDuration  = mustHistogram("llm.call.duration_ms", "ms", "LLM call latency by model/call_type")
 )
@@ -275,4 +278,32 @@ func RecordLLMUsage(ctx context.Context, callType, model string, promptTokens, c
 		attribute.String("model", model),
 		attribute.String("kind", "completion"),
 	))
+}
+
+// RecordChatTurn reports one finished agent turn, counted by how it ended: "ok",
+// "abandoned" (the client hung up before the turn finished), or the turn's error code
+// ("timeout", "budget_exceeded", "model_error", "iteration_limit").
+//
+// This is the denominator of the funnel BACKLOG 9.6 asks for — saves per 100 turns is
+// chat.recipe.saved over the sum of this counter — so it is recorded for every outcome,
+// not just successful ones. A turn whose process dies mid-flight records nothing; that
+// is the known floor on its accuracy.
+func RecordChatTurn(ctx context.Context, outcome string) {
+	chatTurnCount.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", outcome)))
+}
+
+// RecordChatTool reports one agent tool call. The tool name is a closed set (the tool
+// catalog), so it is safe as a metric attribute — unlike anything drawn from user input.
+func RecordChatTool(ctx context.Context, tool string, ok bool) {
+	chatToolCount.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("tool", tool),
+		attribute.String("outcome", outcomeAttr(ok)),
+	))
+}
+
+// RecordChatRecipeSaved reports one recipe persisted by an agent turn — the thing the
+// whole funnel is trying to cause. Counted where the row is actually created, so
+// re-saving an already-saved draft (which returns the first recipe) does not count twice.
+func RecordChatRecipeSaved(ctx context.Context) {
+	chatRecipeSaved.Add(ctx, 1)
 }

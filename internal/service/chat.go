@@ -20,6 +20,7 @@ import (
 	"github.com/ili16/recipe-generator/internal/model"
 	"github.com/ili16/recipe-generator/internal/ratelimit"
 	"github.com/ili16/recipe-generator/internal/storage"
+	"github.com/ili16/recipe-generator/internal/telemetry"
 	"github.com/ili16/recipe-generator/internal/utils"
 	"github.com/openai/openai-go"
 )
@@ -191,8 +192,8 @@ func HandleChat(w http.ResponseWriter, r *http.Request) {
 		// Language is the caller's device locale (ISO 639-1). Optional; it only breaks
 		// the tie when the message itself carries no clear language signal — a short
 		// foreign dish name like "cacio e pepe" should not hijack the output language.
-		Language string `json:"language"`
-		Attachments    []struct {
+		Language    string `json:"language"`
+		Attachments []struct {
 			Type string `json:"type"`
 			URL  string `json:"url"`
 			// Data carries an image inline, either as a data: URL or bare base64.
@@ -264,6 +265,7 @@ func HandleChat(w http.ResponseWriter, r *http.Request) {
 	session.messages = append(session.messages, model.ConversationMessage{Role: "user", Content: req.Message})
 
 	produced, code := runTurn(ctx, emit, session)
+	telemetry.RecordChatTurn(ctx, turnOutcome(ctx, code))
 
 	// Persist whatever the turn produced even when it ended on an error — a half-done
 	// turn the user can see must be a half-done turn the next turn can read.
@@ -274,6 +276,20 @@ func HandleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	emit("done", map[string]string{"conversation_id": session.id})
+}
+
+// turnOutcome labels a finished turn for the funnel counter. A client that hangs up
+// mid-stream cancels the request context, which runTurn reports as "timeout" — but a
+// user who walked away and a backend that was too slow are different problems, so they
+// are separated here by *which* context error fired (Canceled vs DeadlineExceeded).
+func turnOutcome(ctx context.Context, code string) string {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return "abandoned"
+	}
+	if code == "" {
+		return "ok"
+	}
+	return code
 }
 
 // emit sends one client event. The turn never knows which transport it is on.
@@ -448,6 +464,7 @@ func runToolCall(ctx context.Context, send emit, session *chatSession, call open
 		payload = []byte(`{"error":"the tool returned something unreadable"}`)
 	}
 
+	telemetry.RecordChatTool(ctx, name, err == nil)
 	send("tool_end", map[string]any{"name": name, "ok": err == nil})
 	if art != nil {
 		send("artifact", art)

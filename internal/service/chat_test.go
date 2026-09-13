@@ -1,10 +1,12 @@
 package service
 
 import (
+	"context"
 	"encoding/base64"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ili16/recipe-generator/internal/model"
 )
@@ -205,5 +207,35 @@ func TestCompaction(t *testing.T) {
 	}
 	if renderThread(msgs[:cut]) == "" {
 		t.Error("the summariser was handed an empty thread")
+	}
+}
+
+// An abandoned turn and a slow one both surface as a context error, and the funnel
+// (BACKLOG.md 9.6) is only worth reading if it tells them apart.
+func TestTurnOutcome(t *testing.T) {
+	ok := context.Background()
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	expired, stop := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer stop()
+
+	cases := []struct {
+		name string
+		ctx  context.Context
+		code string
+		want string
+	}{
+		{"clean turn", ok, "", "ok"},
+		{"error code passes through", ok, "budget_exceeded", "budget_exceeded"},
+		{"client hung up", canceled, "timeout", "abandoned"},
+		{"client hung up after a clean turn", canceled, "", "abandoned"},
+		{"deadline is a real timeout, not an abandon", expired, "timeout", "timeout"},
+	}
+	for _, c := range cases {
+		if got := turnOutcome(c.ctx, c.code); got != c.want {
+			t.Errorf("%s: turnOutcome(_, %q) = %q, want %q", c.name, c.code, got, c.want)
+		}
 	}
 }
