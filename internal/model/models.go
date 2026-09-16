@@ -224,9 +224,23 @@ type RecipeVersion struct {
 var GroceryCategories = []string{"produce", "protein", "dairy", "pantry", "other"}
 
 // NormalizeItem is the one spelling of an ingredient name that everything keys on: the
-// grocery list consolidates on it (BACKLOG 6.1) and a pantry item is stored as it (7.1),
-// so "Flour" in a recipe and "flour" in the pantry are the same thing.
+// grocery list consolidates on it (BACKLOG 6.1), a pantry item is stored as it (7.1) and
+// ingredient_grams is keyed by it (16.2), so "Flour" in a recipe and "flour" in the
+// pantry are the same thing.
+//
+// The preparation is not part of the name (BACKLOG 16.4). Recipes write the cut into the
+// item — "onion, finely chopped", "garlic (minced)" — and everything downstream is about
+// the food, not what you did to it: a pantry holding onions covers a recipe asking for
+// chopped onion, a week asking three ways is one line on the list, and one onion is one
+// gram conversion instead of three that disagree. Everything before the first comma or
+// bracket is the food; the rest is thrown away here and kept on the ingredient row, which
+// is still what gets rendered.
+//
+// The SQL copy of this is normalize_item() (migration 00037). Change one, change both.
 func NormalizeItem(item string) string {
+	if i := strings.IndexAny(item, ",("); i >= 0 {
+		item = item[:i]
+	}
 	return strings.ToLower(strings.TrimSpace(item))
 }
 
@@ -253,6 +267,77 @@ func NormalizeUnit(unit *string) (family string, factor float64) {
 	}
 }
 
+// PortionScale is how much of a recipe a planned day needs: 4 portions of a recipe that
+// yields 2 is a factor of 2 on every measured quantity (BACKLOG 6.2). Unknown or
+// nonsensical servings on either side mean "as written" — a factor of 1 — because
+// guessing a household size is worse than shopping for the recipe as it stands.
+//
+// The grocery list scales by it and the pantry deduction scales by it, which is the
+// point of it living here: the fridge must lose exactly what the list bought.
+func PortionScale(planned, recipeYield *int) float64 {
+	if planned == nil || recipeYield == nil {
+		return 1
+	}
+	if *planned <= 0 || *recipeYield <= 0 {
+		return 1
+	}
+	return float64(*planned) / float64(*recipeYield)
+}
+
+// ItemUnit is the key of the ingredient_grams table: one normalised ingredient name and
+// one normalised unit. Unit "" means "one piece" — the grams of a single onion. Both
+// halves are always the output of NormalizeItem / NormalizeUnit, so a key built here and
+// a key read from the table are the same key.
+type ItemUnit struct {
+	Item string
+	Unit string
+}
+
+// GramsWildcard is the Item of a conversion that does not depend on the food: a teaspoon
+// is 5 g of most things. An item-specific row always wins over it.
+const GramsWildcard = "*"
+
+// GramsRow is one row of ingredient_grams — Grams is how much one Unit of Item weighs.
+type GramsRow struct {
+	ItemUnit
+	Grams  float64
+	Source string
+}
+
+// ToGrams converts qty of unit for item into grams, using a table read from
+// ingredient_grams. It is the only place in the codebase that does unit arithmetic
+// beyond NormalizeUnit's kg/l folding.
+//
+// The lookup order is deliberate: "g" is the identity and never needs a row; then the
+// item's own conversion ("one onion is 150 g", "a cup of flour is 120 g"); then the
+// wildcard ("a cup is 240 ml of water"). ok is false when nothing knows — and a false
+// here must always mean "leave it alone", never "assume 1", because the callers are a
+// shopping list and a subtraction from someone's fridge.
+func ToGrams(table map[ItemUnit]float64, item string, unit *string, qty float64) (float64, bool) {
+	family, factor := NormalizeUnit(unit)
+	if family == "g" {
+		return qty * factor, true
+	}
+	if g, ok := table[ItemUnit{NormalizeItem(item), family}]; ok {
+		return qty * factor * g, true
+	}
+	if g, ok := table[ItemUnit{GramsWildcard, family}]; ok {
+		return qty * factor * g, true
+	}
+	return 0, false
+}
+
+// FromGrams is ToGrams inverted: how many of unit make up grams, for rendering an amount
+// back in the unit the user actually thinks in. Same lookup order, same contract — false
+// means the caller must not invent a number.
+func FromGrams(table map[ItemUnit]float64, item string, unit *string, grams float64) (float64, bool) {
+	per, ok := ToGrams(table, item, unit, 1)
+	if !ok || per == 0 {
+		return 0, false
+	}
+	return grams / per, true
+}
+
 // PantryCategories are where a pantry item lives, in render order (BACKLOG 7.1).
 // Anything else is treated as the default, "spices_dry".
 var PantryCategories = []string{"fridge", "freezer", "produce", "spices_dry"}
@@ -268,6 +353,21 @@ type PantryItem struct {
 	Unit      *string  `json:"unit"`
 	Category  string   `json:"category"`
 	ExpiresOn *string  `json:"expires_on"` // YYYY-MM-DD
+	// Staple means "this kitchen always has this" — salt, pepper, water, oil. It still
+	// counts toward a recipe's pantry match, which is the point of marking one; what it
+	// stops is the grocery list shopping for it and a cooked meal deducting it.
+	Staple bool `json:"staple"`
+}
+
+// PantryChange is one line of what cooking a meal did to the pantry, so the app can say
+// "−200 g flour" rather than silently editing someone's fridge. Removed means the row is
+// gone entirely; otherwise Remaining is what is left, in the row's own unit.
+type PantryChange struct {
+	Name      string   `json:"name"`
+	Used      float64  `json:"used"`
+	Unit      *string  `json:"unit"`
+	Remaining *float64 `json:"remaining,omitempty"`
+	Removed   bool     `json:"removed,omitempty"`
 }
 
 // GroceryIngredient is one ingredient of one planned meal, as read for a week's grocery
@@ -318,6 +418,10 @@ type MealPlanItem struct {
 	// that pot, eaten again here (BACKLOG 9.11). nil means it is cooked on the day. The
 	// row is deleted with its source (ON DELETE CASCADE) — no cook, no leftover.
 	SourceItemID *int `json:"source_item_id,omitempty"`
+	// CookedAt, when set, means this pot has been cooked and eaten: the grocery list
+	// stops shopping for it and the pantry has already been deducted for it. Distinct
+	// from Recipe.LastCookedAt, which is about the recipe rather than this meal.
+	CookedAt *time.Time `json:"cooked_at,omitempty"`
 }
 
 // MealPlanAssignment is one proposed day in an AI-suggested meal plan. Exactly one of

@@ -516,16 +516,16 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 		-- Pantry match (BACKLOG 7.3): how many of this recipe's ingredients the caller
 		-- already has. Matched on the normalised *name* only — "250 g flour" and "2 cups
 		-- flour" are the same pantry item, so comparing amounts would report a miss on the
-		-- very case the match exists to handle. lower(btrim(...)) is model.NormalizeItem,
+		-- very case the match exists to handle. normalize_item() is model.NormalizeItem in SQL,
 		-- which is also how pantry_items.name was written.
 		LEFT JOIN LATERAL (
 			SELECT count(*) AS total,
 			       count(*) FILTER (
 			           WHERE EXISTS (SELECT 1 FROM pantry_items p
-			                         WHERE `+inScope("p", "$1")+` AND p.name = lower(btrim(ri.item)))
+			                         WHERE `+inScope("p", "$1")+` AND p.name = normalize_item(ri.item))
 			       ) AS have
 			FROM recipe_ingredients ri
-			WHERE ri.recipe_id = r.id AND btrim(ri.item) <> ''
+			WHERE ri.recipe_id = r.id AND normalize_item(ri.item) <> ''
 		) pm ON TRUE
 		WHERE `+inScope("r", "$1")+` AND r.deleted_at IS NULL ORDER BY r.updated_at DESC`, userid)
 	if err != nil {

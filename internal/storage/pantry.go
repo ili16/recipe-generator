@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"math"
 	"slices"
 	"time"
 
@@ -29,7 +30,7 @@ const dateLayout = "2006-01-02"
 // the natural reading order; items with no expiry sort last.
 func ListPantryItems(ctx context.Context, userID int) ([]model.PantryItem, error) {
 	rows, err := Pool.Query(ctx, `
-		SELECT id, name, quantity, unit, category, expires_on
+		SELECT id, name, quantity, unit, category, expires_on, staple
 		FROM pantry_items WHERE `+inScope("pantry_items", "$1")+`
 		ORDER BY expires_on ASC NULLS LAST, name`, userID)
 	if err != nil {
@@ -82,13 +83,13 @@ func UpsertPantryItem(ctx context.Context, userID int, in model.PantryItem) (mod
 	}
 
 	row := Pool.QueryRow(ctx, `
-		INSERT INTO pantry_items (user_id, household_id, name, quantity, unit, category, expires_on)
-		VALUES ($1, `+stampHousehold+`, $2, $3, $4, $5, $6)
+		INSERT INTO pantry_items (user_id, household_id, name, quantity, unit, category, expires_on, staple)
+		VALUES ($1, `+stampHousehold+`, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (COALESCE(household_id::text, 'u' || user_id), name, COALESCE(unit, '')) DO UPDATE
 		SET quantity = EXCLUDED.quantity, category = EXCLUDED.category,
-		    expires_on = EXCLUDED.expires_on, updated_at = NOW()
-		RETURNING id, name, quantity, unit, category, expires_on`,
-		userID, name, qty, unit, category, expires)
+		    expires_on = EXCLUDED.expires_on, staple = EXCLUDED.staple, updated_at = NOW()
+		RETURNING id, name, quantity, unit, category, expires_on, staple`,
+		userID, name, qty, unit, category, expires, in.Staple)
 	return scanPantryItem(row)
 }
 
@@ -105,12 +106,12 @@ func DeletePantryItem(ctx context.Context, userID, itemID int) error {
 	return nil
 }
 
-// scanPantryItem reads the six columns every query above selects, in that order, and
+// scanPantryItem reads the seven columns every query above selects, in that order, and
 // renders expires_on as a plain date string.
 func scanPantryItem(row pgx.Row) (model.PantryItem, error) {
 	var item model.PantryItem
 	var expires *time.Time
-	if err := row.Scan(&item.ID, &item.Name, &item.Quantity, &item.Unit, &item.Category, &expires); err != nil {
+	if err := row.Scan(&item.ID, &item.Name, &item.Quantity, &item.Unit, &item.Category, &expires, &item.Staple); err != nil {
 		return model.PantryItem{}, err
 	}
 	if expires != nil {
@@ -151,11 +152,11 @@ func RecipesUsingIngredients(ctx context.Context, userID int, names []string) (m
 	}
 
 	rows, err := Pool.Query(ctx, `
-		SELECT DISTINCT ri.recipe_id, lower(btrim(ri.item))
+		SELECT DISTINCT ri.recipe_id, normalize_item(ri.item)
 		FROM recipe_ingredients ri
 		JOIN recipes r ON r.id = ri.recipe_id
 		WHERE `+inScope("r", "$1")+` AND r.deleted_at IS NULL
-		  AND lower(btrim(ri.item)) = ANY($2::text[])`, userID, normalised)
+		  AND normalize_item(ri.item) = ANY($2::text[])`, userID, normalised)
 	if err != nil {
 		return nil, err
 	}
@@ -171,4 +172,195 @@ func RecipesUsingIngredients(ctx context.Context, userID int, names []string) (m
 		out[recipeID] = append(out[recipeID], item)
 	}
 	return out, rows.Err()
+}
+
+// StapleNames is the set of normalised names the caller's kitchen always has. The
+// grocery list drops them (you do not shop for salt) and a cooked meal does not deduct
+// them (you do not measure what is left of it). They stay ordinary pantry rows
+// everywhere else, which is why the pantry match still counts them — that is the whole
+// reason for marking one.
+func StapleNames(ctx context.Context, userID int) (map[string]bool, error) {
+	rows, err := Pool.Query(ctx,
+		`SELECT name FROM pantry_items WHERE `+inScope("pantry_items", "$1")+` AND staple`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out[name] = true
+	}
+	return out, rows.Err()
+}
+
+// DeductPantry takes what a cooked recipe used out of the caller's pantry, inside the
+// caller's transaction so that marking a meal cooked and emptying the fridge for it
+// either both happen or neither does.
+//
+// scale is the same portions ratio the grocery list scales by (planned servings over the
+// recipe's own yield), so cooking a 2-portion recipe for 4 takes twice as much out.
+//
+// What it will not do is guess. An ingredient is skipped, not estimated, when:
+//   - either side's unit has no conversion to grams (model.ToGrams says no), or
+//   - the pantry row has no quantity at all — "I have flour" does not say how much.
+//
+// Staples are never touched: they are the things you do not measure.
+//
+// Returns what it changed and the names it left alone, because the one thing worse than
+// not deducting is deducting silently — the caller shows both to the user.
+func DeductPantry(ctx context.Context, tx pgx.Tx, userID, recipeID int, scale float64) ([]model.PantryChange, []string, error) {
+	// What the recipe needs, summed per item: an ingredient listed in two sections is one
+	// demand on one pantry line.
+	rows, err := tx.Query(ctx, `
+		SELECT normalize_item(item), quantity, unit FROM recipe_ingredients
+		WHERE recipe_id = $1 AND normalize_item(item) <> '' AND quantity IS NOT NULL`, recipeID)
+	if err != nil {
+		return nil, nil, err
+	}
+	type demand struct {
+		grams float64
+		known bool
+	}
+	needed := map[string]*demand{}
+	var pairs []model.ItemUnit
+	type rawNeed struct {
+		item string
+		qty  float64
+		unit *string
+	}
+	var raws []rawNeed
+	for rows.Next() {
+		var r rawNeed
+		if err := rows.Scan(&r.item, &r.qty, &r.unit); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		family, _ := model.NormalizeUnit(r.unit)
+		pairs = append(pairs, model.ItemUnit{Item: r.item, Unit: family})
+		raws = append(raws, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	if len(raws) == 0 {
+		return nil, nil, nil
+	}
+
+	// The pantry lines that could be affected: same name, not a staple, in the caller's
+	// kitchen. FOR UPDATE because two members of a household can cook at once.
+	names := make([]string, 0, len(raws))
+	for _, r := range raws {
+		names = append(names, r.item)
+	}
+	pantryRows, err := tx.Query(ctx, `
+		SELECT id, name, quantity, unit FROM pantry_items
+		WHERE `+inScope("pantry_items", "$1")+` AND NOT staple AND name = ANY($2::text[])
+		FOR UPDATE`, userID, names)
+	if err != nil {
+		return nil, nil, err
+	}
+	type held struct {
+		id   int
+		name string
+		qty  *float64
+		unit *string
+	}
+	var have []held
+	for pantryRows.Next() {
+		var h held
+		if err := pantryRows.Scan(&h.id, &h.name, &h.qty, &h.unit); err != nil {
+			pantryRows.Close()
+			return nil, nil, err
+		}
+		pairs = append(pairs, model.ItemUnit{Item: h.name, Unit: derefUnit(h.unit)})
+		have = append(have, h)
+	}
+	pantryRows.Close()
+	if err := pantryRows.Err(); err != nil {
+		return nil, nil, err
+	}
+	if len(have) == 0 {
+		return nil, nil, nil
+	}
+
+	table, err := gramsTableTx(ctx, tx, pairs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Convert the demand. An unconvertible line makes the whole item unknown rather than
+	// deducting only the part we could read — half a deduction is a wrong one.
+	for _, r := range raws {
+		d, ok := needed[r.item]
+		if !ok {
+			d = &demand{known: true}
+			needed[r.item] = d
+		}
+		g, ok := model.ToGrams(table, r.item, r.unit, r.qty*scale)
+		if !ok {
+			d.known = false
+			continue
+		}
+		d.grams += g
+	}
+
+	applied := []model.PantryChange{}
+	skipped := []string{}
+	for _, h := range have {
+		d, ok := needed[h.name]
+		if !ok {
+			continue
+		}
+		hadGrams := 0.0
+		convertible := ok && d.known && h.qty != nil
+		if convertible {
+			hadGrams, convertible = model.ToGrams(table, h.name, h.unit, *h.qty)
+		}
+		if !convertible {
+			skipped = append(skipped, h.name)
+			continue
+		}
+
+		left := hadGrams - d.grams
+		if left <= 0 {
+			if _, err := tx.Exec(ctx, `DELETE FROM pantry_items WHERE id = $1`, h.id); err != nil {
+				return nil, nil, err
+			}
+			applied = append(applied, model.PantryChange{Name: h.name, Used: *h.qty, Unit: h.unit, Removed: true})
+			continue
+		}
+
+		// Back into the row's own unit. Weights are already grams by the time they are
+		// stored (UpsertPantryItem normalises kg away), so this matters for the units
+		// that survive normalisation: "6 eggs" minus 2 must come back as 4 eggs, not as
+		// 200 of anything.
+		remaining, ok := model.FromGrams(table, h.name, h.unit, left)
+		if !ok {
+			skipped = append(skipped, h.name)
+			continue
+		}
+		remaining = math.Round(remaining*1000) / 1000
+		if _, err := tx.Exec(ctx,
+			`UPDATE pantry_items SET quantity = $2, updated_at = NOW() WHERE id = $1`, h.id, remaining); err != nil {
+			return nil, nil, err
+		}
+		applied = append(applied, model.PantryChange{
+			Name: h.name, Used: math.Round((*h.qty-remaining)*1000) / 1000, Unit: h.unit, Remaining: &remaining,
+		})
+	}
+	return applied, skipped, nil
+}
+
+// derefUnit renders a nullable pantry unit as the ItemUnit key's "" for a countable item.
+func derefUnit(u *string) string {
+	if u == nil {
+		return ""
+	}
+	return *u
 }

@@ -95,10 +95,22 @@ func HandleGetGroceryList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Both reads are advisory: without staples the list shows salt, without conversions
+	// it splits onions across two lines. Neither is worth failing a shopping list over,
+	// so an error degrades to the empty map rather than a 500.
+	staples, err := storage.StapleNames(r.Context(), user.ID)
+	if err != nil {
+		slog.Warn("grocery list: could not read staples", "error", err)
+	}
+	grams, err := storage.GramsTable(r.Context(), service.GroceryPairs(ingredients))
+	if err != nil {
+		slog.Warn("grocery list: could not read conversions", "error", err)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"starts_on": startsOn.Format(dateLayout),
 		"ends_on":   endsOn.Format(dateLayout),
-		"lines":     service.BuildGroceryList(ingredients),
+		"lines":     service.BuildGroceryList(ingredients, staples, grams),
 	})
 }
 
@@ -182,6 +194,95 @@ func HandleDeleteMealPlanItem(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		slog.Error("Error deleting meal plan item", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleMarkMealCooked records that a planned meal was cooked, and takes what it used
+// out of the pantry (storage.MarkMealCooked — one transaction). Optional
+// `{"rating": 1..5}` rates the recipe at the same time, the way cooking mode's Done
+// screen does.
+//
+// The response carries what the pantry deduction did and what it refused to guess at,
+// because the alternative — quietly editing someone's fridge — is the thing that would
+// make this feature untrustworthy. 404 when the item isn't the caller's *or* is already
+// marked: re-tapping must not deduct twice.
+func HandleMarkMealCooked(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	itemID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || itemID <= 0 {
+		http.Error(w, "invalid item id", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Rating *int16 `json:"rating"`
+	}
+	// An empty body is the common case (mark it cooked, no rating), so a decode failure
+	// is only an error when something was actually sent and it was wrong.
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+	}
+	if req.Rating != nil && (*req.Rating < 1 || *req.Rating > 5) {
+		http.Error(w, "rating must be 1-5", http.StatusBadRequest)
+		return
+	}
+
+	applied, skipped, err := storage.MarkMealCooked(r.Context(), user.ID, itemID, req.Rating)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("Error marking meal cooked", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	if skipped == nil {
+		skipped = []string{}
+	}
+	if applied == nil {
+		applied = []model.PantryChange{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pantry": map[string]any{"applied": applied, "skipped": skipped},
+	})
+}
+
+// HandleUnmarkMealCooked undoes a mis-tap. The meal goes back on the week and back onto
+// the grocery list; the pantry is deliberately not restored (storage.UnmarkMealCooked
+// says why), which the client tells the user rather than leaving them to discover.
+func HandleUnmarkMealCooked(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	itemID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || itemID <= 0 {
+		http.Error(w, "invalid item id", http.StatusBadRequest)
+		return
+	}
+
+	if err := storage.UnmarkMealCooked(r.Context(), user.ID, itemID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("Error unmarking meal cooked", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}

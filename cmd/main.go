@@ -126,6 +126,8 @@ func main() {
 	mux.HandleFunc("POST /api/v1/meal-plan/items", authenticator.Require(HandleAddMealPlanItem))
 	mux.HandleFunc("DELETE /api/v1/meal-plan/items/{id}", authenticator.Require(HandleDeleteMealPlanItem))
 	mux.HandleFunc("POST /api/v1/meal-plan/items/{id}/covers", authenticator.Require(HandleSetBatchCook))
+	mux.HandleFunc("POST /api/v1/meal-plan/items/{id}/cooked", authenticator.Require(HandleMarkMealCooked))
+	mux.HandleFunc("DELETE /api/v1/meal-plan/items/{id}/cooked", authenticator.Require(HandleUnmarkMealCooked))
 	mux.HandleFunc("POST /api/v1/meal-plan/variants/{id}", llm(rl, HandleGenerateVariant))
 
 	// Feedback is deliberately optional-auth (BACKLOG 9.16) — the alpha's testers include
@@ -972,6 +974,9 @@ func HandleUpdateRecipe(w http.ResponseWriter, r *http.Request) {
 
 	content := service.RenderMarkdown(updateReq.Structured)
 	updated, err := storage.UpdateRecipeStructured(r.Context(), user.ID, updateReq.ID, updateReq.Structured, content, !updateReq.AISourced, updateReq.ChangePrompt)
+	if err == nil {
+		service.LearnGrams(updateReq.Structured.Ingredients)
+	}
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			http.Error(w, "Recipe not found", http.StatusNotFound)

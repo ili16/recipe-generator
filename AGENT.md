@@ -64,6 +64,7 @@ graph LR
         MP[GET /meal-plan]
         MPA[POST /meal-plan/items]
         MPD[DELETE /meal-plan/items/:id]
+        MPC[POST/DELETE /meal-plan/items/:id/cooked]
         PR[GET/PATCH /preferences]
         RID[GET /recipes/:id]
         RH[GET /recipes/:id/history]
@@ -280,6 +281,12 @@ otherwise), rate-limited and budget-capped per the "Rate limiting + budget" note
 	  caps itself at 500 ms and treats any error or timeout as "no duplicate". Only this
 	  tool checks — `apply_week_plan` saves drafts through the same `saveDraft` and must
 	  not stop a week to ask.
+	- `get_pantry` and `mark_meal_cooked` (BACKLOG 16.3) are the first pantry tools in the
+	  catalog. `mark_meal_cooked` is `Mutating`: it empties part of the user's fridge, so its
+	  `approvalPreview` runs the **real** deduction in a rolled-back transaction rather than a
+	  second implementation of the same arithmetic — a preview computed by different code than
+	  the action is a lie waiting to happen. Only a *cook* can be marked; a leftover ate a pot
+	  that was already deducted.
 	- `search_my_recipes` filters on title text, tags, **and `ingredients`** — a recipe
 	  matches if it uses at least one of the named ones, and each hit says which
 	  (`uses`). That last filter is what "find recipes using these" on the Pantry screen
@@ -431,11 +438,15 @@ Authenticated (Bearer token required):
 	  a no-op. 404 when either id isn't the caller's, or when removing a non-member.
 - GET /pantry
 	- 200 with `[{"id":1,"name":"flour","quantity":1500,"unit":"g","category":"spices_dry",`
-	  `"expires_on":null}, ...]` — what the caller has in the house (BACKLOG 7.1), expiring
+	  `"expires_on":null,"staple":false}, ...]` — what the caller has in the house (BACKLOG 7.1), expiring
 	  items first and undated ones last. `name` and `unit` come back **normalised**
 	  (`model.NormalizeItem` / `NormalizeUnit`: lowercased, kg folded into g and l into ml,
 	  the quantity scaled to match), which is the same key the grocery list consolidates on
 	  and the only reason 7.3's match works at all.
+	- `staple` (BACKLOG 16.1) marks a thing the kitchen always has — salt, pepper, oil. It
+	  stays an ordinary row, so the pantry match still counts it (that is the point of
+	  marking one); what it stops is the grocery list shopping for it and a cooked meal
+	  deducting it. A staple normally carries no quantity and no expiry.
 - POST /pantry
 	- JSON: `{"name":"Flour","quantity":1.5,"unit":"kg","category":"fridge",`
 	  `"expires_on":"2026-10-01"}` → 200 with the saved item. An **upsert** on
@@ -444,7 +455,8 @@ Authenticated (Bearer token required):
 	  there is no PATCH. `category` is one of `fridge|freezer|produce|spices_dry` and
 	  anything else silently becomes `spices_dry` (same reasoning as an unknown grocery
 	  aisle becoming "other"). A blank name or an `expires_on` that isn't `YYYY-MM-DD` is
-	  400.
+	  400. `staple` is optional and defaults false; it is a flag on the row, not part of
+	  its identity, so the upsert key is unchanged.
 - DELETE /pantry/{id}
 	- 204. 404 when the id isn't the caller's — indistinguishable from a missing one.
 - PATCH /update-recipe
@@ -484,13 +496,15 @@ Authenticated (Bearer token required):
 	  capped at 42 days; 400 if missing/unparseable/out of range.
 	- 200 with `{"starts_on":"...","ends_on":"...","items":[{"id":...,"recipe_id":...,`
 	  `"recipe_title":"...","planned_on":"...","meal_slot":"dinner","servings":4,`
-	  `"source_item_id":null},`
+	  `"source_item_id":null,"cooked_at":null},`
 	  `...]}` — every item planned in that range, **up to one per (day, `meal_slot`)**,
 	  ordered by day then by the order a day is eaten (BACKLOG 6.4). `source_item_id` names
 	  the item whose pot this meal eats again (BACKLOG 9.11); null means it is cooked that
 	  day. It is what makes a leftover a stored fact rather than a client-side guess from
 	  "yesterday held the same recipe_id" — which was wrong whenever a dish was deliberately
-	  cooked twice. Used by all three calendar views: Week
+	  cooked twice. `cooked_at` (BACKLOG 16.3) means this pot has been eaten — it has left the
+	  grocery list and the pantry has already been deducted for it; a leftover reads its own
+	  done state from the cook it came from. Used by all three calendar views: Week
 	  passes a 7-day range, Day a single day, Month the full displayed grid (up to 42
 	  days).
 - POST /meal-plan/items
@@ -509,6 +523,25 @@ Authenticated (Bearer token required):
 	- 204 on success, 404 if the item doesn't exist or isn't owned by the caller. Deleting a
 	  *cook* deletes every leftover of it too (`meal_plan_items.source_item_id` is
 	  `ON DELETE CASCADE`) — you did not cook it, so nothing eats it (BACKLOG 9.11).
+- POST /meal-plan/items/{id}/cooked
+	- Optional JSON `{"rating":4}` → 200 `{"pantry":{"applied":[…],"skipped":["onion"]}}`.
+	  Records that this planned meal was cooked and eaten (BACKLOG 16.3): it stamps
+	  `meal_plan_items.cooked_at` **and** `recipes.last_cooked_at`, and deducts what it used
+	  from the pantry — one transaction, so a fridge emptied for a meal that did not get
+	  marked cannot happen. `rating` rides along exactly as `PUT /recipes/{id}/cooked` does.
+	- **The response is the point.** `applied` is what changed (`{"name","used","unit",`
+	  `"remaining"}`, or `"removed":true` when the line is used up) and `skipped` names the
+	  ingredients the server would **not** guess at: no known conversion on either side, or
+	  a pantry row with no quantity ("I have flour" does not say how much). Staples are never
+	  touched. The client shows both — silently editing someone's fridge is the failure mode.
+	- 404 when the item isn't the caller's **or is already marked**: claiming `cooked_at IS
+	  NULL` is the idempotency guard, so re-tapping never deducts twice. 400 for a rating
+	  outside 1–5.
+- DELETE /meal-plan/items/{id}/cooked
+	- 204. Undo: the meal goes back on the week and back onto the grocery list. It
+	  deliberately does **not** restore the pantry — the rows were updated in place, not
+	  logged, and inventing a deduction log for an undo nobody asked for is a worse trade
+	  than the user retyping a line. The client says so.
 - POST /meal-plan/items/{id}/covers
 	- JSON: `{"days":["2026-09-21","2026-09-22"],"servings":12}` → 200 with the cooking item
 	  plus its leftovers. Makes one cooking day cover a set of later days in one transaction
@@ -605,7 +638,8 @@ Notes:
 See DATA_MODEL.md for the canonical schema and RECIPE_TAGS.md for the tagging taxonomy.
 Migrations `00001`–`00006` create it from scratch; there is no legacy database to preserve.
 `00020` adds `collections` + `recipe_collections` (BACKLOG 8.1); `00026` adds `pantry_items`
-(BACKLOG 7.1). `recipes.deleted_at` has
+(BACKLOG 7.1); `00036` adds `pantry_items.staple`, `meal_plan_items.cooked_at` and
+`ingredient_grams` (BACKLOG 16). `recipes.deleted_at` has
 existed since `00001` but only became meaningful with BACKLOG 8.2's soft delete.
 
 ## Code Map
@@ -615,6 +649,11 @@ existed since `00001` but only became meaningful with BACKLOG 8.2's soft delete.
 - cmd/backfill-aisles: one-off `make backfill-aisles` — classifies pre-BACKLOG-6.1
   ingredients into shopping aisles in batched assist-model calls; re-running with nothing
   NULL costs nothing
+- cmd/backfill-grams: the same shape for `ingredient_grams` (BACKLOG 16.2) — resolves every
+  (item, unit) in use that nothing can convert yet. Live saves resolve their own
+  (`service.LearnGrams`), so this is for the library that predates them. Safe to re-run, and
+  re-running **is** the retry: a pair the model dropped was never written, so it is still on
+  the worklist
 - internal/auth: JWKS validation, introspection, JIT user provisioning, admin role, typed request context
 - internal/ratelimit: in-memory per-IP/per-user token-bucket request limiter
 - internal/worker: the periodic background pass — cooking-profile recompute, and purging
@@ -658,7 +697,18 @@ existed since `00001` but only became meaningful with BACKLOG 8.2's soft delete.
 - internal/storage/pantry.go: pantry CRUD (BACKLOG 7.1) and `RecipesUsingIngredients`, the
   "what can I cook before it goes off" lookup behind `search_my_recipes`'s `ingredients`
   filter (7.4). The pantry match itself (7.3) is two columns on `GetRecipes`, not a
-  function here — it has no caller that wants it separately
+  function here — it has no caller that wants it separately. Also `StapleNames` (16.1) and
+  `DeductPantry` (16.3), which takes what a cooked recipe used out of the fridge **inside the
+  caller's transaction** and skips — never estimates — anything it cannot convert
+- internal/storage/grams.go: the `ingredient_grams` conversion table (BACKLOG 16.2). The one
+  table in this package with no `inScope` and no userID, deliberately: how much an onion
+  weighs is not a fact about a household
+- internal/storage/cooked_meal.go: `MarkMealCooked` / `UnmarkMealCooked` (16.3) — one
+  transaction stamping `meal_plan_items.cooked_at`, `recipes.last_cooked_at` and the pantry
+  deduction together. `PreviewDeductPantry` is the same call in a transaction that is always
+  rolled back, which is what the agent's approval card shows
+- internal/service/grams.go: filling `ingredient_grams` from the assist model
+  (`EnsureGrams`), and `LearnGrams`, the detached version every recipe save fires
 - internal/storage/duplicates.go: the advisory, time-capped duplicate lookup behind
   `save_recipe`'s prompt (BACKLOG 8.3)
 - internal/storage/conversations.go: server-held chat threads for /chat, ownership-checked on
@@ -675,6 +725,15 @@ existed since `00001` but only became meaningful with BACKLOG 8.2's soft delete.
   `ResponseFormat`. `grep -rn "Tools:\|ToolCall\|tool_choice" --include="*.go" .` returns
   nothing. This is the central limitation the agentic-chat rewrite addresses — see
   [specs/AGENT_CHAT.md](specs/AGENT_CHAT.md).
+
+- **`NormalizeItem` drops the preparation, and is load-bearing in four places.** It cuts at
+  the first comma or bracket and lowercases the rest, so `onion`, `onion, sliced` and
+  `onion (chopped)` are one food to the pantry match, the grocery list, `ingredient_grams`
+  and the cooked deduction (BACKLOG 16.4). `recipe_ingredients.item` still holds the full
+  text and is still what renders — only the *key* is the bare food. **There are two copies
+  of this rule**: `model.NormalizeItem` and the SQL `normalize_item()` from migration
+  `00037`, which every storage query calls. Change one, change both — `internal/model/grams_test.go`
+  pins the cases.
 
 - **One tagger.** The structured schema returns `tags` as a constrained enum. The second
   one (`classifyTags`, a substring match over a plain-text reply) died with

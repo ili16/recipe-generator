@@ -16,7 +16,7 @@ import (
 // races into two plan rows for the same week.
 func GetMealPlanRange(ctx context.Context, userID int, startsOn, endsOn time.Time) ([]model.MealPlanItem, error) {
 	rows, err := Pool.Query(ctx, `
-		SELECT mpi.id, mpi.recipe_id, r.title, mpi.planned_on, mpi.servings, mpi.meal_slot, mpi.source_item_id
+		SELECT mpi.id, mpi.recipe_id, r.title, mpi.planned_on, mpi.servings, mpi.meal_slot, mpi.source_item_id, mpi.cooked_at
 		FROM meal_plan_items mpi
 		JOIN meal_plans mp ON mp.id = mpi.meal_plan_id
 		JOIN recipes r ON r.id = mpi.recipe_id
@@ -33,7 +33,7 @@ func GetMealPlanRange(ctx context.Context, userID int, startsOn, endsOn time.Tim
 	for rows.Next() {
 		var item model.MealPlanItem
 		var plannedOn time.Time
-		if err := rows.Scan(&item.ID, &item.RecipeID, &item.RecipeTitle, &plannedOn, &item.Servings, &item.MealSlot, &item.SourceItemID); err != nil {
+		if err := rows.Scan(&item.ID, &item.RecipeID, &item.RecipeTitle, &plannedOn, &item.Servings, &item.MealSlot, &item.SourceItemID, &item.CookedAt); err != nil {
 			return nil, err
 		}
 		item.PlannedOn = plannedOn.Format("2006-01-02")

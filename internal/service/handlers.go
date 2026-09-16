@@ -100,6 +100,9 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 	content := RenderMarkdown(*req.Structured)
 	created, err := storage.AddRecipeStructured(r.Context(), user.ID, *req.Structured, content, req.Origin, req.History, string(recipeModel), promptVersion, req.VariantOfRecipeID)
 	telemetry.RecordSave(r.Context(), max(0, len(req.History)-1), err == nil)
+	if err == nil {
+		LearnGrams(req.Structured.Ingredients)
+	}
 	if err != nil {
 		http.Error(w, "Error adding recipe", http.StatusInternalServerError)
 		return

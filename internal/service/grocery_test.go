@@ -20,7 +20,7 @@ func TestBuildGroceryList(t *testing.T) {
 		{PlannedOn: "2026-09-15", RecipeTitle: "Bread", Item: "salt", Quantity: ptrF(5), Unit: ptrS("g"), Category: ptrS("pantry")},
 		{PlannedOn: "2026-09-15", RecipeTitle: "Bread", Item: "Parsley", QuantityText: ptrS("for garnish"), Category: ptrS("produce")},
 		{PlannedOn: "2026-09-14", RecipeTitle: "Roast", Item: "Eggs", Quantity: ptrF(2), Category: ptrS("protein")},
-	})
+	}, nil, nil)
 
 	// Keyed lowercase: a line's display name is whichever spelling the first row that
 	// created it used ("flour" from Bread, not "Flour" from Roast).
@@ -83,7 +83,7 @@ func TestBuildGroceryListScalesByServings(t *testing.T) {
 		// The recipe doesn't say what it yields, so there is no ratio to scale by.
 		{PlannedOn: "2026-09-16", RecipeTitle: "Cake", PlannedServings: ptrI(8),
 			Item: "Sugar", Quantity: ptrF(80), Unit: ptrS("g"), Category: ptrS("pantry")},
-	})
+	}, nil, nil)
 
 	byItem := map[string]model.GroceryLine{}
 	for _, l := range lines {
@@ -94,5 +94,77 @@ func TestBuildGroceryListScalesByServings(t *testing.T) {
 	}
 	if sugar := byItem["sugar"]; sugar.Quantity == nil || *sugar.Quantity != 80 {
 		t.Errorf("sugar should be unscaled without a recipe yield, got %+v", sugar)
+	}
+}
+
+// Staples are dropped outright: the point of marking salt as one is that it stops being
+// a shopping decision, while staying a pantry row the recipe match still counts.
+func TestBuildGroceryListDropsStaples(t *testing.T) {
+	lines := BuildGroceryList([]model.GroceryIngredient{
+		{PlannedOn: "2026-09-14", RecipeTitle: "Roast", Item: "Salt", Quantity: ptrF(5), Unit: ptrS("g"), Category: ptrS("pantry")},
+		{PlannedOn: "2026-09-14", RecipeTitle: "Roast", Item: "Pepper", QuantityText: ptrS("to taste"), Category: ptrS("pantry")},
+		{PlannedOn: "2026-09-14", RecipeTitle: "Roast", Item: "Flour", Quantity: ptrF(250), Unit: ptrS("g"), Category: ptrS("pantry")},
+	}, map[string]bool{"salt": true, "pepper": true}, nil)
+
+	if len(lines) != 1 || strings.ToLower(lines[0].Item) != "flour" {
+		t.Fatalf("only flour should survive, got %+v", lines)
+	}
+}
+
+// The unit fix: "2 onions" on Monday and "150 g onion" on Thursday are one line, and it
+// is expressed in the unit you shop in — whole onions, rounded up.
+func TestBuildGroceryListConsolidatesAcrossUnits(t *testing.T) {
+	grams := map[model.ItemUnit]float64{
+		{Item: "onion", Unit: ""}:  150,
+		{Item: "milk", Unit: "ml"}: 1,
+	}
+	lines := BuildGroceryList([]model.GroceryIngredient{
+		{PlannedOn: "2026-09-14", RecipeTitle: "Soup", Item: "Onion", Quantity: ptrF(2), Category: ptrS("produce")},
+		{PlannedOn: "2026-09-17", RecipeTitle: "Stew", Item: "onion", Quantity: ptrF(150), Unit: ptrS("g"), Category: ptrS("produce")},
+		{PlannedOn: "2026-09-15", RecipeTitle: "Sauce", Item: "Milk", Quantity: ptrF(200), Unit: ptrS("ml"), Category: ptrS("dairy")},
+		{PlannedOn: "2026-09-16", RecipeTitle: "Custard", Item: "milk", Quantity: ptrF(0.3), Unit: ptrS("l"), Category: ptrS("dairy")},
+	}, nil, grams)
+
+	byItem := map[string]model.GroceryLine{}
+	for _, l := range lines {
+		byItem[strings.ToLower(l.Item)] = l
+	}
+	if len(lines) != 2 {
+		t.Fatalf("want 2 consolidated lines, got %d: %+v", len(lines), lines)
+	}
+
+	// 2 onions (300 g) + 150 g = 450 g = 3 onions, rendered as pieces.
+	onion := byItem["onion"]
+	if onion.Quantity == nil || *onion.Quantity != 3 || onion.Unit != nil {
+		t.Errorf("onion should be 3 whole onions: %+v", onion)
+	}
+	if len(onion.For) != 2 {
+		t.Errorf("onion should name both meals, got %v", onion.For)
+	}
+
+	// Milk is never counted in pieces, so it stays in the unit the week first used.
+	milk := byItem["milk"]
+	if milk.Quantity == nil || *milk.Quantity != 500 || milk.Unit == nil || *milk.Unit != "ml" {
+		t.Errorf("milk should be 500 ml: %+v", milk)
+	}
+}
+
+// A thin table must never produce a wrong number: one unweighable amount makes that item
+// fall back to a line per unit family, and leaves every other item consolidated.
+func TestBuildGroceryListFallsBackPerItem(t *testing.T) {
+	grams := map[model.ItemUnit]float64{{Item: "onion", Unit: ""}: 150}
+	lines := BuildGroceryList([]model.GroceryIngredient{
+		{PlannedOn: "2026-09-14", RecipeTitle: "Soup", Item: "Onion", Quantity: ptrF(2), Category: ptrS("produce")},
+		{PlannedOn: "2026-09-15", RecipeTitle: "Stew", Item: "Leek", Quantity: ptrF(1), Category: ptrS("produce")},
+		{PlannedOn: "2026-09-16", RecipeTitle: "Pie", Item: "leek", Quantity: ptrF(80), Unit: ptrS("g"), Category: ptrS("produce")},
+	}, nil, grams)
+
+	if len(lines) != 3 {
+		t.Fatalf("leek should split into two lines and onion stay one, got %d: %+v", len(lines), lines)
+	}
+	for _, l := range lines {
+		if strings.ToLower(l.Item) == "onion" && (l.Quantity == nil || *l.Quantity != 2) {
+			t.Errorf("onion should still consolidate to 2: %+v", l)
+		}
 	}
 }

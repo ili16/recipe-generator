@@ -16,6 +16,7 @@ import (
 	"github.com/ili16/recipe-generator/internal/storage"
 	"github.com/ili16/recipe-generator/internal/telemetry"
 	"github.com/ili16/recipe-generator/internal/utils"
+	"github.com/jackc/pgx/v5"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/shared"
 )
@@ -189,6 +190,23 @@ var chatTools = map[string]tool{
 		NeedsAuth: true,
 		Mutating:  true,
 		Run:       toolClearPlanDay,
+	},
+	"get_pantry": {
+		Description: "Read what the user has in the house: name, amount, where it is kept, when it expires, and whether it is a staple they always have. Use it to answer \"what can I make tonight\" and \"what is about to go off\" without making them go and look.",
+		Params:      obj(map[string]any{}),
+		NeedsAuth:   true,
+		Run:         toolGetPantry,
+	},
+	"mark_meal_cooked": {
+		Description: "Record that a meal on the user's plan was cooked and eaten. It leaves the week's grocery list and its ingredients come out of the pantry. Pass meal_slot when the day holds more than one meal. Optionally rate the recipe 1-5.",
+		Params: obj(map[string]any{
+			"date":      str("The day that was cooked, YYYY-MM-DD"),
+			"meal_slot": str("Which meal: breakfast, lunch, dinner or snack. Omit when the day holds only one."),
+			"rating":    integer("How the cook went, 1-5. Omit unless the user said."),
+		}, "date"),
+		NeedsAuth: true,
+		Mutating:  true,
+		Run:       toolMarkMealCooked,
 	},
 	"get_preferences": {
 		Description: "Read the user's dietary preferences, disliked ingredients, skill level and meal-plan scheduling settings.",
@@ -763,6 +781,101 @@ func toolSetPlanDay(ctx context.Context, s *chatSession, args json.RawMessage) (
 	return result, nil, nil
 }
 
+func toolGetPantry(ctx context.Context, s *chatSession, _ json.RawMessage) (any, *artifact, error) {
+	items, err := storage.ListPantryItems(ctx, s.userID)
+	if err != nil {
+		return nil, nil, errors.New("could not read your pantry")
+	}
+	return map[string]any{"items": items}, nil, nil
+}
+
+// toolMarkMealCooked is the agent's half of the planner's "mark as cooked": same storage
+// call, same transaction, same refusal to guess at an amount it cannot convert. The
+// applied/skipped lists come back so the model can say what it did to the pantry —
+// having the assistant quietly empty someone's fridge is the failure mode here.
+func toolMarkMealCooked(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
+	a, item, err := resolveCookedMeal(ctx, s, args)
+	if err != nil {
+		return nil, nil, err
+	}
+	if a.Rating != nil && (*a.Rating < 1 || *a.Rating > 5) {
+		return nil, nil, errors.New("a rating is 1 to 5")
+	}
+
+	applied, skipped, err := storage.MarkMealCooked(ctx, s.userID, item.ID, a.Rating)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, errors.New("that meal is already marked as cooked")
+		}
+		return nil, nil, errors.New("could not mark that meal as cooked")
+	}
+	if applied == nil {
+		applied = []model.PantryChange{}
+	}
+	if skipped == nil {
+		skipped = []string{}
+	}
+	return map[string]any{
+		"date": a.Date, "meal_slot": item.MealSlot, "recipe_title": item.RecipeTitle,
+		"pantry_used": applied, "pantry_unchanged": skipped,
+	}, nil, nil
+}
+
+// cookedMealArgs is mark_meal_cooked's argument shape, shared with its approval preview.
+type cookedMealArgs struct {
+	Date     string `json:"date"`
+	MealSlot string `json:"meal_slot"`
+	Rating   *int16 `json:"rating"`
+}
+
+// resolveCookedMeal turns "Monday's dinner" into the one plan item it names. A day
+// holding several meals with no meal_slot given is an error rather than a guess: marking
+// the wrong meal cooked deducts the wrong things from the pantry.
+//
+// Deliberately allows a day in the past — unlike clear_plan_day, which refuses one. "I
+// cooked that on Sunday" is the normal way to say this, and the whole point of the tool.
+func resolveCookedMeal(ctx context.Context, s *chatSession, args json.RawMessage) (cookedMealArgs, model.MealPlanItem, error) {
+	var a cookedMealArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return a, model.MealPlanItem{}, errors.New("could not read the arguments")
+	}
+	if a.MealSlot != "" && !storage.ValidMealSlot(a.MealSlot) {
+		return a, model.MealPlanItem{}, errors.New("meal_slot must be one of breakfast, lunch, dinner, snack")
+	}
+	day, err := time.Parse(time.DateOnly, a.Date)
+	if err != nil {
+		return a, model.MealPlanItem{}, errors.New("date must be a date like 2026-09-14")
+	}
+
+	items, err := storage.GetMealPlanRange(ctx, s.userID, day, day)
+	if err != nil {
+		return a, model.MealPlanItem{}, errors.New("could not read your plan")
+	}
+	matches := []model.MealPlanItem{}
+	for _, item := range items {
+		if a.MealSlot != "" && item.MealSlot != a.MealSlot {
+			continue
+		}
+		if item.CookedAt != nil {
+			continue
+		}
+		// A leftover is not cooked; the pot it came from was. Marking one would deduct a
+		// second set of ingredients for a meal that used none.
+		if item.SourceItemID != nil {
+			continue
+		}
+		matches = append(matches, item)
+	}
+	switch len(matches) {
+	case 0:
+		return a, model.MealPlanItem{}, errors.New("nothing is planned there that still needs marking as cooked")
+	case 1:
+		return a, matches[0], nil
+	default:
+		return a, model.MealPlanItem{}, errors.New("that day holds more than one meal — say which one (breakfast, lunch, dinner or snack)")
+	}
+}
+
 func toolClearPlanDay(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
 	var a struct {
 		Date string `json:"date"`
@@ -1037,6 +1150,7 @@ func (s *chatSession) saveDraft(ctx context.Context, ref string, tags []string) 
 	if err != nil {
 		return 0, model.RecipeDocument{}, errors.New("could not save that recipe")
 	}
+	LearnGrams(doc.Ingredients)
 	if s.draftInfo == nil {
 		s.draftInfo = map[string]draftInfo{}
 	}
@@ -1091,6 +1205,38 @@ func approvalPreview(ctx context.Context, s *chatSession, name string, args json
 			// A draft (id 0) has no saved recipe yet, so it always replaces what is there.
 			return ok && item.RecipeID != id
 		})
+	case "mark_meal_cooked":
+		// The meal itself is not "replaced", but the pantry lines it will empty are the
+		// part the user needs to see before agreeing — this writes to their fridge, and
+		// the deduction is the half they did not ask for in words.
+		_, item, err := resolveCookedMeal(ctx, s, args)
+		if err != nil {
+			return nil
+		}
+		recipe, err := storage.GetRecipeByID(ctx, s.userID, item.RecipeID)
+		if err != nil {
+			return nil
+		}
+		var yield *int
+		if recipe.Structured != nil {
+			yield = recipe.Structured.Servings
+		}
+		applied, _, err := storage.PreviewDeductPantry(ctx, s.userID, item.RecipeID, model.PortionScale(item.Servings, yield))
+		if err != nil {
+			return nil
+		}
+		out := []map[string]any{}
+		for _, c := range applied {
+			row := map[string]any{"pantry_item": c.Name, "using": c.Used}
+			if c.Unit != nil {
+				row["unit"] = *c.Unit
+			}
+			if c.Removed {
+				row["uses_up"] = true
+			}
+			out = append(out, row)
+		}
+		return out
 	case "clear_plan_day":
 		var a struct {
 			Date     string `json:"date"`

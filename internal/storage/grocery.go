@@ -13,6 +13,16 @@ import (
 //
 // Optional ingredients are included: "you may want this" is a shopping decision, and a
 // list that silently omits half a recipe is worse than one with a line to ignore.
+//
+// Two kinds of planned item are deliberately not shopped for:
+//
+//   - A meal already cooked (cooked_at set). Its ingredients have been bought, used, and
+//     deducted from the pantry; leaving it on the list is asking someone to buy dinner
+//     twice.
+//   - A leftover (source_item_id set). SetBatchCook stores each covered day as its own
+//     row *and* scales the cooking day's servings to feed all of them, so the cook row
+//     already carries the whole amount. Counting the leftovers too put 3x the ingredients
+//     of a batch-cooked dish on the list — the one line below is that bug's fix.
 func GetPlannedIngredients(ctx context.Context, userID int, startsOn, endsOn time.Time) ([]model.GroceryIngredient, error) {
 	rows, err := Pool.Query(ctx, `
 		SELECT mpi.planned_on, r.title, mpi.servings, r.servings, ri.item, ri.quantity, ri.unit, ri.quantity_text, ri.category
@@ -21,6 +31,7 @@ func GetPlannedIngredients(ctx context.Context, userID int, startsOn, endsOn tim
 		JOIN recipes r ON r.id = mpi.recipe_id
 		JOIN recipe_ingredients ri ON ri.recipe_id = r.id
 		WHERE `+inScope("mp", "$1")+` AND mpi.planned_on BETWEEN $2 AND $3 AND r.deleted_at IS NULL
+		  AND mpi.cooked_at IS NULL AND mpi.source_item_id IS NULL
 		ORDER BY mpi.planned_on, mpi.id, ri.sort_order`,
 		userID, startsOn, endsOn,
 	)

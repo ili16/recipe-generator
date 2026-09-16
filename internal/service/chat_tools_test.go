@@ -87,7 +87,7 @@ func TestToolsRefuseAnonymousCallers(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			// Deliberately valid-looking args: the refusal must come from the missing
 			// identity, not from argument parsing.
-			_, _, err := dispatch(context.Background(), session, name, `{"id":1,"date":"2026-09-14","starts_on":"2026-09-14","draft_ref":"draft_1","patch":{"skill_level":"beginner"},"target":"draft_1","instruction":"x"}`)
+			_, _, err := dispatch(context.Background(), session, name, `{"id":1,"date":"`+day1+`","starts_on":"`+day1+`","draft_ref":"draft_1","patch":{"skill_level":"beginner"},"target":"draft_1","instruction":"x"}`)
 			if !errors.Is(err, errSignInRequired) {
 				t.Errorf("expected sign-in refusal, got %v", err)
 			}
@@ -150,13 +150,13 @@ func TestToolsOwnershipComesFromTheSession(t *testing.T) {
 	})
 
 	t.Run("set_plan_day", func(t *testing.T) {
-		if _, _, err := dispatch(ctx, intruder, "set_plan_day", `{"date":"2026-09-14","recipe_id":`+id+`}`); err == nil {
+		if _, _, err := dispatch(ctx, intruder, "set_plan_day", `{"date":"`+day1+`","recipe_id":`+id+`}`); err == nil {
 			t.Fatal("planned another user's recipe")
 		}
 	})
 
 	t.Run("apply_week_plan", func(t *testing.T) {
-		if _, _, err := dispatch(ctx, intruder, "apply_week_plan", `{"days":[{"date":"2026-09-14","recipe_id":`+id+`}],"confirm":true}`); err == nil {
+		if _, _, err := dispatch(ctx, intruder, "apply_week_plan", `{"days":[{"date":"`+day1+`","recipe_id":`+id+`}],"confirm":true}`); err == nil {
 			t.Fatal("planned another user's recipe")
 		}
 	})
@@ -173,11 +173,11 @@ func TestToolsOwnershipComesFromTheSession(t *testing.T) {
 		// A day whose recipe is fine plus one naming a recipe the owner does not have:
 		// the good day must not be written.
 		_, _, err := dispatch(ctx, owner, "apply_week_plan",
-			`{"days":[{"date":"2026-09-14","recipe_id":`+id+`},{"date":"2026-09-15","recipe_id":999999999}],"confirm":true}`)
+			`{"days":[{"date":"`+day1+`","recipe_id":`+id+`},{"date":"`+day2+`","recipe_id":999999999}],"confirm":true}`)
 		if err == nil {
 			t.Fatal("expected the bad day to fail the apply")
 		}
-		items, err := storage.GetMealPlanRange(ctx, ownerID, date(t, "2026-09-14"), date(t, "2026-09-15"))
+		items, err := storage.GetMealPlanRange(ctx, ownerID, date(t, day1), date(t, day2))
 		if err != nil {
 			t.Fatalf("read plan: %v", err)
 		}
@@ -186,7 +186,7 @@ func TestToolsOwnershipComesFromTheSession(t *testing.T) {
 		}
 
 		// Two days, one of them a draft that has to be saved first.
-		args := `{"days":[{"date":"2026-09-14","recipe_id":` + id + `},{"date":"2026-09-15","draft_ref":"draft_1"}],"confirm":true}`
+		args := `{"days":[{"date":"` + day1 + `","recipe_id":` + id + `},{"date":"` + day2 + `","draft_ref":"draft_1"}],"confirm":true}`
 		if _, _, err := dispatch(ctx, owner, "apply_week_plan", args); err != nil {
 			t.Fatalf("apply: %v", err)
 		}
@@ -210,7 +210,7 @@ func TestToolsOwnershipComesFromTheSession(t *testing.T) {
 		}
 
 		// Changing a filled day is reported, not silently done.
-		result, _, err = dispatch(ctx, owner, "apply_week_plan", `{"days":[{"date":"2026-09-15","recipe_id":`+id+`}]}`)
+		result, _, err = dispatch(ctx, owner, "apply_week_plan", `{"days":[{"date":"`+day2+`","recipe_id":`+id+`}]}`)
 		if err != nil {
 			t.Fatalf("overwrite check: %v", err)
 		}
@@ -267,6 +267,14 @@ func TestToolsRejectBadArguments(t *testing.T) {
 		})
 	}
 }
+
+// day1 and day2 are tomorrow and the day after, not fixed dates. The plan tools refuse
+// to write to a day in the past, so a hardcoded date is a test that passes until that
+// date goes by — this suite broke exactly that way.
+var (
+	day1 = time.Now().AddDate(0, 0, 1).Format(time.DateOnly)
+	day2 = time.Now().AddDate(0, 0, 2).Format(time.DateOnly)
+)
 
 func date(t *testing.T, s string) time.Time {
 	t.Helper()
