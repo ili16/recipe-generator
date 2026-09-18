@@ -123,3 +123,62 @@ func writeJSON(w http.ResponseWriter, v any) {
 		slog.Error("conversations: encode failed", "error", err)
 	}
 }
+
+// maxTitleRunes bounds a hand-typed thread name, matching the cap the model-written title
+// already gets in chat.go — the list renders one line either way.
+const maxTitleRunes = 80
+
+// HandleRenameConversation renames a thread (BACKLOG.md 10.7). An empty title is a valid
+// body: it clears the name and the list falls back to the thread's last message.
+func HandleRenameConversation(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		Title string `json:"title"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	title := strings.TrimSpace(body.Title)
+	if len([]rune(title)) > maxTitleRunes {
+		title = string([]rune(title)[:maxTitleRunes])
+	}
+	id := r.PathValue("id")
+	err := storage.SetConversationTitle(r.Context(), user.ID, id, title)
+	if errors.Is(err, storage.ErrConversationNotFound) {
+		http.Error(w, "conversation not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		slog.ErrorContext(r.Context(), "conversations: rename failed", "error", err, "conversation_id", id)
+		http.Error(w, "could not rename conversation", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"id": id, "title": title})
+}
+
+// HandleDeleteConversation removes a thread and its transcript. There is no undo and the
+// client confirms first; the row is gone, not hidden.
+func HandleDeleteConversation(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	err := storage.DeleteConversation(r.Context(), user.ID, id)
+	if errors.Is(err, storage.ErrConversationNotFound) {
+		http.Error(w, "conversation not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		slog.ErrorContext(r.Context(), "conversations: delete failed", "error", err, "conversation_id", id)
+		http.Error(w, "could not delete conversation", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}

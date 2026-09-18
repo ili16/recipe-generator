@@ -156,11 +156,26 @@ func ListConversations(ctx context.Context, userID int, limit int) ([]Conversati
 }
 
 // SetConversationTitle names a thread. Scoped to the owner like every other read here,
-// so a guessed id renames nothing.
+// so a guessed id renames nothing — and says so, since a user renaming a thread by hand
+// (BACKLOG.md 10.7) needs to hear that it did not happen.
 func SetConversationTitle(ctx context.Context, userID int, conversationID, title string) error {
-	_, err := Pool.Exec(ctx,
+	tag, err := Pool.Exec(ctx,
 		`UPDATE conversations SET title = $3 WHERE id = $1 AND user_id = $2`,
 		conversationID, userID, title)
+	if err == nil && tag.RowsAffected() == 0 {
+		return ErrConversationNotFound
+	}
+	return err
+}
+
+// DeleteConversation removes a thread and, by the messages table's ON DELETE CASCADE,
+// its transcript. Same owner scoping and same not-found error as everything else here.
+func DeleteConversation(ctx context.Context, userID int, conversationID string) error {
+	tag, err := Pool.Exec(ctx,
+		`DELETE FROM conversations WHERE id = $1 AND user_id = $2`, conversationID, userID)
+	if err == nil && tag.RowsAffected() == 0 {
+		return ErrConversationNotFound
+	}
 	return err
 }
 
