@@ -91,6 +91,10 @@ type chatSession struct {
 	// anonymous caller. One line, not a profile dump — the aggregated household memory
 	// file is 15.6 and is deliberately not this.
 	household string
+	// fresh marks a thread whose conversations row was opened by *this* request, and
+	// is the whole trigger for naming it (BACKLOG.md 10.4): a title is derived once,
+	// from the first user message, and never recomputed.
+	fresh bool
 	// pending is runTurn's way out: set when the turn stopped on a mutating call the
 	// user has to approve (BACKLOG.md 10.2), and written back to the session state by
 	// the handler. Nil on every turn that ran to completion.
@@ -338,6 +342,10 @@ func HandleChat(w http.ResponseWriter, r *http.Request) {
 	// turn the user can see must be a half-done turn the next turn can read.
 	persistTurn(ctx, session, state, mark)
 
+	if session.fresh {
+		go nameThread(ctx, session.userID, session.id, req.Message)
+	}
+
 	if code != "" {
 		emit("error", map[string]string{"code": code})
 		return
@@ -425,7 +433,7 @@ func openSession(ctx context.Context, r *http.Request, conversationID string) (*
 			if err != nil {
 				return nil, nil, err
 			}
-			session.id = id
+			session.id, session.fresh = id, true
 		} else {
 			msgs, err := storage.ConversationMessages(ctx, userID, session.id)
 			if err != nil {
@@ -448,8 +456,65 @@ func openSession(ctx context.Context, r *http.Request, conversationID string) (*
 	session.nextDraft = state.nextDraft
 	if userID == 0 {
 		session.messages = state.messages
+	} else {
+		rehydrateDrafts(session)
 	}
 	return session, state, nil
+}
+
+// rehydrateDrafts puts the thread's recipe drafts back in reach after the in-memory
+// session behind it has gone (a restart, or anonThreadTTL). The documents are on the
+// stored artifacts, so a thread reopened tomorrow can still be transformed and still has
+// a working Save button, instead of the model being told draft_7 does not exist.
+//
+// Drafts still held in memory win: they carry savedID, which the stored card may predate.
+func rehydrateDrafts(session *chatSession) {
+	for _, m := range session.messages {
+		if len(m.Artifact) == 0 {
+			continue
+		}
+		var art struct {
+			Kind string `json:"kind"`
+			Data struct {
+				DraftRef string               `json:"draft_ref"`
+				RecipeID int                  `json:"recipe_id"`
+				Document model.RecipeDocument `json:"document"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(m.Artifact, &art) != nil || art.Kind != "recipe" || art.Data.DraftRef == "" {
+			continue
+		}
+		ref := art.Data.DraftRef
+		if _, held := session.drafts[ref]; held {
+			continue
+		}
+		session.drafts[ref] = art.Data.Document
+		session.draftInfo[ref] = draftInfo{savedID: art.Data.RecipeID}
+		if n, err := strconv.Atoi(strings.TrimPrefix(ref, "draft_")); err == nil && n > session.nextDraft {
+			session.nextDraft = n
+		}
+	}
+}
+
+// nameThread derives a thread's title from the message that opened it, once. Cheap tier,
+// detached from the request: the turn it belongs to has already been answered, and a
+// failed title is a thread listed by its preview rather than a failed turn.
+func nameThread(ctx context.Context, userID int, conversationID, firstMessage string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer cancel()
+
+	title, err := chatCompletion(ctx, llm.ThreadTitlePrompt, firstMessage, string(assistModel), "thread_title")
+	title = strings.Trim(strings.TrimSpace(title), `"'`)
+	if err != nil || title == "" {
+		slog.WarnContext(ctx, "chat: naming thread failed", "error", err, "conversation_id", conversationID)
+		return
+	}
+	if len([]rune(title)) > 80 {
+		title = string([]rune(title)[:80])
+	}
+	if err := storage.SetConversationTitle(ctx, userID, conversationID, title); err != nil {
+		slog.ErrorContext(ctx, "chat: storing thread title failed", "error", err, "conversation_id", conversationID)
+	}
 }
 
 // storeDrafts writes the session's drafts back to the shared state. Separate from
@@ -759,10 +824,17 @@ func runToolCall(ctx context.Context, send emit, session *chatSession, call open
 	}
 	telemetry.RecordChatTool(ctx, name, err == nil)
 	send("tool_end", map[string]any{"name": name, "ok": err == nil})
+	msg := toolResult(call, result)
 	if art != nil {
 		send("artifact", art)
+		// Stored on the message, not just streamed: a thread reopened tomorrow has to
+		// show the card it wrote (BACKLOG.md 10.4). A card that will not marshal is
+		// dropped rather than failing the turn — the prose is still worth keeping.
+		if encoded, err := json.Marshal(art); err == nil {
+			msg.Artifact = encoded
+		}
 	}
-	return toolResult(call, result)
+	return msg
 }
 
 // overBudget reports whether the caller has reached their monthly cap. Anonymous callers

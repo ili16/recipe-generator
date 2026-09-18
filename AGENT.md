@@ -268,6 +268,12 @@ otherwise), rate-limited and budget-capped per the "Rate limiting + budget" note
 	  a `GenerationOrigin` on `draftInfo` (it is the only place that still knows whether the
 	  user gave a URL, a photo or a description), `transform_recipe` inherits it from its
 	  target draft, and `saveDraft` writes it as the recipe's `sources` row.
+	- A recipe artifact born of a **transform** (`transform_recipe`, `review_cook_flow`)
+	  carries `derived_from`: the `draft_ref` or `recipe:<id>` it was made out of (BACKLOG
+	  10.3). Those tools park their result as a *new* draft, so without it the client has a
+	  new card and no way to know which of its existing ones it replaced. It is a string,
+	  never a document or a diff — the client already holds the before-card and does the
+	  comparison itself. A fresh `generate_recipe` omits the field entirely.
 	- `save_recipe` re-emits the draft's `artifact` carrying its new `recipe_id`, so the
 	  client's card flips from "unsaved draft" to saved. The client keys recipe artifacts on
 	  `draft_ref` across the whole thread, so this updates the existing card rather than

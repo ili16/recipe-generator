@@ -311,7 +311,7 @@ func TestResolvePlanDays(t *testing.T) {
 
 func TestSessionDrafts(t *testing.T) {
 	session := &chatSession{drafts: map[string]model.RecipeDocument{}}
-	result, art, err := session.addDraft(testDraft, &model.GenerationOrigin{SourceType: "url", SourceURL: "https://example.com/x"})
+	result, art, err := session.addDraft(testDraft, &model.GenerationOrigin{SourceType: "url", SourceURL: "https://example.com/x"}, "")
 	if err != nil {
 		t.Fatalf("addDraft: %v", err)
 	}
@@ -335,8 +335,24 @@ func TestSessionDrafts(t *testing.T) {
 	if _, err := session.resolveRecipe(context.Background(), "draft_1"); err != nil {
 		t.Errorf("resolveRecipe(draft_1): %v", err)
 	}
+	// A fresh generation replaces nothing, so it must carry no derived_from — the client
+	// keys its "what changed" block on that field's presence (BACKLOG.md 10.3), and an
+	// empty one would make every new recipe look like an edit of something.
+	if _, ok := art.Data.(map[string]any)["derived_from"]; ok {
+		t.Error("a fresh draft must not claim to be derived from anything")
+	}
 	if _, err := session.resolveRecipe(context.Background(), "draft_2"); err == nil {
 		t.Error("resolved a draft that was never created")
+	}
+
+	// A transform does: it names the card it changed, which is how the client finds the
+	// before-document it already holds.
+	_, derived, err := session.addDraft(testDraft, nil, "draft_1")
+	if err != nil {
+		t.Fatalf("addDraft(derived): %v", err)
+	}
+	if got := derived.Data.(map[string]any)["derived_from"]; got != "draft_1" {
+		t.Errorf("derived_from = %v, want draft_1", got)
 	}
 
 	// plan_week parks one draft per variant day so "apply it" has something

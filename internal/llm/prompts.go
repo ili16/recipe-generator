@@ -57,6 +57,12 @@ var ChatAgentSystemPrompt string
 //go:embed prompts/thread_summary.txt
 var ThreadSummaryPrompt string
 
+// ThreadTitlePrompt names a thread from its first user message so it can be found again
+// in the conversation list (BACKLOG.md 10.4). Cheap tier, one call per thread, ever.
+//
+//go:embed prompts/thread_title.txt
+var ThreadTitlePrompt string
+
 // promptHash is a short deterministic fingerprint of the given prompt contents,
 // concatenated in order.
 func promptHash(parts ...string) string {

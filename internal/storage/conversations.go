@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/ili16/recipe-generator/internal/model"
 	"github.com/jackc/pgx/v5"
@@ -35,7 +36,7 @@ func ConversationMessages(ctx context.Context, userID int, conversationID string
 	}
 
 	rows, err := Pool.Query(ctx, `
-		SELECT role, content, tool_calls, tool_call_id
+		SELECT role, content, tool_calls, tool_call_id, artifact
 		FROM conversation_messages
 		WHERE conversation_id = $1
 		ORDER BY seq`, conversationID)
@@ -48,7 +49,7 @@ func ConversationMessages(ctx context.Context, userID int, conversationID string
 	for rows.Next() {
 		var m model.ConversationMessage
 		var toolCallID *string
-		if err := rows.Scan(&m.Role, &m.Content, &m.ToolCalls, &toolCallID); err != nil {
+		if err := rows.Scan(&m.Role, &m.Content, &m.ToolCalls, &toolCallID, &m.Artifact); err != nil {
 			return nil, err
 		}
 		if toolCallID != nil {
@@ -97,10 +98,14 @@ func AppendConversationMessages(ctx context.Context, userID int, conversationID 
 		if len(m.ToolCalls) > 0 {
 			toolCalls = m.ToolCalls
 		}
+		var artifact any
+		if len(m.Artifact) > 0 {
+			artifact = m.Artifact
+		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO conversation_messages (conversation_id, seq, role, content, tool_calls, tool_call_id)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
-			conversationID, next+i, m.Role, m.Content, toolCalls, toolCallID); err != nil {
+			INSERT INTO conversation_messages (conversation_id, seq, role, content, tool_calls, tool_call_id, artifact)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			conversationID, next+i, m.Role, m.Content, toolCalls, toolCallID, artifact); err != nil {
 			return err
 		}
 	}
@@ -108,4 +113,65 @@ func AppendConversationMessages(ctx context.Context, userID int, conversationID 
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// ConversationSummary is one row of the thread list (BACKLOG.md 10.4): enough to pick a
+// conversation out of a list, and nothing more — the messages are a second request.
+type ConversationSummary struct {
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	Preview   string    `json:"preview"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// ListConversations returns a user's threads, most recently used first. Threads with no
+// readable message are left out: a turn that failed before the model answered leaves a
+// row behind, and an untitled empty thread in the list is a dead link.
+func ListConversations(ctx context.Context, userID int, limit int) ([]ConversationSummary, error) {
+	rows, err := Pool.Query(ctx, `
+		SELECT c.id, c.title, c.updated_at, last.content
+		FROM conversations c
+		JOIN LATERAL (
+			SELECT content FROM conversation_messages m
+			WHERE m.conversation_id = c.id AND m.role IN ('user', 'assistant') AND m.content <> ''
+			ORDER BY m.seq DESC LIMIT 1
+		) last ON TRUE
+		WHERE c.user_id = $1
+		ORDER BY c.updated_at DESC
+		LIMIT $2`, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []ConversationSummary{}
+	for rows.Next() {
+		var c ConversationSummary
+		if err := rows.Scan(&c.ID, &c.Title, &c.UpdatedAt, &c.Preview); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// SetConversationTitle names a thread. Scoped to the owner like every other read here,
+// so a guessed id renames nothing.
+func SetConversationTitle(ctx context.Context, userID int, conversationID, title string) error {
+	_, err := Pool.Exec(ctx,
+		`UPDATE conversations SET title = $3 WHERE id = $1 AND user_id = $2`,
+		conversationID, userID, title)
+	return err
+}
+
+// ConversationTitle returns a thread's title, or ErrConversationNotFound if it is not
+// this user's.
+func ConversationTitle(ctx context.Context, userID int, conversationID string) (string, error) {
+	var title string
+	var owner int
+	err := Pool.QueryRow(ctx, `SELECT user_id, title FROM conversations WHERE id = $1`, conversationID).Scan(&owner, &title)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && owner != userID) {
+		return "", ErrConversationNotFound
+	}
+	return title, err
 }

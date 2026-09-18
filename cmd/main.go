@@ -81,6 +81,10 @@ func main() {
 	// Saving a draft the agent already wrote calls no model, so it is not behind the LLM
 	// stack — but it writes a recipe, so unlike /chat it needs a real user.
 	mux.HandleFunc("POST /api/v1/chat/drafts/save", authenticator.Require(service.HandleSaveChatDraft))
+	// The thread list and one thread's transcript (BACKLOG.md 10.4) — read-only; every
+	// write to a conversation goes through POST /chat.
+	mux.HandleFunc("GET /api/v1/conversations", authenticator.Require(service.HandleListConversations))
+	mux.HandleFunc("GET /api/v1/conversations/{id}", authenticator.Require(service.HandleGetConversation))
 
 	mux.HandleFunc("GET /api/v1/recipes/trash", authenticator.Require(HandleGetTrash))
 	mux.HandleFunc("POST /api/v1/recipes/{id}/restore", authenticator.Require(HandleRestoreRecipe))

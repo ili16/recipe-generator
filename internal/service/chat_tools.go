@@ -322,7 +322,7 @@ func toolGenerateRecipe(ctx context.Context, s *chatSession, args json.RawMessag
 	case a.ImageRef != "":
 		origin.SourceType = "image"
 	}
-	return s.addDraft(doc, origin)
+	return s.addDraft(doc, origin, "")
 }
 
 func toolTransformRecipe(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
@@ -358,7 +358,7 @@ func toolTransformRecipe(ctx context.Context, s *chatSession, args json.RawMessa
 	}
 	// An adjusted draft keeps the original's provenance — "from seriouseats.com" is
 	// still true after "make it vegan". A saved-id target has none to inherit.
-	return s.addDraft(*result.Recipe, s.draftInfo[strings.TrimSpace(a.Target)].origin)
+	return s.addDraft(*result.Recipe, s.draftInfo[strings.TrimSpace(a.Target)].origin, a.Target)
 }
 
 func toolReviewCookFlow(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
@@ -381,7 +381,7 @@ func toolReviewCookFlow(ctx context.Context, s *chatSession, args json.RawMessag
 	}
 	// The result is a new draft, not a write: like every other proposal in this catalog it
 	// is the user's to save. A saved-id target has no provenance to inherit.
-	return s.addDraft(out, s.draftInfo[strings.TrimSpace(a.Target)].origin)
+	return s.addDraft(out, s.draftInfo[strings.TrimSpace(a.Target)].origin, a.Target)
 }
 
 func toolSearchMyRecipes(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
@@ -1040,23 +1040,31 @@ func (s *chatSession) parkDraft(doc model.RecipeDocument, variantOf int, origin 
 
 // addDraft parks a freshly generated document under a new draft_ref and returns the
 // compact summary the model reads plus the full-document artifact the client renders.
-func (s *chatSession) addDraft(doc model.RecipeDocument, origin *model.GenerationOrigin) (any, *artifact, error) {
+//
+// derivedFrom is the draft_ref or `recipe:<id>` this document was made *out of* — a
+// transform or a flow review — and empty for a fresh generation. It is the whole of the
+// server's part in BACKLOG 10.3: the client already holds the before-card, so naming it
+// is enough for the card to show what changed rather than a silent replacement. No diff
+// is computed here and no document is sent twice.
+func (s *chatSession) addDraft(doc model.RecipeDocument, origin *model.GenerationOrigin, derivedFrom string) (any, *artifact, error) {
 	ref := s.parkDraft(doc, 0, origin)
 
+	data := map[string]any{"draft_ref": ref, "document": doc}
+	if derivedFrom = strings.TrimSpace(derivedFrom); derivedFrom != "" {
+		data["derived_from"] = derivedFrom
+	}
+
 	return map[string]any{
-			"draft_ref":     ref,
-			"title":         doc.Title,
-			"summary":       doc.Summary,
-			"language":      doc.Language,
-			"servings":      doc.Servings,
-			"total_minutes": doc.TotalMinutes,
-			"tags":          doc.Tags,
-			"ingredients":   len(doc.Ingredients),
-			"steps":         len(doc.Steps),
-		}, &artifact{Kind: "recipe", Data: map[string]any{
-			"draft_ref": ref,
-			"document":  doc,
-		}}, nil
+		"draft_ref":     ref,
+		"title":         doc.Title,
+		"summary":       doc.Summary,
+		"language":      doc.Language,
+		"servings":      doc.Servings,
+		"total_minutes": doc.TotalMinutes,
+		"tags":          doc.Tags,
+		"ingredients":   len(doc.Ingredients),
+		"steps":         len(doc.Steps),
+	}, &artifact{Kind: "recipe", Data: data}, nil
 }
 
 // resolveRecipe turns a draft_ref or a saved recipe id into a document. A saved id is

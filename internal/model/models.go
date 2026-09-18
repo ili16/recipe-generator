@@ -1,6 +1,7 @@
 package model
 
 import (
+	"encoding/json"
 	"io"
 	"strings"
 	"time"
@@ -481,4 +482,8 @@ type ConversationMessage struct {
 	Content    string     `json:"content"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
+	// Artifact is the card this message produced, verbatim as it was streamed
+	// ({kind, data}), and set only on tool messages. Stored so a reopened thread shows
+	// the recipe it wrote and not just the prose around it (BACKLOG.md 10.4).
+	Artifact json.RawMessage `json:"artifact,omitempty"`
 }
