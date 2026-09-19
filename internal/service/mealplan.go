@@ -69,6 +69,7 @@ func buildMealPlanContextText(candidates []model.Recipe, profile model.CookingPr
 	if priorMeal != nil {
 		fmt.Fprintf(&b, "Most recently cooked meal before this range: %s — %s (id %d).\n\n", priorMeal.PlannedOn, priorMeal.RecipeTitle, priorMeal.RecipeID)
 	}
+	cookedRecently := false
 	if len(candidates) == 0 {
 		b.WriteString("Saved recipes: none.\n")
 	} else {
@@ -83,7 +84,17 @@ func buildMealPlanContextText(candidates []model.Recipe, profile model.CookingPr
 			if r.CookedRating != nil {
 				fmt.Fprintf(&b, " (user rated their last cook %d/5)", *r.CookedRating)
 			}
+			// BACKLOG 11.2: enforceNoCookCarryover only stops a dish repeating on the very
+			// next day. This is the higher constraint — what was eaten in the last fortnight
+			// — and it is a signal, not a filter, so "I want that again" still wins.
+			if days, ok := daysSinceCooked(r, startsOn); ok && days <= recentCookWindowDays {
+				fmt.Fprintf(&b, " (cooked %d days ago)", days)
+				cookedRecently = true
+			}
 			b.WriteString("\n")
+		}
+		if cookedRecently {
+			fmt.Fprintf(&b, "\nDo not plan a recipe marked \"cooked N days ago\" again unless the user asked for that dish by name — pick something they have not eaten in the last %d days.\n", recentCookWindowDays)
 		}
 	}
 	if len(profile.TopTags) > 0 {
@@ -219,6 +230,21 @@ func enforceNoCookCarryover(result *model.MealPlanSuggestion, prefs model.UserPr
 		}
 		result.Message = &msg
 	}
+}
+
+// recentCookWindowDays is how far back "I already ate that" reaches (BACKLOG 11.2) —
+// longer than a batch-cook run, shorter than a season. It bounds both the meal_history
+// tool's default and the repeat warning the planner gets below.
+const recentCookWindowDays = 14
+
+// daysSinceCooked reports how many calendar days before ref the recipe was last cooked.
+// ok is false when it has never been cooked. A stamp after ref (a cook already logged for
+// a day inside the range) comes back negative, which still reads as "just eaten".
+func daysSinceCooked(r model.Recipe, ref time.Time) (int, bool) {
+	if r.LastCookedAt == nil {
+		return 0, false
+	}
+	return int(utcDate(ref).Sub(utcDate(*r.LastCookedAt)).Hours() / 24), true
 }
 
 // utcDate strips a time to its calendar date in UTC.

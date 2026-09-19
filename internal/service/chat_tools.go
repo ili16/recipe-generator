@@ -120,6 +120,12 @@ var chatTools = map[string]tool{
 		NeedsAuth: true,
 		Run:       toolSearchMyRecipes,
 	},
+	"meal_history": {
+		Description: "What the user has actually cooked lately, most recently first, with tags, their rating and their vote. Read it before proposing a week so you do not serve the same thing twice, and when the user asks what they have been eating. Defaults to the last 14 days.",
+		Params:      obj(map[string]any{"days": integer("How far back to look, in days; defaults to 14")}),
+		NeedsAuth:   true,
+		Run:         toolMealHistory,
+	},
 	"get_recipe": {
 		Description: "Load one of the user's saved recipes in full, including ingredients and steps.",
 		Params:      obj(map[string]any{"id": integer("The saved recipe's id")}, "id"),
@@ -458,6 +464,58 @@ func hasAllTags(have, want []string) bool {
 		}
 	}
 	return true
+}
+
+// cookedEntry is one line of meal_history: enough for the model to say "you had that on
+// Tuesday and rated it 2" without loading a single recipe.
+type cookedEntry struct {
+	ID       int      `json:"id"`
+	Title    string   `json:"title"`
+	Tags     []string `json:"tags,omitempty"`
+	CookedOn string   `json:"cooked_on"`
+	DaysAgo  int      `json:"days_ago"`
+	Rating   *int16   `json:"rating,omitempty"`
+	Vote     *int16   `json:"vote,omitempty"`
+}
+
+// recentlyCooked picks the recipes cooked within the last days days, most recent first.
+// recipes.last_cooked_at holds only the most recent cook, which is exactly the question
+// being asked ("have I had this lately?") — no separate history table earns its keep here.
+func recentlyCooked(recipes []model.Recipe, now time.Time, days int) []cookedEntry {
+	out := []cookedEntry{}
+	for _, r := range recipes {
+		ago, ok := daysSinceCooked(r, now)
+		if !ok || ago > days {
+			continue
+		}
+		out = append(out, cookedEntry{
+			ID: r.ID, Title: r.Recipename, Tags: r.Tags,
+			CookedOn: r.LastCookedAt.UTC().Format("2006-01-02"), DaysAgo: ago,
+			Rating: r.CookedRating, Vote: r.MyVote,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].DaysAgo < out[j].DaysAgo })
+	return out
+}
+
+// toolMealHistory is BACKLOG 11.2: without it the agent cycles the same handful of
+// recipes, because nothing in the thread remembers last Tuesday.
+func toolMealHistory(_ context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
+	var a struct {
+		Days int `json:"days"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return nil, nil, errors.New("could not read the arguments")
+	}
+	if a.Days <= 0 {
+		a.Days = recentCookWindowDays
+	}
+	recipes, err := storage.GetRecipes(s.userID)
+	if err != nil {
+		return nil, nil, errors.New("could not read your saved recipes")
+	}
+	cooked := recentlyCooked(recipes, time.Now(), a.Days)
+	return map[string]any{"days": a.Days, "count": len(cooked), "cooked": cooked}, nil, nil
 }
 
 func toolGetRecipe(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
