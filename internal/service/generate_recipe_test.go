@@ -136,3 +136,27 @@ func TestSameIngredients(t *testing.T) {
 		}
 	}
 }
+
+// BACKLOG 14.3: the words RenderMarkdown adds are display text and follow the recipe's
+// language. An unknown language falls back to English rather than dropping the label.
+func TestRenderMarkdownLabelsFollowLanguage(t *testing.T) {
+	i, s, c := 30, 4, 10
+	doc := model.RecipeDocument{
+		Title: "Test", Language: "de", Servings: &s, TotalMinutes: &i, ProteinG: &c,
+		Ingredients: []model.RecipeIngredient{{Item: "Salz", Optional: true}},
+		Steps:       []model.RecipeStep{{SortOrder: 1, StepText: "Kochen"}},
+	}
+	de := RenderMarkdown(doc)
+	for _, want := range []string{"## Zutaten", "## Zubereitung", "Portionen: 4", "Gesamt: 30 Min.", "Eiweiß", "Pro Portion", "(optional)"} {
+		if !strings.Contains(de, want) {
+			t.Errorf("german render missing %q:\n%s", want, de)
+		}
+	}
+	doc.Language = "xx"
+	en := RenderMarkdown(doc)
+	for _, want := range []string{"## Ingredients", "Servings: 4", "Total: 30 min", "protein"} {
+		if !strings.Contains(en, want) {
+			t.Errorf("fallback render missing %q:\n%s", want, en)
+		}
+	}
+}

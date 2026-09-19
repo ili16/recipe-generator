@@ -402,22 +402,66 @@ func generateFromImage(ctx context.Context, file io.Reader, prompt, preferredLan
 	)
 }
 
-var sectionHeadings = map[string][2]string{
-	"de": {"Zutaten", "Zubereitung"},
-	"fr": {"Ingrédients", "Préparation"},
-	"es": {"Ingredientes", "Preparación"},
-	"it": {"Ingredienti", "Preparazione"},
+// recipeLabels are the words RenderMarkdown puts around the recipe's own words. They
+// are display text generated server-side, so they follow the recipe's language (BACKLOG
+// 14.3) — not the caller's UI language, because the markdown is stored with the recipe.
+type recipeLabels struct {
+	Ingredients, Preparation         string
+	Servings, Total, Prep, Cook, Min string
+	PerServing                       string
+	Protein, Carbs, Fat              string
+	Optional                         string
 }
 
-func headings(language string) (ingredients, preparation string) {
-	if h, ok := sectionHeadings[strings.ToLower(language)]; ok {
-		return h[0], h[1]
+var englishLabels = recipeLabels{
+	"Ingredients", "Preparation",
+	"Servings", "Total", "Prep", "Cook", "min",
+	"Per serving (estimated)",
+	"protein", "carbs", "fat",
+	"optional",
+}
+
+var labelsByLanguage = map[string]recipeLabels{
+	"de": {
+		"Zutaten", "Zubereitung",
+		"Portionen", "Gesamt", "Vorbereitung", "Kochzeit", "Min.",
+		"Pro Portion (geschätzt)",
+		"Eiweiß", "Kohlenhydrate", "Fett",
+		"optional",
+	},
+	"fr": {
+		"Ingrédients", "Préparation",
+		"Portions", "Total", "Préparation", "Cuisson", "min",
+		"Par portion (estimé)",
+		"protéines", "glucides", "lipides",
+		"facultatif",
+	},
+	"es": {
+		"Ingredientes", "Preparación",
+		"Raciones", "Total", "Preparación", "Cocción", "min",
+		"Por ración (estimado)",
+		"proteínas", "carbohidratos", "grasas",
+		"opcional",
+	},
+	"it": {
+		"Ingredienti", "Preparazione",
+		"Porzioni", "Totale", "Preparazione", "Cottura", "min",
+		"Per porzione (stimato)",
+		"proteine", "carboidrati", "grassi",
+		"facoltativo",
+	},
+}
+
+func labelsFor(language string) recipeLabels {
+	if l, ok := labelsByLanguage[strings.ToLower(language)]; ok {
+		return l
 	}
-	return "Ingredients", "Preparation"
+	return englishLabels
 }
 
 // RenderMarkdown produces a markdown string from a RecipeDocument for the mobile client.
 func RenderMarkdown(doc model.RecipeDocument) string {
+	lb := labelsFor(doc.Language)
 	var b strings.Builder
 	b.WriteString("# " + doc.Title + "\n\n")
 	if doc.Summary != nil && *doc.Summary != "" {
@@ -425,16 +469,16 @@ func RenderMarkdown(doc model.RecipeDocument) string {
 	}
 	var meta []string
 	if doc.Servings != nil {
-		meta = append(meta, fmt.Sprintf("Servings: %d", *doc.Servings))
+		meta = append(meta, fmt.Sprintf("%s: %d", lb.Servings, *doc.Servings))
 	}
 	if doc.TotalMinutes != nil {
-		meta = append(meta, fmt.Sprintf("Total: %d min", *doc.TotalMinutes))
+		meta = append(meta, fmt.Sprintf("%s: %d %s", lb.Total, *doc.TotalMinutes, lb.Min))
 	}
 	if doc.PrepMinutes != nil {
-		meta = append(meta, fmt.Sprintf("Prep: %d min", *doc.PrepMinutes))
+		meta = append(meta, fmt.Sprintf("%s: %d %s", lb.Prep, *doc.PrepMinutes, lb.Min))
 	}
 	if doc.CookMinutes != nil {
-		meta = append(meta, fmt.Sprintf("Cook: %d min", *doc.CookMinutes))
+		meta = append(meta, fmt.Sprintf("%s: %d %s", lb.Cook, *doc.CookMinutes, lb.Min))
 	}
 	if len(meta) > 0 {
 		b.WriteString("*" + strings.Join(meta, " · ") + "*\n\n")
@@ -447,21 +491,19 @@ func RenderMarkdown(doc model.RecipeDocument) string {
 		value *int
 	}{
 		{"%d kcal", doc.Calories},
-		{"%dg protein", doc.ProteinG},
-		{"%dg carbs", doc.CarbsG},
-		{"%dg fat", doc.FatG},
+		{"%dg " + lb.Protein, doc.ProteinG},
+		{"%dg " + lb.Carbs, doc.CarbsG},
+		{"%dg " + lb.Fat, doc.FatG},
 	} {
 		if m.value != nil {
 			macros = append(macros, fmt.Sprintf(m.label, *m.value))
 		}
 	}
 	if len(macros) > 0 {
-		b.WriteString("*Per serving (estimated): " + strings.Join(macros, " · ") + "*\n\n")
+		b.WriteString("*" + lb.PerServing + ": " + strings.Join(macros, " · ") + "*\n\n")
 	}
 
-	ingHeading, prepHeading := headings(doc.Language)
-
-	b.WriteString("## " + ingHeading + "\n\n")
+	b.WriteString("## " + lb.Ingredients + "\n\n")
 	currentSection := ""
 	for _, ing := range doc.Ingredients {
 		sec := ""
@@ -491,16 +533,16 @@ func RenderMarkdown(doc model.RecipeDocument) string {
 		}
 		line := "- " + qty + ing.Item
 		if ing.Optional {
-			line += " *(optional)*"
+			line += " *(" + lb.Optional + ")*"
 		}
 		b.WriteString(line + "\n")
 	}
 
-	b.WriteString("\n## " + prepHeading + "\n\n")
+	b.WriteString("\n## " + lb.Preparation + "\n\n")
 	for _, step := range doc.Steps {
 		b.WriteString(fmt.Sprintf("%d. %s\n", step.SortOrder, step.StepText))
 		if step.TimerSeconds != nil && *step.TimerSeconds > 0 {
-			b.WriteString(fmt.Sprintf("   *⏱ %d min*\n", *step.TimerSeconds/60))
+			b.WriteString(fmt.Sprintf("   *⏱ %d %s*\n", *step.TimerSeconds/60, lb.Min))
 		}
 	}
 	return b.String()
