@@ -105,6 +105,14 @@ var chatTools = map[string]tool{
 		}, "target", "instruction"),
 		Run: toolTransformRecipe,
 	},
+	"translate_recipe": {
+		Description: "Write a recipe out again in another language. The original is never touched: this returns a new draft, and saving it files the translation as a sibling of the saved recipe it came from. Use it when the user wants a recipe in a different language than it was written in; use transform_recipe when the dish itself should change. target is a draft_ref or a saved recipe id.",
+		Params: obj(map[string]any{
+			"target":   str("A draft_ref, or the id of a saved recipe"),
+			"language": str("ISO 639-1 code to translate into, e.g. 'de'"),
+		}, "target", "language"),
+		Run: toolTranslateRecipe,
+	},
 	"review_cook_flow": {
 		Description: "Re-plan how a recipe is cooked, without changing the recipe. Merges steps too small to be worth their own screen, labels each step as mise en place / cook / wait, and marks the steps that should run at the same time (chopping while the water boils). Ingredients, quantities and the dish itself are never touched. Use it when a recipe's steps are fiddly, out of order, or written as a list of one-line actions, and when the user asks how to actually cook something. target is a draft_ref or a saved recipe id.",
 		Params:      obj(map[string]any{"target": str("A draft_ref, or the id of a saved recipe")}, "target"),
@@ -338,7 +346,7 @@ func toolGenerateRecipe(ctx context.Context, s *chatSession, args json.RawMessag
 	case a.ImageRef != "":
 		origin.SourceType = "image"
 	}
-	return s.addDraft(doc, origin, "")
+	return s.addDraft(doc, 0, origin, "")
 }
 
 func toolTransformRecipe(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
@@ -374,7 +382,53 @@ func toolTransformRecipe(ctx context.Context, s *chatSession, args json.RawMessa
 	}
 	// An adjusted draft keeps the original's provenance — "from seriouseats.com" is
 	// still true after "make it vegan". A saved-id target has none to inherit.
-	return s.addDraft(*result.Recipe, s.draftInfo[strings.TrimSpace(a.Target)].origin, a.Target)
+	return s.addDraft(*result.Recipe, 0, s.draftInfo[strings.TrimSpace(a.Target)].origin, a.Target)
+}
+
+func toolTranslateRecipe(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
+	var a struct {
+		Target   string `json:"target"`
+		Language string `json:"language"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return nil, nil, errors.New("could not read the arguments")
+	}
+	lang := strings.ToLower(strings.TrimSpace(a.Language))
+	if lang == "" {
+		return nil, nil, errors.New("give the language to translate into, as an ISO 639-1 code")
+	}
+	doc, err := s.resolveRecipe(ctx, a.Target)
+	if err != nil {
+		return nil, nil, err
+	}
+	if strings.EqualFold(doc.Language, lang) {
+		return nil, nil, errors.New("that recipe is already written in that language")
+	}
+
+	messages, err := buildRefineMessages(model.GenerationOrigin{Prompt: doc.Title, SourceType: "text"}, doc, nil,
+		"Translate this recipe into the language with ISO 639-1 code '"+lang+"'. Translate every text field: title, summary, section names, ingredient names, steps and notes. Change nothing else \u2014 same ingredients, same quantities, same steps, same dish.")
+	if err != nil {
+		return nil, nil, errors.New("could not prepare that translation")
+	}
+	// buildRefineMessages takes the output language from the document, which here is the
+	// language being translated *out of*. The target language is the whole point, so the
+	// system message is rebuilt for it.
+	messages[0] = openai.SystemMessage(buildSystemPrompt(lang) + refineJudgmentInstructions)
+
+	result, err := generateRefineFromMessages(ctx, messages)
+	if err != nil || result.Status != "applied" || result.Recipe == nil {
+		return nil, nil, errors.New("could not translate that recipe")
+	}
+	out := *result.Recipe
+	// The prompt asks for it, but a translation whose language field still says "en" is a
+	// sibling nothing can tell apart from its parent, so it is stamped here as well.
+	out.Language = lang
+
+	// A translation of a *saved* recipe is a sibling of it, never a replacement: parking
+	// it as a variant means saving links it with variant_of_recipe_id and leaves the
+	// original where it was (BACKLOG.md 14.2). It also settles the duplicate question,
+	// which a translation would otherwise fail on its way past a same-title parent.
+	return s.addDraft(out, savedRecipeID(a.Target), s.draftInfo[strings.TrimSpace(a.Target)].origin, a.Target)
 }
 
 func toolReviewCookFlow(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
@@ -397,7 +451,7 @@ func toolReviewCookFlow(ctx context.Context, s *chatSession, args json.RawMessag
 	}
 	// The result is a new draft, not a write: like every other proposal in this catalog it
 	// is the user's to save. A saved-id target has no provenance to inherit.
-	return s.addDraft(out, s.draftInfo[strings.TrimSpace(a.Target)].origin, a.Target)
+	return s.addDraft(out, 0, s.draftInfo[strings.TrimSpace(a.Target)].origin, a.Target)
 }
 
 func toolSearchMyRecipes(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
@@ -1182,13 +1236,14 @@ func (s *chatSession) parkDraft(doc model.RecipeDocument, variantOf int, origin 
 // addDraft parks a freshly generated document under a new draft_ref and returns the
 // compact summary the model reads plus the full-document artifact the client renders.
 //
-// derivedFrom is the draft_ref or `recipe:<id>` this document was made *out of* — a
+// variantOf is the saved recipe this document is a twist or a translation of, or 0; see
+// parkDraft. derivedFrom is the draft_ref or `recipe:<id>` this document was made *out of* — a
 // transform or a flow review — and empty for a fresh generation. It is the whole of the
 // server's part in BACKLOG 10.3: the client already holds the before-card, so naming it
 // is enough for the card to show what changed rather than a silent replacement. No diff
 // is computed here and no document is sent twice.
-func (s *chatSession) addDraft(doc model.RecipeDocument, origin *model.GenerationOrigin, derivedFrom string) (any, *artifact, error) {
-	ref := s.parkDraft(doc, 0, origin)
+func (s *chatSession) addDraft(doc model.RecipeDocument, variantOf int, origin *model.GenerationOrigin, derivedFrom string) (any, *artifact, error) {
+	ref := s.parkDraft(doc, variantOf, origin)
 
 	data := map[string]any{"draft_ref": ref, "document": doc}
 	if derivedFrom = strings.TrimSpace(derivedFrom); derivedFrom != "" {
@@ -1208,6 +1263,16 @@ func (s *chatSession) addDraft(doc model.RecipeDocument, origin *model.Generatio
 	}, &artifact{Kind: "recipe", Data: data}, nil
 }
 
+// savedRecipeID reads the saved recipe id out of a target ref ("recipe:12" or "12"),
+// or 0 when the ref names a draft instead.
+func savedRecipeID(ref string) int {
+	id, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSpace(ref), "recipe:"))
+	if err != nil || id <= 0 {
+		return 0
+	}
+	return id
+}
+
 // resolveRecipe turns a draft_ref or a saved recipe id into a document. A saved id is
 // looked up scoped to this session's user, so another user's id resolves to not-found.
 func (s *chatSession) resolveRecipe(ctx context.Context, ref string) (model.RecipeDocument, error) {
@@ -1215,8 +1280,8 @@ func (s *chatSession) resolveRecipe(ctx context.Context, ref string) (model.Reci
 	if doc, ok := s.drafts[ref]; ok {
 		return doc, nil
 	}
-	id, err := strconv.Atoi(strings.TrimPrefix(ref, "recipe:"))
-	if err != nil {
+	id := savedRecipeID(ref)
+	if id == 0 {
 		return model.RecipeDocument{}, errors.New("no such draft: " + ref)
 	}
 	if s.userID == 0 {

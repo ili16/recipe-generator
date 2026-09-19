@@ -311,7 +311,7 @@ func TestResolvePlanDays(t *testing.T) {
 
 func TestSessionDrafts(t *testing.T) {
 	session := &chatSession{drafts: map[string]model.RecipeDocument{}}
-	result, art, err := session.addDraft(testDraft, &model.GenerationOrigin{SourceType: "url", SourceURL: "https://example.com/x"}, "")
+	result, art, err := session.addDraft(testDraft, 0, &model.GenerationOrigin{SourceType: "url", SourceURL: "https://example.com/x"}, "")
 	if err != nil {
 		t.Fatalf("addDraft: %v", err)
 	}
@@ -347,12 +347,30 @@ func TestSessionDrafts(t *testing.T) {
 
 	// A transform does: it names the card it changed, which is how the client finds the
 	// before-document it already holds.
-	_, derived, err := session.addDraft(testDraft, nil, "draft_1")
+	_, derived, err := session.addDraft(testDraft, 0, nil, "draft_1")
 	if err != nil {
 		t.Fatalf("addDraft(derived): %v", err)
 	}
 	if got := derived.Data.(map[string]any)["derived_from"]; got != "draft_1" {
 		t.Errorf("derived_from = %v, want draft_1", got)
+	}
+
+	// translate_recipe parks its result as a variant of the saved recipe it read, so
+	// saving files a German sibling instead of replacing the English original, and the
+	// duplicate check (which skips variants) does not stop it on the shared title.
+	_, _, err = session.addDraft(testDraft, 7, nil, "recipe:7")
+	if err != nil {
+		t.Fatalf("addDraft(variant): %v", err)
+	}
+	if got := session.draftInfo["draft_3"].variantOf; got != 7 {
+		t.Errorf("variantOf = %d, want 7", got)
+	}
+
+	// Which parent that is comes straight off the target ref: a draft has none.
+	for ref, want := range map[string]int{"recipe:7": 7, "7": 7, " recipe:7 ": 7, "draft_1": 0, "": 0, "recipe:-1": 0} {
+		if got := savedRecipeID(ref); got != want {
+			t.Errorf("savedRecipeID(%q) = %d, want %d", ref, got, want)
+		}
 	}
 
 	// plan_week parks one draft per variant day so "apply it" has something
