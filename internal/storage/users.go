@@ -44,12 +44,12 @@ func GetPreferences(ctx context.Context, userID int) (model.UserPreferences, err
 	err := Pool.QueryRow(ctx, `
 		SELECT me.skill_level, me.dietary_prefs, me.disliked_ingredients,
 		       me.meal_plan_no_food_days, me.meal_plan_no_cook_days, me.meal_plan_batch_days,
-		       kitchen.week_start_day, kitchen.household_size
+		       me.language, kitchen.week_start_day, kitchen.household_size
 		FROM users me, users kitchen WHERE me.id = $1 AND kitchen.id = $2`,
 		userID, kitchenOwner(ctx, Pool, userID),
 	).Scan(&p.SkillLevel, &p.DietaryPrefs, &p.DislikedIngredients,
-		&p.MealPlanNoFoodDays, &p.MealPlanNoCookDays, &p.MealPlanBatchDays, &p.WeekStartDay,
-		&p.HouseholdSize)
+		&p.MealPlanNoFoodDays, &p.MealPlanNoCookDays, &p.MealPlanBatchDays, &p.Language,
+		&p.WeekStartDay, &p.HouseholdSize)
 	return p, err
 }
 
@@ -67,10 +67,11 @@ func UpdatePreferences(ctx context.Context, userID int, p model.UserPreferences)
 	if _, err = tx.Exec(ctx, `
 		UPDATE users
 		SET skill_level = $2, dietary_prefs = $3, disliked_ingredients = $4,
-		    meal_plan_no_food_days = $5, meal_plan_no_cook_days = $6, meal_plan_batch_days = $7
+		    meal_plan_no_food_days = $5, meal_plan_no_cook_days = $6, meal_plan_batch_days = $7,
+		    language = $8
 		WHERE id = $1`,
 		userID, p.SkillLevel, p.DietaryPrefs, p.DislikedIngredients,
-		p.MealPlanNoFoodDays, p.MealPlanNoCookDays, p.MealPlanBatchDays); err != nil {
+		p.MealPlanNoFoodDays, p.MealPlanNoCookDays, p.MealPlanBatchDays, p.Language); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `

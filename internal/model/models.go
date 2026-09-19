@@ -178,6 +178,10 @@ type UserPreferences struct {
 	// starts from. nil means they never said, which is not 1: nothing to compare a
 	// recipe's yield against, so no mismatch is claimed.
 	HouseholdSize *int `json:"household_size"`
+	// Language is the UI language the user picked ("en" or "de"), or nil when they never
+	// picked one — which is not English: the client follows the device locale instead.
+	// Per person, not per household: two people at one table can read different languages.
+	Language *string `json:"language"`
 }
 
 // CookingProfile is a behavioral profile derived from a user's saved recipe history by

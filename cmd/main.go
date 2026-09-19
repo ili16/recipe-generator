@@ -356,6 +356,14 @@ func HandlePatchPreferences(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if prefs.Language != nil {
+		switch *prefs.Language {
+		case "en", "de":
+		default:
+			http.Error(w, "invalid language", http.StatusBadRequest)
+			return
+		}
+	}
 	for _, slug := range prefs.DietaryPrefs {
 		if !dietaryPrefSlugs[slug] {
 			http.Error(w, "invalid dietary_prefs entry: "+slug, http.StatusBadRequest)
