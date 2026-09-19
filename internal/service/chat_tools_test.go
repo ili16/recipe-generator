@@ -394,6 +394,42 @@ func TestMergePreferences(t *testing.T) {
 	}
 }
 
+// TestApplyNotedPreference is BACKLOG 11.1's list logic: the write is one value, it is
+// case-insensitive both ways, and it never claims a change it did not make.
+func TestApplyNotedPreference(t *testing.T) {
+	current := model.UserPreferences{
+		DislikedIngredients: []string{"cilantro"},
+		DietaryPrefs:        []string{"vegetarian"},
+	}
+
+	added, list, changed, err := applyNotedPreference(current, "disliked_ingredients", " Mushrooms ", false)
+	if err != nil || !changed || len(list) != 2 || list[1] != "Mushrooms" {
+		t.Fatalf("add: %v changed=%v list=%v", err, changed, list)
+	}
+	if len(added.DietaryPrefs) != 1 {
+		t.Errorf("add clobbered the other list: %+v", added)
+	}
+
+	if _, _, changed, err := applyNotedPreference(added, "disliked_ingredients", "MUSHROOMS", false); err != nil || changed {
+		t.Errorf("re-adding the same value should be a no-op: changed=%v err=%v", changed, err)
+	}
+
+	removed, list, changed, err := applyNotedPreference(added, "disliked_ingredients", "mushrooms", true)
+	if err != nil || !changed || len(list) != 1 || list[0] != "cilantro" {
+		t.Fatalf("remove: %v changed=%v list=%v", err, changed, list)
+	}
+	if _, _, changed, _ := applyNotedPreference(removed, "disliked_ingredients", "mushrooms", true); changed {
+		t.Errorf("removing what is not there should be a no-op")
+	}
+
+	if _, _, _, err := applyNotedPreference(current, "household_size", "3", false); err == nil {
+		t.Errorf("a field that is not a list should be refused")
+	}
+	if _, _, _, err := applyNotedPreference(current, "disliked_ingredients", "  ", false); err == nil {
+		t.Errorf("an empty value should be refused")
+	}
+}
+
 // TestResolvePlanDaysSlots is BACKLOG 6.10's acceptance: one call can fill two slots of
 // the same day, and a day that names no slot still goes to dinner.
 func TestResolvePlanDaysSlots(t *testing.T) {

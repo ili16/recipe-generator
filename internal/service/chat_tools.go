@@ -223,6 +223,16 @@ var chatTools = map[string]tool{
 		Mutating:  true,
 		Run:       toolSetPreferences,
 	},
+	"note_preference": {
+		Description: "Record one durable like or dislike the user let slip in passing (\"ugh, not mushrooms again\") without interrupting them. One value at a time. Use remove=true to take one back. For anything else — skill level, household size, week scheduling — use set_preferences.",
+		Params: obj(map[string]any{
+			"field":  str("Which list: disliked_ingredients or dietary_prefs"),
+			"value":  str("The single ingredient or diet, e.g. 'mushrooms' or 'vegetarian'"),
+			"remove": map[string]any{"type": "boolean", "description": "Take this value back off the list instead of adding it"},
+		}, "field", "value"),
+		NeedsAuth: true,
+		Run:       toolNotePreference,
+	},
 	"fetch_url": {
 		Description: "Fetch the readable text of a webpage. Use this to look at a link the user shared when it isn't a recipe to extract.",
 		Params:      obj(map[string]any{"url": str("The page to fetch")}, "url"),
@@ -971,6 +981,79 @@ func mergePreferences(current model.UserPreferences, patch map[string]any) (mode
 		return current, err
 	}
 	return out, nil
+}
+
+// notablePreferenceFields are the two list fields note_preference may touch. Everything
+// else on UserPreferences (skill level, household size, week scheduling) stays on
+// set_preferences, which asks first — those are settings, not things overheard.
+var notablePreferenceFields = map[string]func(*model.UserPreferences) *[]string{
+	"disliked_ingredients": func(p *model.UserPreferences) *[]string { return &p.DislikedIngredients },
+	"dietary_prefs":        func(p *model.UserPreferences) *[]string { return &p.DietaryPrefs },
+}
+
+// applyNotedPreference adds or removes one value from one list, case-insensitively, and
+// reports whether anything actually moved — so the agent can say "already noted" rather
+// than claim a change it did not make.
+func applyNotedPreference(current model.UserPreferences, field, value string, remove bool) (model.UserPreferences, []string, bool, error) {
+	pick, ok := notablePreferenceFields[strings.ToLower(strings.TrimSpace(field))]
+	if !ok {
+		return current, nil, false, errors.New("field must be disliked_ingredients or dietary_prefs")
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return current, nil, false, errors.New("give a value")
+	}
+	list := pick(&current)
+	changed := false
+	if remove {
+		kept := make([]string, 0, len(*list))
+		for _, v := range *list {
+			if strings.EqualFold(v, value) {
+				changed = true
+				continue
+			}
+			kept = append(kept, v)
+		}
+		*list = kept
+	} else {
+		for _, v := range *list {
+			if strings.EqualFold(v, value) {
+				return current, *list, false, nil
+			}
+		}
+		*list = append(*list, value)
+		changed = true
+	}
+	return current, *list, changed, nil
+}
+
+// toolNotePreference is BACKLOG 11.1: a dislike said in passing is the most valuable
+// signal in the product and it used to die with the thread. Deliberately not Mutating —
+// one additive value is cheap to undo (the same tool, remove=true) and an approval card
+// per overheard "not mushrooms again" would be worse than the silence it replaces.
+func toolNotePreference(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
+	var a struct {
+		Field  string `json:"field"`
+		Value  string `json:"value"`
+		Remove bool   `json:"remove"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return nil, nil, errors.New("give a field and a value")
+	}
+	current, err := storage.GetPreferences(ctx, s.userID)
+	if err != nil {
+		return nil, nil, errors.New("could not read your preferences")
+	}
+	merged, list, changed, err := applyNotedPreference(current, a.Field, a.Value, a.Remove)
+	if err != nil {
+		return nil, nil, err
+	}
+	if changed {
+		if err := storage.UpdatePreferences(ctx, s.userID, merged); err != nil {
+			return nil, nil, errors.New("could not save your preferences")
+		}
+	}
+	return map[string]any{"field": a.Field, "value": a.Value, "removed": a.Remove, "changed": changed, "now": list}, nil, nil
 }
 
 // maxFetchedPageChars bounds what one fetch_url result can add to the thread — a long
