@@ -61,7 +61,8 @@ func GetHousehold(ctx context.Context, userID int) (model.Household, error) {
 	}
 
 	rows, err := Pool.Query(ctx, `
-		SELECT id, COALESCE(name, ''), COALESCE(email, '')
+		SELECT id, COALESCE(name, ''), COALESCE(email, ''),
+		       dietary_prefs, disliked_ingredients
 		FROM users WHERE household_id = $1::uuid
 		ORDER BY created_at`, h.ID)
 	if err != nil {
@@ -72,7 +73,7 @@ func GetHousehold(ctx context.Context, userID int) (model.Household, error) {
 	h.Members = []model.HouseholdMember{}
 	for rows.Next() {
 		var m model.HouseholdMember
-		if err := rows.Scan(&m.ID, &m.Name, &m.Email); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.Email, &m.DietaryPrefs, &m.DislikedIngredients); err != nil {
 			return model.Household{}, err
 		}
 		m.IsMe = m.ID == userID

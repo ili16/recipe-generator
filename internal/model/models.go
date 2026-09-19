@@ -142,13 +142,20 @@ type Household struct {
 	Members  []HouseholdMember `json:"members"`
 }
 
-// HouseholdMember is one person in it. Deliberately thin — a household has no roles and
-// no admin, so there is nothing to say about a member beyond who they are.
+// HouseholdMember is one person in it. A household has no roles and no admin, so there is
+// nothing to say about a member beyond who they are — plus the two preferences that are
+// asserted about the whole table rather than about them (BACKLOG 15.6).
+//
+// KitchenDietary unions exactly these two arrays into what the agent plans against; sending
+// them per member is what lets the client show that union with a name on every line, so a
+// constraint nobody recognises can be traced to the person it came from.
 type HouseholdMember struct {
-	ID    int    `json:"id"`
-	Name  string `json:"name"`
-	Email string `json:"email"`
-	IsMe  bool   `json:"is_me"`
+	ID                  int      `json:"id"`
+	Name                string   `json:"name"`
+	Email               string   `json:"email"`
+	IsMe                bool     `json:"is_me"`
+	DietaryPrefs        []string `json:"dietary_prefs"`
+	DislikedIngredients []string `json:"disliked_ingredients"`
 }
 
 // UserPreferences is the explicit profile settings a user can set about themselves:
