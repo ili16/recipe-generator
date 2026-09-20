@@ -580,6 +580,20 @@ type GroceryLine struct {
 	Need *float64 `json:"need,omitempty"`
 }
 
+// GroceryTick is one ticked-off shopping line, shared across a household (BACKLOG 15.9).
+// LineKey is the client's identity for a line — lowercased item plus unit — and not an
+// index, because the list reshuffles whenever the plan does. PantryItemID is the row the
+// tick wrote into the pantry (BACKLOG 7.2), so unticking knows what to take back out; nil
+// means the pantry write failed and the line is ticked with nothing behind it.
+type GroceryTick struct {
+	LineKey      string `json:"line_key"`
+	PantryItemID *int   `json:"pantry_item_id,omitempty"`
+	// Mine is false for a tick a housemate made, so the shopper can tell their own from
+	// the ones that appeared while they were in the aisle. Resolved server-side because
+	// the client authenticates with an OIDC subject and never sees its own row id.
+	Mine bool `json:"mine"`
+}
+
 // PantryHolding is one pantry line as the grocery list sees it (BACKLOG 16.5): Key is
 // canonical_item(name), the same key a grocery line is grouped under, and Name is the
 // owner's own wording, which is what ToGrams weighs.

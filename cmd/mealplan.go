@@ -523,3 +523,104 @@ func HandleSetBatchCook(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, items)
 }
+
+/* ── Ticked-off grocery lines (BACKLOG 15.9) ───────────────────────────────── */
+
+// parseTickRequest reads the week and line the three tick routes all address. week_start
+// is the shopping week, not the plan: the list is re-derived from the plan on every load
+// (6.1), so the plan's identity is not a stable thing to hang a tick on.
+func parseTickRequest(w http.ResponseWriter, r *http.Request) (weekStart time.Time, lineKey string, ok bool) {
+	weekStart, err := time.Parse(dateLayout, r.URL.Query().Get("week_start"))
+	if err != nil {
+		http.Error(w, "invalid or missing week_start (YYYY-MM-DD)", http.StatusBadRequest)
+		return
+	}
+	lineKey = r.URL.Query().Get("line_key")
+	return weekStart, lineKey, true
+}
+
+func HandleGetGroceryTicks(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	weekStart, _, ok := parseTickRequest(w, r)
+	if !ok {
+		return
+	}
+
+	ticks, err := storage.ListGroceryTicks(r.Context(), user.ID, weekStart)
+	if err != nil {
+		slog.Error("Error listing grocery ticks", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ticks": ticks})
+}
+
+// HandleTickGroceryLine marks a line bought for the whole kitchen and writes it into the
+// pantry. The pantry side of the tick lives here and not in the client (where 7.2 put it)
+// for the reason 15.9 exists: with two shoppers, a client-side write is one write per
+// device, and the first untick deletes a row the other shopper still believes in. One
+// server-side write behind one unique index is one pantry row.
+func HandleTickGroceryLine(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	weekStart, _, ok := parseTickRequest(w, r)
+	if !ok {
+		return
+	}
+
+	// The line_key and the pantry item it becomes arrive together: the client already
+	// knows both, and deriving the item here would mean re-aggregating the whole week to
+	// tick one line.
+	var in struct {
+		LineKey string           `json:"line_key"`
+		Item    model.PantryItem `json:"item"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	if in.LineKey == "" {
+		http.Error(w, "line_key is required", http.StatusBadRequest)
+		return
+	}
+
+	tick, err := storage.TickGroceryLine(r.Context(), user.ID, weekStart, in.LineKey, in.Item)
+	if err != nil {
+		slog.Error("Error ticking grocery line", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, tick)
+}
+
+func HandleUntickGroceryLine(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	weekStart, lineKey, ok := parseTickRequest(w, r)
+	if !ok {
+		return
+	}
+	if lineKey == "" {
+		http.Error(w, "line_key is required", http.StatusBadRequest)
+		return
+	}
+
+	// A line already unticked -- by the other shopper, a second between the two taps --
+	// is the state the caller asked for, so it is a 204 and not a 404.
+	if err := storage.UntickGroceryLine(r.Context(), user.ID, weekStart, lineKey); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		slog.Error("Error unticking grocery line", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}

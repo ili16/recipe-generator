@@ -132,6 +132,9 @@ func main() {
 
 	mux.HandleFunc("GET /api/v1/meal-plan", authenticator.Require(HandleGetMealPlan))
 	mux.HandleFunc("GET /api/v1/grocery-list", authenticator.Require(HandleGetGroceryList))
+	mux.HandleFunc("GET /api/v1/grocery-ticks", authenticator.Require(HandleGetGroceryTicks))
+	mux.HandleFunc("POST /api/v1/grocery-ticks", authenticator.Require(HandleTickGroceryLine))
+	mux.HandleFunc("DELETE /api/v1/grocery-ticks", authenticator.Require(HandleUntickGroceryLine))
 	mux.HandleFunc("POST /api/v1/meal-plan/share", authenticator.Require(HandleSharePlan))
 	mux.HandleFunc("DELETE /api/v1/meal-plan/share", authenticator.Require(HandleUnsharePlan))
 	mux.HandleFunc("POST /api/v1/meal-plan/items", authenticator.Require(HandleAddMealPlanItem))
