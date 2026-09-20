@@ -110,6 +110,7 @@ func main() {
 	mux.HandleFunc("DELETE /api/v1/recipes/{id}/share", authenticator.Require(HandleUnshareRecipe))
 	// Deliberately unauthenticated (BACKLOG 8.4) — the token is the credential.
 	mux.HandleFunc("GET /api/v1/shared/{token}", HandleGetSharedRecipe)
+	mux.HandleFunc("GET /api/v1/shared-plan/{token}", HandleGetSharedPlan)
 	mux.HandleFunc("GET /api/v1/collections", authenticator.Require(HandleGetCollections))
 	mux.HandleFunc("POST /api/v1/collections", authenticator.Require(HandleCreateCollection))
 	mux.HandleFunc("DELETE /api/v1/collections/{id}", authenticator.Require(HandleDeleteCollection))
@@ -131,6 +132,8 @@ func main() {
 
 	mux.HandleFunc("GET /api/v1/meal-plan", authenticator.Require(HandleGetMealPlan))
 	mux.HandleFunc("GET /api/v1/grocery-list", authenticator.Require(HandleGetGroceryList))
+	mux.HandleFunc("POST /api/v1/meal-plan/share", authenticator.Require(HandleSharePlan))
+	mux.HandleFunc("DELETE /api/v1/meal-plan/share", authenticator.Require(HandleUnsharePlan))
 	mux.HandleFunc("POST /api/v1/meal-plan/items", authenticator.Require(HandleAddMealPlanItem))
 	mux.HandleFunc("DELETE /api/v1/meal-plan/items/{id}", authenticator.Require(HandleDeleteMealPlanItem))
 	mux.HandleFunc("POST /api/v1/meal-plan/items/{id}/covers", authenticator.Require(HandleSetBatchCook))

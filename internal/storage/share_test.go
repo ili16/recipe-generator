@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/ili16/recipe-generator/internal/model"
 	"github.com/jackc/pgx/v5"
@@ -94,5 +95,64 @@ func TestShareLink(t *testing.T) {
 	}
 	if _, err := GetSharedRecipe(ctx, newToken); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("trashed share: want ErrNoRows, got %v", err)
+	}
+}
+
+// TestPlanShareLink is BACKLOG 13.2's plan half against a real DB (skipped unless DB_URL
+// is set): sharing a week resolves the token to that owner and range with no user id,
+// re-sharing keeps the link already sent, and revoking kills it.
+func TestPlanShareLink(t *testing.T) {
+	if os.Getenv("DB_URL") == "" {
+		t.Skip("DB_URL not set, skipping DB integration test")
+	}
+	InitDBPool()
+	ctx := context.Background()
+
+	var userID int
+	if err := Pool.QueryRow(ctx, `INSERT INTO users (oauth_id) VALUES ('test-plan-share-owner') RETURNING id`).Scan(&userID); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	t.Cleanup(func() { Pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, userID) })
+
+	monday := time.Date(2026, 3, 2, 0, 0, 0, 0, time.UTC)
+	sunday := monday.AddDate(0, 0, 6)
+
+	if _, _, _, err := GetSharedPlan(ctx, ""); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("empty token: want ErrNoRows, got %v", err)
+	}
+
+	token, err := SharePlan(ctx, userID, monday, sunday)
+	if err != nil || token == "" {
+		t.Fatalf("SharePlan: token=%q err=%v", token, err)
+	}
+	t.Cleanup(func() { Pool.Exec(ctx, `DELETE FROM meal_plans WHERE user_id = $1`, userID) })
+
+	again, err := SharePlan(ctx, userID, monday, sunday)
+	if err != nil || again != token {
+		t.Fatalf("re-share: want %q, got %q (err %v)", token, again, err)
+	}
+
+	// The week reports its own token back, so "stop sharing" survives a reload.
+	held, err := PlanShareToken(ctx, userID, monday.AddDate(0, 0, -1), sunday)
+	if err != nil || held != token {
+		t.Fatalf("PlanShareToken: want %q, got %q (err %v)", token, held, err)
+	}
+
+	owner, gotStart, gotEnd, err := GetSharedPlan(ctx, token)
+	if err != nil {
+		t.Fatalf("GetSharedPlan: %v", err)
+	}
+	if owner != userID || !gotStart.Equal(monday) || !gotEnd.Equal(sunday) {
+		t.Fatalf("shared plan mismatch: owner=%d %v–%v", owner, gotStart, gotEnd)
+	}
+
+	if err := UnsharePlan(ctx, userID, monday); err != nil {
+		t.Fatalf("UnsharePlan: %v", err)
+	}
+	if _, _, _, err := GetSharedPlan(ctx, token); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("revoked token: want ErrNoRows, got %v", err)
+	}
+	if held, err := PlanShareToken(ctx, userID, monday.AddDate(0, 0, -1), sunday); err != nil || held != "" {
+		t.Fatalf("PlanShareToken after revoke: want \"\", got %q (err %v)", held, err)
 	}
 }

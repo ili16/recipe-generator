@@ -65,10 +65,18 @@ func HandleGetMealPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Advisory (BACKLOG 13.2): without it the planner just offers to share again, which
+	// is idempotent anyway.
+	shareToken, err := storage.PlanShareToken(r.Context(), user.ID, startsOn, endsOn)
+	if err != nil {
+		slog.Warn("meal plan: could not read share token", "error", err)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"starts_on": startsOn.Format(dateLayout),
-		"ends_on":   endsOn.Format(dateLayout),
-		"items":     items,
+		"starts_on":   startsOn.Format(dateLayout),
+		"ends_on":     endsOn.Format(dateLayout),
+		"items":       items,
+		"share_token": shareToken,
 	})
 }
 
@@ -88,41 +96,129 @@ func HandleGetGroceryList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ingredients, err := storage.GetPlannedIngredients(r.Context(), user.ID, startsOn, endsOn)
+	lines, err := groceryLinesFor(r.Context(), user.ID, startsOn, endsOn)
 	if err != nil {
 		slog.Error("Error getting planned ingredients", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	// Both reads are advisory: without staples the list shows salt, without conversions
-	// it splits onions across two lines. Neither is worth failing a shopping list over,
-	// so an error degrades to the empty map rather than a 500.
-	staples, err := storage.StapleNames(r.Context(), user.ID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"starts_on": startsOn.Format(dateLayout),
+		"ends_on":   endsOn.Format(dateLayout),
+		"lines":     lines,
+	})
+}
+
+// groceryLinesFor builds one user's shopping list for [startsOn, endsOn]. Shared by the
+// owner's own list and by a shared plan link (BACKLOG 13.2), which passes the plan
+// owner's id — one definition of what the week needs, so the visitor's page cannot drift
+// from the cook's.
+//
+// Only the planned ingredients are load-bearing: staples, stock, conversions and aliases
+// are advisory. Without staples the list shows salt, without stock it shops for what is
+// already in the fridge, without conversions it splits onions across two lines and
+// without aliases a zwiebel and an onion stay apart. None of that is worth failing a
+// shopping list over, so each degrades to its zero value rather than a 500.
+func groceryLinesFor(ctx context.Context, userID int, startsOn, endsOn time.Time) ([]model.GroceryLine, error) {
+	ingredients, err := storage.GetPlannedIngredients(ctx, userID, startsOn, endsOn)
+	if err != nil {
+		return nil, err
+	}
+
+	staples, err := storage.StapleNames(ctx, userID)
 	if err != nil {
 		slog.Warn("grocery list: could not read staples", "error", err)
 	}
-	// Advisory too: without it the list shops for the whole week even though some of it
-	// is already in the fridge, which is exactly the pre-16.5 behaviour.
-	stock, err := storage.PantryStock(r.Context(), user.ID)
+	stock, err := storage.PantryStock(ctx, userID)
 	if err != nil {
 		slog.Warn("grocery list: could not read pantry stock", "error", err)
 	}
-	grams, err := storage.GramsTable(r.Context(), append(service.GroceryPairs(ingredients), service.StockPairs(stock)...))
+	grams, err := storage.GramsTable(ctx, append(service.GroceryPairs(ingredients), service.StockPairs(stock)...))
 	if err != nil {
 		slog.Warn("grocery list: could not read conversions", "error", err)
 	}
-	// Advisory in the same way: without aliases a German recipe's zwiebel and an English
-	// one's onion stay two lines, which is exactly the old behaviour.
-	aliases, err := storage.AliasTable(r.Context(), service.GroceryAliasNames(ingredients))
+	aliases, err := storage.AliasTable(ctx, service.GroceryAliasNames(ingredients))
 	if err != nil {
 		slog.Warn("grocery list: could not read aliases", "error", err)
+	}
+
+	return service.BuildGroceryList(ingredients, staples, grams, aliases, stock), nil
+}
+
+// HandleSharePlan turns on the read-only link for the caller's week and returns its
+// token (BACKLOG 13.2). Idempotent — a second tap returns the token already sent.
+func HandleSharePlan(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	startsOn, endsOn, ok := parsePlanRange(w, r)
+	if !ok {
+		return
+	}
+	token, err := storage.SharePlan(r.Context(), user.ID, startsOn, endsOn)
+	if err != nil {
+		slog.Error("Error sharing meal plan", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"share_token": token})
+}
+
+// HandleUnsharePlan revokes the week's link; it stops resolving immediately.
+func HandleUnsharePlan(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	startsOn, _, ok := parsePlanRange(w, r)
+	if !ok {
+		return
+	}
+	if err := storage.UnsharePlan(r.Context(), user.ID, startsOn); err != nil {
+		slog.Error("Error unsharing meal plan", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleGetSharedPlan serves a shared week and its grocery list to anyone holding the
+// token — no auth, no account, nothing to install (BACKLOG 13.2). The token resolves to
+// the owner, and every read below is the owner's ordinary scoped read.
+func HandleGetSharedPlan(w http.ResponseWriter, r *http.Request) {
+	ownerID, startsOn, endsOn, err := storage.GetSharedPlan(r.Context(), r.PathValue("token"))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("Error getting shared plan", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	items, err := storage.GetMealPlanRange(r.Context(), ownerID, startsOn, endsOn)
+	if err != nil {
+		slog.Error("Error getting shared plan range", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	// The list is the half with the real use — coordinating with someone who does not
+	// have the app — but it is derived, so a failure here still leaves a readable week.
+	lines, err := groceryLinesFor(r.Context(), ownerID, startsOn, endsOn)
+	if err != nil {
+		slog.Warn("shared plan: could not build grocery list", "error", err)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"starts_on": startsOn.Format(dateLayout),
 		"ends_on":   endsOn.Format(dateLayout),
-		"lines":     service.BuildGroceryList(ingredients, staples, grams, aliases, stock),
+		"items":     items,
+		"lines":     lines,
 	})
 }
 
