@@ -50,6 +50,13 @@ var MealPlanLowVarietyAddendum string
 //go:embed prompts/chat_agent_system.txt
 var ChatAgentSystemPrompt string
 
+// PantryScanPrompt reads a photo of a shelf or a shop receipt into pantry lines
+// (BACKLOG.md 17.5). Not part of PromptVersion: it shapes a pantry row, never a saved
+// RecipeDocument.
+//
+//go:embed prompts/pantry_scan.txt
+var PantryScanPrompt string
+
 // ThreadSummaryPrompt compresses the dropped span of an over-long thread into one
 // system message (BACKLOG.md 2.6). Cheap tier — it summarises text that is already in
 // hand, not a recipe.

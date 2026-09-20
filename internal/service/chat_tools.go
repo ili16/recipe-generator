@@ -140,6 +140,15 @@ var chatTools = map[string]tool{
 		NeedsAuth:   true,
 		Run:         toolGetRecipe,
 	},
+	"rename_recipe": {
+		Description: "Rename one of the user's saved recipes. Use it when the user asks for a different name, or when a saved recipe carries a name that only made sense in the conversation that produced it (\"Half-Batch Cr\u00e8me Br\u00fbl\u00e9e\"). The new title names the dish, not the request: no serving counts, no source, no wording of the change that produced it.",
+		Params: obj(map[string]any{
+			"id":    integer("The saved recipe's id"),
+			"title": str("The new title"),
+		}, "id", "title"),
+		NeedsAuth: true,
+		Run:       toolRenameRecipe,
+	},
 	"save_recipe": {
 		Description: "Save a draft to the user's account. Only call this when the user has actually asked to save. If the user already has a recipe that looks like this one, nothing is saved and the match is reported back as duplicate_of — tell the user what they already have and offer to save it as a variant of that recipe or as a separate recipe, then call again with confirm true (plus variant_of set to the existing id, if they chose variant).",
 		Params: obj(map[string]any{
@@ -206,10 +215,41 @@ var chatTools = map[string]tool{
 		Run:       toolClearPlanDay,
 	},
 	"get_pantry": {
-		Description: "Read what the user has in the house: name, amount, where it is kept, when it expires, whether it is a staple they always have, and its substitution class where one is known (penne and spaghetti are both pasta_dry). Use it to answer \"what can I make tonight\" and \"what is about to go off\" without making them go and look. A shared class means a swap you may offer, never one you may assume.",
+		Description: "Read what the user has in the house: name, amount, where it is kept, when it expires, whether it is a staple they always have, whether they have marked it running low (a staple running low is back on the grocery list), and its substitution class where one is known (penne and spaghetti are both pasta_dry). Use it to answer \"what can I make tonight\" and \"what is about to go off\" without making them go and look. A shared class means a swap you may offer, never one you may assume.",
 		Params:      obj(map[string]any{}),
 		NeedsAuth:   true,
 		Run:         toolGetPantry,
+	},
+	"scan_pantry": {
+		Description: "Read a photo the user attached — a fridge, freezer or cupboard shelf, or a supermarket receipt — into a list of foods with amounts. It changes nothing: show the user what came back, then pass the lines they want kept to add_pantry_items.",
+		Params: obj(map[string]any{
+			"image_ref": str("The ref from an [attached photo] marker in the user's message, e.g. 'image1'"),
+		}, "image_ref"),
+		NeedsAuth: true,
+		Run:       toolScanPantry,
+	},
+	"add_pantry_items": {
+		Description: "Put foods into the user's pantry. Re-adding something they already have replaces that line's amount rather than making a second one. Use it for what the user tells you they have ('I bought two kilos of flour') and for the lines they keep from a scan_pantry photo.",
+		Params: obj(map[string]any{
+			"items": map[string]any{
+				"type":        "array",
+				"description": "The foods to put in the pantry",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"name":       str("The generic name of the food, e.g. 'milk' — never a brand"),
+						"quantity":   map[string]any{"type": "number", "description": "How much, in the unit below. Omit if unknown."},
+						"unit":       str("g, kg, ml, l, or piece. Omit if unknown."),
+						"category":   map[string]any{"type": "string", "enum": model.PantryCategories, "description": "Where it is kept"},
+						"expires_on": str("YYYY-MM-DD, only if actually known"),
+					},
+					"required": []string{"name"},
+				},
+			},
+		}, "items"),
+		NeedsAuth: true,
+		Mutating:  true,
+		Run:       toolAddPantryItems,
 	},
 	"mark_meal_cooked": {
 		Description: "Record that a meal on the user's plan was cooked and eaten. It leaves the week's grocery list and its ingredients come out of the pantry. Pass meal_slot when the day holds more than one meal. Optionally rate the recipe 1-5.",
@@ -621,6 +661,44 @@ func toolGetRecipe(ctx context.Context, s *chatSession, args json.RawMessage) (a
 		&artifact{Kind: "recipe", Data: map[string]any{"recipe_id": recipe.ID, "document": recipe.Structured}}, nil
 }
 
+func toolRenameRecipe(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
+	var a struct {
+		ID    int    `json:"id"`
+		Title string `json:"title"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return nil, nil, errors.New("could not read the arguments")
+	}
+	title := strings.TrimSpace(a.Title)
+	if title == "" {
+		return nil, nil, errors.New("give the new title")
+	}
+	// Scoped by user_id, so another user's id is simply not found.
+	recipe, err := storage.GetRecipeByID(ctx, s.userID, a.ID)
+	if err != nil {
+		return nil, nil, errors.New("no such recipe")
+	}
+	if recipe.Structured == nil {
+		return nil, nil, errors.New("that recipe has no structured document to rename")
+	}
+	if recipe.Structured.Title == title {
+		return map[string]any{"id": a.ID, "title": title, "unchanged": true}, nil, nil
+	}
+
+	// The whole document goes back through the normal update path rather than a bespoke
+	// title-only UPDATE, so the rename lands in recipe_versions and the timeline like
+	// every other edit. manuallyEdited is true: the user asked for this name, no model
+	// regenerated the recipe.
+	doc := *recipe.Structured
+	doc.Title = title
+	updated, err := storage.UpdateRecipeStructured(ctx, s.userID, a.ID, doc, RenderMarkdown(doc), true, "renamed to "+title)
+	if err != nil {
+		return nil, nil, errors.New("could not rename that recipe")
+	}
+	return map[string]any{"id": a.ID, "title": title},
+		&artifact{Kind: "recipe", Data: map[string]any{"recipe_id": a.ID, "document": updated.Structured}}, nil
+}
+
 func toolSaveRecipe(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
 	var a struct {
 		DraftRef  string   `json:"draft_ref"`
@@ -939,6 +1017,75 @@ func toolGetPantry(ctx context.Context, s *chatSession, _ json.RawMessage) (any,
 		return nil, nil, errors.New("could not read your pantry")
 	}
 	return map[string]any{"items": items}, nil, nil
+}
+
+// toolScanPantry turns an attached photo into a list of pantry lines. It is deliberately
+// NOT Mutating: it writes nothing, so there is nothing to approve. The write is
+// add_pantry_items, and that one is gated — which is also what makes the approval card
+// show the actual parsed list, since by then the items are the tool call's own arguments
+// and the user can have the model drop the ones they do not want.
+func toolScanPantry(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
+	var a struct {
+		ImageRef string `json:"image_ref"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return nil, nil, errors.New("could not read the arguments")
+	}
+	data, ok := s.images[a.ImageRef]
+	if !ok {
+		return nil, nil, errors.New("that photo isn't attached to this message; ask the user to send it again")
+	}
+	items, err := ScanPantryImage(ctx, data)
+	if err != nil {
+		return nil, nil, errors.New("could not read that photo")
+	}
+	return map[string]any{"items": items}, nil, nil
+}
+
+// toolAddPantryItems writes the lines the user agreed to. Every row goes through
+// UpsertPantryItem, so a name and unit are normalised exactly as the pantry screen
+// normalises them and a food they already hold keeps one line — and then through the
+// same background alias/grams learning a saved recipe triggers, which is what makes a
+// scanned "Zwiebeln" match a recipe's "onion" and a 500 g bag count against 300 g of it.
+func toolAddPantryItems(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
+	var a struct {
+		Items []model.PantryItem `json:"items"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return nil, nil, errors.New("could not read the arguments")
+	}
+	if len(a.Items) == 0 {
+		return nil, nil, errors.New("give at least one item")
+	}
+	if len(a.Items) > maxScannedItems {
+		return nil, nil, fmt.Errorf("that is more than %d items; add them in smaller batches", maxScannedItems)
+	}
+
+	added := []model.PantryItem{}
+	skipped := []string{}
+	for _, in := range a.Items {
+		item, err := storage.UpsertPantryItem(ctx, s.userID, in)
+		if err != nil {
+			// A single unreadable line (a blank name, an unparseable date) is not a
+			// reason to lose the rest of the shelf — it comes back named so the model
+			// can say which one it could not take.
+			if errors.Is(err, storage.ErrEmptyPantryItemName) || errors.Is(err, storage.ErrInvalidExpiry) {
+				skipped = append(skipped, in.Name)
+				continue
+			}
+			return nil, nil, errors.New("could not write to your pantry")
+		}
+		added = append(added, item)
+	}
+
+	ingredients := make([]model.RecipeIngredient, 0, len(added))
+	for _, item := range added {
+		ingredients = append(ingredients, model.RecipeIngredient{Item: item.Name, Quantity: item.Quantity, Unit: item.Unit})
+	}
+	LearnAliases(ingredients)
+	LearnGrams(ingredients)
+
+	return map[string]any{"added": added, "skipped": skipped}, nil, nil
 }
 
 // toolMarkMealCooked is the agent's half of the planner's "mark as cooked": same storage

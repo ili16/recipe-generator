@@ -3,13 +3,11 @@ package service
 import (
 	"cmp"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"os"
 	"strings"
 
@@ -386,19 +384,14 @@ func generateFromImage(ctx context.Context, file io.Reader, prompt, preferredLan
 	if err != nil {
 		return model.RecipeDocument{}, fmt.Errorf("read image: %w", err)
 	}
-	mime := http.DetectContentType(data)
-	if mime == "application/octet-stream" {
-		mime = "image/jpeg"
-	}
-	slog.Debug("generate/image: read", "bytes", len(data), "mime", mime)
+	slog.Debug("generate/image: read", "bytes", len(data))
 	userText := "Extract and structure the recipe shown in this image."
 	if prompt != "" {
 		userText += " Additional instructions: " + prompt
 	}
-	dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)
 	return generateStructured(ctx, resolveLanguage(prompt, preferredLanguage),
 		openai.TextContentPart(userText),
-		openai.ImageContentPart(openai.ChatCompletionContentPartImageImageURLParam{URL: dataURL}),
+		openai.ImageContentPart(openai.ChatCompletionContentPartImageImageURLParam{URL: imageDataURL(data)}),
 	)
 }
 

@@ -508,6 +508,13 @@ type PantryItem struct {
 	// counts toward a recipe's pantry match, which is the point of marking one; what it
 	// stops is the grocery list shopping for it and a cooked meal deducting it.
 	Staple bool `json:"staple"`
+	// RunningLow is the only thing that ever changes about a staple: the kitchen is out
+	// of it, or nearly. It is what puts salt back on the grocery list (BACKLOG 16.6).
+	RunningLow bool `json:"running_low"`
+	// ConfirmedAt is when the user last said this line is still true. Stamped on upsert
+	// and on every stock tap; a staple 28 days stale is what the Pantry screen's stock
+	// check asks about.
+	ConfirmedAt time.Time `json:"confirmed_at"`
 	// Class is the substitution class of this food, when one has been resolved
 	// (BACKLOG 17.4b): penne and spaghetti are both pasta_dry. It is what lets the
 	// agent offer a swap — and say it is offering one. nil means unresolved, and is
@@ -563,6 +570,24 @@ type GroceryLine struct {
 	Unit     *string  `json:"unit"`
 	Note     string   `json:"note,omitempty"`
 	For      []string `json:"for"`
+	// Need is the week's full demand when the pantry already covers part of it
+	// (BACKLOG 16.5): Quantity is then only the shortfall, and Need - Quantity is what
+	// the kitchen holds. Set only when a subtraction actually happened, so a line
+	// without it is the old, unreduced line. The UI says both numbers out loud — a
+	// shopping list that shrinks without saying why is worse than one that never shrinks.
+	// Ticking the line stores Need in the pantry, not Quantity: after the trip you hold
+	// what the week asked for, not just what you bought.
+	Need *float64 `json:"need,omitempty"`
+}
+
+// PantryHolding is one pantry line as the grocery list sees it (BACKLOG 16.5): Key is
+// canonical_item(name), the same key a grocery line is grouped under, and Name is the
+// owner's own wording, which is what ToGrams weighs.
+type PantryHolding struct {
+	Key      string
+	Name     string
+	Quantity float64
+	Unit     *string
 }
 
 // MealPlanItem is one recipe assigned to one meal slot of one day in a user's meal plan.

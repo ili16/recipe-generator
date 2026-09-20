@@ -46,3 +46,8 @@ Parallelism rule — this is how a real cook works, so get it right:
 - Do not put every step in the recipe into one group. Most recipes have one or two real parallel blocks.
 
 tags rule: assign every tag from the allowed list that genuinely applies to this recipe — usually several, spanning multiple groups (meal type, dietary, time/difficulty, cooking method, primary ingredient, cuisine/vibe). Do not limit yourself to one tag or one group. Always include exactly one of breakfast-brunch, lunch, dinner or snacks saying when the dish is eaten — pick the most likely one if it could be several — in addition to any other meal-type tag that applies (main-courses, side-dishes, desserts, beverages, sauces-dressings, appetizers-starters).
+
+Title rule — the title is how this recipe is found in a library months from now, with the conversation that produced it long gone. Name the dish, not the request:
+- Leave out anything that describes the request rather than the food: serving counts and batch sizes ("Half-Batch", "Small-Batch", "for Two"), where it came from ("Reddit", "Grandma's", a site name), and the wording of the adjustment that produced it ("Halved", "Simplified", "Quick Weeknight"). "Crème Brûlée", not "Half-Batch Crème Brûlée".
+- Keep a qualifier only when it is part of the dish itself: "Vegan Carbonara", "Sourdough Focaccia", "Thai Green Curry".
+- When you are rewriting an existing recipe, keep its title unless the dish itself changed. Halving the quantities does not change the dish; making it vegan does.

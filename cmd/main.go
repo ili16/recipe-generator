@@ -127,6 +127,7 @@ func main() {
 	mux.HandleFunc("GET /api/v1/pantry", authenticator.Require(HandleGetPantry))
 	mux.HandleFunc("POST /api/v1/pantry", authenticator.Require(HandleUpsertPantryItem))
 	mux.HandleFunc("DELETE /api/v1/pantry/{id}", authenticator.Require(HandleDeletePantryItem))
+	mux.HandleFunc("PATCH /api/v1/pantry/{id}/stock", authenticator.Require(HandleSetPantryStock))
 
 	mux.HandleFunc("GET /api/v1/meal-plan", authenticator.Require(HandleGetMealPlan))
 	mux.HandleFunc("GET /api/v1/grocery-list", authenticator.Require(HandleGetGroceryList))
@@ -977,6 +978,43 @@ func HandleUpsertPantryItem(w http.ResponseWriter, r *http.Request) {
 		}
 		slog.Error("Error saving pantry item", "error", err)
 		http.Error(w, "Error saving pantry item", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
+}
+
+// HandleSetPantryStock answers "still enough?" for one line: running low, or have it.
+// Its own route rather than a field on the upsert, because the upsert is keyed on name
+// and unit and a staple carries neither an amount nor an expiry to re-send (BACKLOG 16.6).
+func HandleSetPantryStock(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+		return
+	}
+
+	itemID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || itemID <= 0 {
+		http.Error(w, "Invalid pantry item id", http.StatusBadRequest)
+		return
+	}
+
+	var in struct {
+		RunningLow bool `json:"running_low"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	item, err := storage.SetPantryStock(r.Context(), user.ID, itemID, in.RunningLow)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "Pantry item not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("Error updating pantry stock", "error", err)
+		http.Error(w, "Error updating pantry stock", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, http.StatusOK, item)

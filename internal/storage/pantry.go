@@ -30,7 +30,7 @@ const dateLayout = "2006-01-02"
 // the natural reading order; items with no expiry sort last.
 func ListPantryItems(ctx context.Context, userID int) ([]model.PantryItem, error) {
 	rows, err := Pool.Query(ctx, `
-		SELECT id, name, quantity, unit, category, expires_on, staple,
+		SELECT id, name, quantity, unit, category, expires_on, staple, running_low, confirmed_at,
 		       (SELECT a.class FROM ingredient_alias a WHERE a.name = normalize_item(pantry_items.name))
 		FROM pantry_items WHERE `+inScope("pantry_items", "$1")+`
 		ORDER BY expires_on ASC NULLS LAST, name`, userID)
@@ -88,8 +88,13 @@ func UpsertPantryItem(ctx context.Context, userID int, in model.PantryItem) (mod
 		VALUES ($1, `+stampHousehold+`, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (COALESCE(household_id::text, 'u' || user_id), name, COALESCE(unit, '')) DO UPDATE
 		SET quantity = EXCLUDED.quantity, category = EXCLUDED.category,
-		    expires_on = EXCLUDED.expires_on, staple = EXCLUDED.staple, updated_at = NOW()
-		RETURNING id, name, quantity, unit, category, expires_on, staple,
+		    expires_on = EXCLUDED.expires_on, staple = EXCLUDED.staple, updated_at = NOW(),
+		    -- Putting something in the fridge is confirming it. An amount arriving also
+		    -- settles the question the stock tap asked; a bare "I have flour" does not,
+		    -- so a running-low staple stays low until it is answered (BACKLOG 16.6).
+		    confirmed_at = NOW(),
+		    running_low = pantry_items.running_low AND EXCLUDED.quantity IS NULL
+		RETURNING id, name, quantity, unit, category, expires_on, staple, running_low, confirmed_at,
 		          (SELECT a.class FROM ingredient_alias a WHERE a.name = pantry_items.name)`,
 		userID, name, qty, unit, category, expires, in.Staple)
 	return scanPantryItem(row)
@@ -108,12 +113,26 @@ func DeletePantryItem(ctx context.Context, userID, itemID int) error {
 	return nil
 }
 
-// scanPantryItem reads the eight columns every query above selects, in that order, and
+// SetPantryStock answers the only question a standing fact ever raises: is there still
+// enough? Either answer stamps confirmed_at, which is what takes the row out of the
+// Pantry screen's stock check — saying "running low" is confirming the line, not
+// ignoring it (BACKLOG 16.6).
+func SetPantryStock(ctx context.Context, userID, itemID int, runningLow bool) (model.PantryItem, error) {
+	row := Pool.QueryRow(ctx, `
+		UPDATE pantry_items SET running_low = $3, confirmed_at = NOW(), updated_at = NOW()
+		WHERE id = $2 AND `+inScope("pantry_items", "$1")+`
+		RETURNING id, name, quantity, unit, category, expires_on, staple, running_low, confirmed_at,
+		          (SELECT a.class FROM ingredient_alias a WHERE a.name = pantry_items.name)`,
+		userID, itemID, runningLow)
+	return scanPantryItem(row)
+}
+
+// scanPantryItem reads the ten columns every query above selects, in that order, and
 // renders expires_on as a plain date string.
 func scanPantryItem(row pgx.Row) (model.PantryItem, error) {
 	var item model.PantryItem
 	var expires *time.Time
-	if err := row.Scan(&item.ID, &item.Name, &item.Quantity, &item.Unit, &item.Category, &expires, &item.Staple, &item.Class); err != nil {
+	if err := row.Scan(&item.ID, &item.Name, &item.Quantity, &item.Unit, &item.Category, &expires, &item.Staple, &item.RunningLow, &item.ConfirmedAt, &item.Class); err != nil {
 		return model.PantryItem{}, err
 	}
 	if expires != nil {
@@ -210,9 +229,13 @@ func RecipesUsingIngredients(ctx context.Context, userID int, names []string) (m
 // them (you do not measure what is left of it). They stay ordinary pantry rows
 // everywhere else, which is why the pantry match still counts them — that is the whole
 // reason for marking one.
+//
+// A staple the user has marked running low is not in this set: it goes back on the
+// grocery list, which is the whole reason the stock tap is worth anything (BACKLOG
+// 16.6). It still counts for the pantry match and is still never deducted.
 func StapleNames(ctx context.Context, userID int) (map[string]bool, error) {
 	rows, err := Pool.Query(ctx,
-		`SELECT name FROM pantry_items WHERE `+inScope("pantry_items", "$1")+` AND staple`, userID)
+		`SELECT name FROM pantry_items WHERE `+inScope("pantry_items", "$1")+` AND staple AND NOT running_low`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -225,6 +248,43 @@ func StapleNames(ctx context.Context, userID int) (map[string]bool, error) {
 			return nil, err
 		}
 		out[name] = true
+	}
+	return out, rows.Err()
+}
+
+// PantryStockDays is how long a pantry amount is trusted to still be there. Past it the
+// grocery list stops subtracting the row: an amount nobody has confirmed in four weeks is
+// a memory, and a list that silently shops for less because of one is worse than a list
+// that shops for the full week. Same 28 days as 16.6's stock check, and on purpose —
+// confirming a row is what puts it back in play.
+const PantryStockDays = 28
+
+// PantryStock is what the caller's kitchen already holds, for the grocery list to
+// subtract from the week's demand (BACKLOG 16.5).
+//
+// Four things keep a row out of it, each of them a way the subtraction would lie:
+//   - no quantity — "I have flour" does not say how much;
+//   - a staple — those leave the list whole (StapleNames), never partially;
+//   - already expired — you are not cooking with it, so you still have to buy it;
+//   - unconfirmed for PantryStockDays — see above.
+func PantryStock(ctx context.Context, userID int) ([]model.PantryHolding, error) {
+	rows, err := Pool.Query(ctx, `
+		SELECT canonical_item(name), name, quantity, unit FROM pantry_items
+		WHERE `+inScope("pantry_items", "$1")+` AND NOT staple AND quantity IS NOT NULL
+		  AND (expires_on IS NULL OR expires_on >= CURRENT_DATE)
+		  AND confirmed_at > NOW() - make_interval(days => $2)`, userID, PantryStockDays)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []model.PantryHolding{}
+	for rows.Next() {
+		var h model.PantryHolding
+		if err := rows.Scan(&h.Key, &h.Name, &h.Quantity, &h.Unit); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
 	}
 	return out, rows.Err()
 }
