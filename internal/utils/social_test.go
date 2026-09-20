@@ -115,3 +115,43 @@ func TestSocialLive(t *testing.T) {
 		}
 	})
 }
+
+// TestInstagramCaptionBlock is the embed page's shape, trimmed to the caption block: the
+// author anchor, the caption with its <br /> paragraph breaks, and the comments link that
+// ends it. Measured against a live reel on 2026-09-20 — the og: tags that used to carry
+// this were simply absent on that post, which is why the embed page is now the first try.
+func TestInstagramCaptionBlock(t *testing.T) {
+	page := `<div class="Caption"><a class="CaptionUsername" href="/davespizzaoven/">davespizzaoven</a>` +
+		`<br /><br />200g flour, 5g salt<br /><br />Bake 90 seconds &amp; eat` +
+		`<div class="CaptionComments"><a href="#">View all 341 comments</a></div></div>`
+	block := captionRe.FindStringSubmatch(page)
+	if block == nil {
+		t.Fatal("caption block not matched")
+	}
+	text := strings.ReplaceAll(block[1], "<br />", "\n")
+	text = tagRe.ReplaceAllString(text, "\n")
+	if !strings.Contains(text, "200g flour, 5g salt") || !strings.Contains(text, "Bake 90 seconds") {
+		t.Errorf("caption lost its body: %q", text)
+	}
+	if strings.Contains(text, "View all 341 comments") {
+		t.Errorf("comment link leaked into the caption: %q", text)
+	}
+}
+
+func TestInstagramShortcode(t *testing.T) {
+	cases := map[string]string{
+		"https://www.instagram.com/reel/DZfeR3zuoWw/?stkn=abc":  "DZfeR3zuoWw",
+		"https://www.instagram.com/p/C1wWQcYrHXH/":              "C1wWQcYrHXH",
+		"https://www.instagram.com/davespizzaoven/reel/DZfe_x/": "DZfe_x",
+		"https://www.instagram.com/davespizzaoven/":             "",
+	}
+	for url, want := range cases {
+		got := ""
+		if m := instagramShortcodeRe.FindStringSubmatch(url); m != nil {
+			got = m[1]
+		}
+		if got != want {
+			t.Errorf("%s: shortcode %q, want %q", url, got, want)
+		}
+	}
+}

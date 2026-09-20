@@ -21,10 +21,11 @@ import (
 //	YouTube   oembed endpoint, no key, but title/author only — no description, which
 //	          is where a YouTube recipe actually lives. YOUTUBE_API_KEY (free quota,
 //	          10K units/day) buys the description; without it we degrade to the title.
-//	Instagram og:title and og:description — but ONLY to a crawler User-Agent. To a
-//	          browser UA it serves the shell with no tags at all, which is why this was
-//	          first measured as "nothing" (see 11.8). The title reads
-//	          `Dave's Pizza Oven on Instagram: "<caption>"`, which is the whole post.
+//	Instagram the /embed/captioned/ page. It is server-rendered and carries the WHOLE
+//	          caption, untruncated, in a <div class="Caption">. og:title and og:description
+//	          were the first route here (11.8) and are now only a fallback: measured
+//	          2026-09-20, a live public reel served og:image and og:url and no og:title at
+//	          all, so the og path called a perfectly readable post private.
 //
 // ponytail: no cache table. A recipe URL is pasted once; the entry that proposed
 // `social_media_cache` was pricing a re-fetch that does not happen. Add one when the
@@ -55,7 +56,52 @@ func metaContent(page, prop string) string {
 	return ""
 }
 
+// instagramShortcodeRe pulls the post id out of /p/<code>/, /reel/<code>/ or /tv/<code>/,
+// including the /<author>/reel/<code>/ shape Instagram redirects to.
+var instagramShortcodeRe = regexp.MustCompile(`/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)`)
+
+// captionRe matches the embed page's caption block: everything between the Caption div
+// and either the comment link or its close.
+var captionRe = regexp.MustCompile(`(?s)<div class="Caption">(.*?)(?:<div class="CaptionComments">|</div>)`)
+
+// tagRe strips the handful of inline tags the caption block carries (the author anchor,
+// hashtag links, <br>). The caption is plain text inside them.
+var tagRe = regexp.MustCompile(`<[^>]*>`)
+
+// instagramCaption reads the whole caption off the server-rendered embed page. Empty
+// when the post is gone, private, or the page shape changed — the caller falls back.
+func instagramCaption(rawURL string) string {
+	m := instagramShortcodeRe.FindStringSubmatch(rawURL)
+	if m == nil {
+		return ""
+	}
+	page, err := GetWebsiteAs("https://www.instagram.com/p/"+m[1]+"/embed/captioned/", crawlerUA)
+	if err != nil {
+		return ""
+	}
+	block := captionRe.FindStringSubmatch(page)
+	if block == nil {
+		return ""
+	}
+	text := strings.ReplaceAll(block[1], "<br />", "\n")
+	text = htmlpkg.UnescapeString(tagRe.ReplaceAllString(text, "\n"))
+	// The block opens with the author's handle on its own line; the rest is the caption
+	// as written, blank lines and all. Collapse the runs the tag-stripping leaves.
+	lines := []string{}
+	for _, l := range strings.Split(text, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 func instagramContent(rawURL string) (string, error) {
+	// The embed page is the good source: the full caption, not a preview of it.
+	if caption := instagramCaption(rawURL); caption != "" {
+		return join("Instagram post", "", caption), nil
+	}
+
 	page, err := GetWebsiteAs(rawURL, crawlerUA)
 	if err != nil {
 		// Instagram rate-limits per IP and answers 429 with a redirect to the login
