@@ -157,3 +157,38 @@ func TestMigrationSizeWordsMatchGo(t *testing.T) {
 		}
 	}
 }
+
+// BACKLOG 17.4c: a swap keeps the amount 1:1 by weight, and refuses to invent one when
+// either side cannot be weighed. The second half is the one that matters — the callers
+// are a shopping list and a subtraction from someone's fridge.
+func TestSwapQuantity(t *testing.T) {
+	g := "g"
+	piece := (*string)(nil)
+	table := map[ItemUnit]float64{
+		{"onion", ""}:   150,
+		{"shallot", ""}: 50,
+		{"spaghetti", "g"}: 1, // never consulted: g is the identity
+	}
+
+	// Mass in, mass out: the same 200 g, whatever the box says.
+	if got, ok := SwapQuantity(table, "spaghetti", "linguine", &g, 200); !ok || got != 200 {
+		t.Errorf("200 g spaghetti → linguine = %v (ok=%v), want 200 g", got, ok)
+	}
+	// Pieces convert by weight: two onions is 300 g is six shallots.
+	if got, ok := SwapQuantity(table, "onion", "shallot", piece, 2); !ok || got != 6 {
+		t.Errorf("2 onions → shallots = %v (ok=%v), want 6", got, ok)
+	}
+	// The size modifier still counts on the way in (BACKLOG 17.1): a large onion is
+	// 202.5 g, which is 4.05 shallots.
+	if got, ok := SwapQuantity(table, "large onion", "shallot", piece, 1); !ok || got < 4.04 || got > 4.06 {
+		t.Errorf("1 large onion → shallots = %v (ok=%v), want ~4.05", got, ok)
+	}
+	// Nothing knows what a sprig of thyme weighs: the amount is handed back untouched.
+	if got, ok := SwapQuantity(table, "thyme", "oregano", piece, 3); ok || got != 3 {
+		t.Errorf("unweighable swap = %v (ok=%v), want 3 and false", got, ok)
+	}
+	// Half-known is still unknown: the source weighs, the target does not.
+	if got, ok := SwapQuantity(table, "onion", "galangal", piece, 2); ok || got != 2 {
+		t.Errorf("half-known swap = %v (ok=%v), want 2 and false", got, ok)
+	}
+}

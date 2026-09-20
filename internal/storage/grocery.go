@@ -25,11 +25,16 @@ import (
 //     of a batch-cooked dish on the list — the one line below is that bug's fix.
 func GetPlannedIngredients(ctx context.Context, userID int, startsOn, endsOn time.Time) ([]model.GroceryIngredient, error) {
 	rows, err := Pool.Query(ctx, `
-		SELECT mpi.planned_on, r.title, mpi.servings, r.servings, ri.item, ri.quantity, ri.unit, ri.quantity_text, ri.category
+		SELECT mpi.planned_on, r.title, mpi.servings, r.servings, ri.item, ri.quantity, ri.unit, ri.quantity_text, ri.category,
+		       sw.replacement
 		FROM meal_plan_items mpi
 		JOIN meal_plans mp ON mp.id = mpi.meal_plan_id
 		JOIN recipes r ON r.id = mpi.recipe_id
 		JOIN recipe_ingredients ri ON ri.recipe_id = r.id
+		-- The caller's own substitutions (BACKLOG 17.4c). Per-user by design, even
+		-- though the plan is the household's: you shop for what you cook with.
+		LEFT JOIN recipe_ingredient_swaps sw
+		       ON sw.user_id = $1 AND sw.recipe_id = r.id AND sw.sort_order = ri.sort_order
 		WHERE `+inScope("mp", "$1")+` AND mpi.planned_on BETWEEN $2 AND $3 AND r.deleted_at IS NULL
 		  AND mpi.cooked_at IS NULL AND mpi.source_item_id IS NULL
 		ORDER BY mpi.planned_on, mpi.id, ri.sort_order`,
@@ -41,16 +46,48 @@ func GetPlannedIngredients(ctx context.Context, userID int, startsOn, endsOn tim
 	defer rows.Close()
 
 	out := []model.GroceryIngredient{}
+	swapped := map[int]string{} // index in out -> what the recipe originally said
 	for rows.Next() {
 		var ing model.GroceryIngredient
 		var plannedOn time.Time
-		if err := rows.Scan(&plannedOn, &ing.RecipeTitle, &ing.PlannedServings, &ing.RecipeServings, &ing.Item, &ing.Quantity, &ing.Unit, &ing.QuantityText, &ing.Category); err != nil {
+		var replacement *string
+		if err := rows.Scan(&plannedOn, &ing.RecipeTitle, &ing.PlannedServings, &ing.RecipeServings, &ing.Item, &ing.Quantity, &ing.Unit, &ing.QuantityText, &ing.Category, &replacement); err != nil {
 			return nil, err
 		}
 		ing.PlannedOn = plannedOn.Format("2006-01-02")
+		if replacement != nil {
+			swapped[len(out)] = ing.Item
+			ing.Item = *replacement
+		}
 		out = append(out, ing)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// A swap keeps the amount 1:1 by weight, which needs both foods in the gram table.
+	// Advisory, like every other gram lookup: without a row the line is shopped for in
+	// the amount the recipe wrote, under the replacement's name.
+	if len(swapped) > 0 {
+		var pairs []model.ItemUnit
+		for i, was := range swapped {
+			family, _ := model.NormalizeUnit(out[i].Unit)
+			pairs = append(pairs,
+				model.ItemUnit{Item: model.NormalizeItem(was), Unit: family},
+				model.ItemUnit{Item: model.NormalizeItem(out[i].Item), Unit: family})
+		}
+		if table, gErr := gramsTableTx(ctx, Pool, pairs); gErr == nil {
+			for i, was := range swapped {
+				if out[i].Quantity == nil {
+					continue
+				}
+				if q, ok := model.SwapQuantity(table, was, out[i].Item, out[i].Unit, *out[i].Quantity); ok {
+					out[i].Quantity = &q
+				}
+			}
+		}
+	}
+	return out, nil
 }
 
 // UncategorisedItems returns the distinct lowercased ingredient names that have no

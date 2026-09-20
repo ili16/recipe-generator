@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/ili16/recipe-generator/internal/model"
 )
@@ -160,5 +161,114 @@ func TestRecipesUsingIngredientsSeparatesSwaps(t *testing.T) {
 	// "penne" is a sibling of the recipe's spaghetti: a swap, and named as one.
 	if len(swaps) != 1 || swaps[0].Item != "spaghetti" || swaps[0].SwapFor != "penne" {
 		t.Errorf("swaps = %v, want spaghetti←penne", swaps)
+	}
+}
+
+// BACKLOG 17.4c: one swap, three surfaces. The point of the test is that they agree —
+// being shown linguine, shopping for spaghetti and deducting either at random is worse
+// than having no swap at all.
+func TestIngredientSwapAppliesOnEverySurface(t *testing.T) {
+	if os.Getenv("DB_URL") == "" {
+		t.Skip("DB_URL not set, skipping DB integration test")
+	}
+	InitDBPool()
+	ctx := context.Background()
+
+	var userID int
+	if err := Pool.QueryRow(ctx, `INSERT INTO users (oauth_id) VALUES ('test-swap-apply') RETURNING id`).Scan(&userID); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	t.Cleanup(func() { Pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, userID) })
+
+	class := func(s string) *string { return &s }
+	if err := UpsertAliases(ctx, []model.Alias{
+		{Name: "spaghetti", Canonical: "spaghetti", Class: class("pasta_dry")},
+		{Name: "linguine", Canonical: "linguine", Class: class("pasta_dry")},
+	}); err != nil {
+		t.Fatalf("UpsertAliases: %v", err)
+	}
+	t.Cleanup(func() {
+		Pool.Exec(ctx, `DELETE FROM ingredient_alias WHERE name = ANY($1::text[])`, []string{"spaghetti", "linguine"})
+	})
+
+	doc := model.RecipeDocument{
+		Title: "Swap Surfaces", Language: "en", Servings: i(2),
+		Ingredients: []model.RecipeIngredient{{Item: "Spaghetti", Quantity: f(200), Unit: u("g")}},
+		Steps:       []model.RecipeStep{{SortOrder: 1, StepText: "Cook"}},
+	}
+	recipe, err := AddRecipeStructured(ctx, userID, doc, "# Swap Surfaces", nil, nil, "test-model", "v1", nil)
+	if err != nil {
+		t.Fatalf("AddRecipeStructured: %v", err)
+	}
+	t.Cleanup(func() { Pool.Exec(ctx, `DELETE FROM recipes WHERE id = $1`, recipe.ID) })
+
+	if _, err := UpsertPantryItem(ctx, userID, model.PantryItem{
+		Name: "Linguine", Quantity: f(500), Unit: u("g"), Category: "spices_dry",
+	}); err != nil {
+		t.Fatalf("UpsertPantryItem: %v", err)
+	}
+
+	// Before the swap, the kitchen's linguine is only ever an offer.
+	got, err := GetRecipeByID(ctx, userID, recipe.ID)
+	if err != nil {
+		t.Fatalf("GetRecipeByID: %v", err)
+	}
+	if len(got.Structured.Ingredients) != 1 {
+		t.Fatalf("ingredients = %d, want 1", len(got.Structured.Ingredients))
+	}
+	if ing := got.Structured.Ingredients[0]; ing.SwappedFrom != nil || len(ing.SwapOptions) != 1 || ing.SwapOptions[0] != "linguine" {
+		t.Fatalf("unswapped line = %+v, want no swap and linguine on offer", ing)
+	}
+
+	if err := SetSwap(ctx, userID, recipe.ID, 1, "linguine"); err != nil {
+		t.Fatalf("SetSwap: %v", err)
+	}
+
+	// Surface 1: the recipe reads as linguine, and still says what it really asks for.
+	got, err = GetRecipeByID(ctx, userID, recipe.ID)
+	if err != nil {
+		t.Fatalf("GetRecipeByID after swap: %v", err)
+	}
+	ing := got.Structured.Ingredients[0]
+	if ing.Item != "linguine" || ing.SwappedFrom == nil || *ing.SwappedFrom != "Spaghetti" {
+		t.Errorf("swapped line = %+v, want linguine swapped from Spaghetti", ing)
+	}
+	if ing.Quantity == nil || *ing.Quantity != 200 {
+		t.Errorf("swapped quantity = %v, want 200 g unchanged (1:1 by weight)", ing.Quantity)
+	}
+
+	// Surface 2: the week's list shops for it.
+	day := time.Now().Truncate(24 * time.Hour)
+	if _, err := Pool.Exec(ctx, `
+		WITH p AS (
+			INSERT INTO meal_plans (user_id, title, starts_on, ends_on) VALUES ($1, 'Swap week', $2, $2)
+			RETURNING id
+		)
+		INSERT INTO meal_plan_items (meal_plan_id, recipe_id, planned_on, meal_slot, servings)
+		SELECT id, $3, $2, 'dinner', 2 FROM p`, userID, day, recipe.ID); err != nil {
+		t.Fatalf("seed plan: %v", err)
+	}
+	t.Cleanup(func() { Pool.Exec(ctx, `DELETE FROM meal_plans WHERE user_id = $1`, userID) })
+
+	planned, err := GetPlannedIngredients(ctx, userID, day, day)
+	if err != nil {
+		t.Fatalf("GetPlannedIngredients: %v", err)
+	}
+	if len(planned) != 1 || planned[0].Item != "linguine" || planned[0].Quantity == nil || *planned[0].Quantity != 200 {
+		t.Errorf("planned = %+v, want 200 g of linguine", planned)
+	}
+
+	// Surface 3: cooking it empties the linguine, not the spaghetti the user never had.
+	tx, err := Pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	applied, _, err := DeductPantry(ctx, tx, userID, recipe.ID, 1)
+	if err != nil {
+		t.Fatalf("DeductPantry: %v", err)
+	}
+	if len(applied) != 1 || applied[0].Name != "linguine" || applied[0].Used != 200 {
+		t.Errorf("deducted %+v, want 200 g of linguine", applied)
 	}
 }

@@ -105,6 +105,7 @@ func main() {
 	mux.HandleFunc("DELETE /api/v1/recipes/{id}/vote", authenticator.Require(HandleUnvoteRecipe))
 	mux.HandleFunc("PUT /api/v1/recipes/{id}/cooked", authenticator.Require(HandleMarkCooked))
 	mux.HandleFunc("DELETE /api/v1/recipes/{id}/cooked", authenticator.Require(HandleUnmarkCooked))
+	mux.HandleFunc("PUT /api/v1/recipes/{id}/swaps/{sortOrder}", authenticator.Require(HandleSetIngredientSwap))
 	mux.HandleFunc("POST /api/v1/recipes/{id}/share", authenticator.Require(HandleShareRecipe))
 	mux.HandleFunc("DELETE /api/v1/recipes/{id}/share", authenticator.Require(HandleUnshareRecipe))
 	// Deliberately unauthenticated (BACKLOG 8.4) — the token is the credential.
@@ -671,6 +672,52 @@ func HandleGetRecipeByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, recipe)
+}
+
+// HandleSetIngredientSwap records what the caller uses instead on one ingredient line
+// (BACKLOG 17.4c). An empty replacement clears the swap, so one endpoint does both — the
+// client toggles rather than deciding which verb it needs.
+//
+// The swap is the caller's alone: it never touches the recipe, so this is a write a
+// household member may make on somebody else's recipe.
+func HandleSetIngredientSwap(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	recipeID, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || recipeID <= 0 {
+		http.Error(w, "invalid recipe id", http.StatusBadRequest)
+		return
+	}
+	sortOrder, err := strconv.Atoi(r.PathValue("sortOrder"))
+	if err != nil || sortOrder <= 0 {
+		http.Error(w, "invalid ingredient", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		Replacement string `json:"replacement"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "could not read the request", http.StatusBadRequest)
+		return
+	}
+	if len(req.Replacement) > 200 {
+		http.Error(w, "that name is too long", http.StatusBadRequest)
+		return
+	}
+
+	if err := storage.SetSwap(r.Context(), user.ID, recipeID, sortOrder, req.Replacement); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("Error setting ingredient swap", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func HandleGetRecipeHistory(w http.ResponseWriter, r *http.Request) {

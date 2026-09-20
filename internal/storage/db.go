@@ -402,28 +402,78 @@ func GetRecipeByID(ctx context.Context, userID, recipeID int) (model.Recipe, err
 	}
 	doc.Tags = recipe.Tags
 
+	// sortOrders runs alongside doc.Ingredients: it is the key a swap is filed under,
+	// and the ingredient itself does not carry it.
+	var sortOrders []int
 	ingRows, err := Pool.Query(ctx, `
-		SELECT section, item, quantity, quantity_text, unit, optional, category
+		SELECT sort_order, section, item, quantity, quantity_text, unit, optional, category
 		FROM recipe_ingredients WHERE recipe_id = $1 ORDER BY sort_order`, recipeID)
 	if err == nil {
 		defer ingRows.Close()
 		for ingRows.Next() {
 			var ing model.RecipeIngredient
-			if scanErr := ingRows.Scan(&ing.Section, &ing.Item, &ing.Quantity, &ing.QuantityText, &ing.Unit, &ing.Optional, &ing.Category); scanErr == nil {
+			var sortOrder int
+			if scanErr := ingRows.Scan(&sortOrder, &ing.Section, &ing.Item, &ing.Quantity, &ing.QuantityText, &ing.Unit, &ing.Optional, &ing.Category); scanErr == nil {
 				doc.Ingredients = append(doc.Ingredients, ing)
+				sortOrders = append(sortOrders, sortOrder)
 			}
 		}
+	}
+
+	// The caller's own substitutions (BACKLOG 17.4c), applied here so that the recipe
+	// they read, the list they shop from and the fridge they empty all name the same
+	// food. Advisory like the gram hint below: a failure here loses the swap, not the
+	// recipe.
+	swaps, swapErr := ListSwaps(ctx, userID, recipeID)
+	if swapErr != nil {
+		slog.Warn("could not read ingredient swaps", "recipeID", recipeID, "error", swapErr)
+		swaps = nil
+	}
+	options, optErr := SwapOptions(ctx, userID, recipeID)
+	if optErr != nil {
+		slog.Warn("could not read swap options", "recipeID", recipeID, "error", optErr)
+		options = nil
 	}
 
 	// What one of each line's unit weighs, for the client's servings scaler (BACKLOG
 	// 17.3). One query for the whole recipe, and advisory in the same way the grocery
 	// list's lookup is: without it every line simply renders without a gram hint.
-	if pairs := gramsPairsOfDoc(doc.Ingredients); len(pairs) > 0 {
-		if table, gErr := gramsTableTx(ctx, Pool, pairs); gErr == nil {
-			for i, ing := range doc.Ingredients {
-				if g, ok := model.ToGrams(table, ing.Item, ing.Unit, 1); ok {
-					doc.Ingredients[i].GramsPerUnit = &g
+	//
+	// The replacements are weighed in the same query as the originals, because a swap
+	// converts between the two and needs both sides in the table.
+	pairs := gramsPairsOfDoc(doc.Ingredients)
+	for i, sortOrder := range sortOrders {
+		if replacement, ok := swaps[sortOrder]; ok {
+			family, _ := model.NormalizeUnit(doc.Ingredients[i].Unit)
+			pairs = append(pairs, model.ItemUnit{Item: model.NormalizeItem(replacement), Unit: family})
+		}
+	}
+	var table map[model.ItemUnit]float64
+	if len(pairs) > 0 {
+		if t, gErr := gramsTableTx(ctx, Pool, pairs); gErr == nil {
+			table = t
+		}
+	}
+
+	for i, sortOrder := range sortOrders {
+		if replacement, ok := swaps[sortOrder]; ok {
+			ing := &doc.Ingredients[i]
+			written := ing.Item
+			ing.SwappedFrom = &written
+			if ing.Quantity != nil {
+				if q, converted := model.SwapQuantity(table, written, replacement, ing.Unit, *ing.Quantity); converted {
+					ing.Quantity = &q
 				}
+			}
+			ing.Item = replacement
+		}
+		doc.Ingredients[i].SwapOptions = options[sortOrder]
+	}
+
+	if table != nil {
+		for i, ing := range doc.Ingredients {
+			if g, ok := model.ToGrams(table, ing.Item, ing.Unit, 1); ok {
+				doc.Ingredients[i].GramsPerUnit = &g
 			}
 		}
 	}

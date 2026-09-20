@@ -123,6 +123,13 @@ func scanPantryItem(row pgx.Row) (model.PantryItem, error) {
 	return item, nil
 }
 
+// sizeStripped is the key ToGrams will look an ingredient's own wording up under: the
+// food with its size modifier cut off (BACKLOG 17.1).
+func sizeStripped(written string) string {
+	_, name := model.SplitSize(written)
+	return name
+}
+
 // parseDatePtr turns an optional "YYYY-MM-DD" into a nullable date. A malformed date is
 // the caller's error, not a silently dropped expiry.
 func parseDatePtr(s *string) (*time.Time, error) {
@@ -240,9 +247,19 @@ func StapleNames(ctx context.Context, userID int) (map[string]bool, error) {
 func DeductPantry(ctx context.Context, tx pgx.Tx, userID, recipeID int, scale float64) ([]model.PantryChange, []string, error) {
 	// What the recipe needs, summed per item: an ingredient listed in two sections is one
 	// demand on one pantry line.
+	//
+	// A swapped line (BACKLOG 17.4c) spends the food the cook actually used: the KEY
+	// becomes the replacement, while the weight is still read off the recipe's own
+	// wording. That is what keeps the swap 1:1 by weight without converting anything --
+	// two large onions' worth of shallots is 405 g of shallots, whatever a shallot
+	// weighs.
 	rows, err := tx.Query(ctx, `
-		SELECT canonical_item(item), item, quantity, unit FROM recipe_ingredients
-		WHERE recipe_id = $1 AND normalize_item(item) <> '' AND quantity IS NOT NULL`, recipeID)
+		SELECT canonical_item(COALESCE(sw.replacement, ri.item)), ri.item, ri.quantity, ri.unit
+		FROM recipe_ingredients ri
+		LEFT JOIN recipe_ingredient_swaps sw
+		       ON sw.user_id = $2 AND sw.recipe_id = ri.recipe_id AND sw.sort_order = ri.sort_order
+		WHERE ri.recipe_id = $1 AND normalize_item(ri.item) <> '' AND ri.quantity IS NOT NULL`,
+		recipeID, userID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -269,7 +286,12 @@ func DeductPantry(ctx context.Context, tx pgx.Tx, userID, recipeID int, scale fl
 			return nil, nil, err
 		}
 		family, _ := model.NormalizeUnit(r.unit)
-		pairs = append(pairs, model.ItemUnit{Item: r.item, Unit: family})
+		// Both keys: the demand is filed under r.item (the replacement's food, once a
+		// swap is in play) but weighed from the recipe's own wording, and ToGrams looks
+		// that up under its own normalised name.
+		pairs = append(pairs,
+			model.ItemUnit{Item: r.item, Unit: family},
+			model.ItemUnit{Item: sizeStripped(r.written), Unit: family})
 		raws = append(raws, r)
 	}
 	rows.Close()

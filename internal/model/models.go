@@ -40,6 +40,16 @@ type RecipeIngredient struct {
 	// llm:"-" keeps it out of the generation schema: the model must not invent a
 	// weight, and the whole point of ingredient_grams is that one food is weighed once.
 	GramsPerUnit *float64 `json:"grams_per_unit" llm:"-"`
+	// SwappedFrom and SwapOptions are the caller's own substitutions (BACKLOG 17.4c).
+	// SwappedFrom is what the recipe actually says, set only on a line the caller has
+	// swapped -- Item then already carries the replacement, and the amount has been
+	// converted by weight where both sides could be weighed. SwapOptions is what their
+	// kitchen holds that could stand in here.
+	//
+	// Both are read on the way out and never stored: a swap belongs to the cook, not to
+	// the recipe, so nothing here may reach a save or the generation schema.
+	SwappedFrom *string  `json:"swapped_from,omitempty" llm:"-"`
+	SwapOptions []string `json:"swap_options,omitempty" llm:"-"`
 }
 
 type RecipeStep struct {
@@ -458,6 +468,25 @@ func FromGrams(table map[ItemUnit]float64, item string, unit *string, grams floa
 		return 0, false
 	}
 	return grams / per, true
+}
+
+// SwapQuantity converts an amount written for one food into the same amount of another,
+// by weight (BACKLOG 17.4c): 200 g of spaghetti is 200 g of linguine, and 2 onions'
+// worth of shallots is however many shallots weigh the same.
+//
+// ok is false when either side has no conversion — and then the amount must be left
+// exactly as written, not estimated. A swap is still offered in that case; what is not
+// offered is a number nobody can stand behind.
+func SwapQuantity(table map[ItemUnit]float64, from, to string, unit *string, qty float64) (float64, bool) {
+	g, ok := ToGrams(table, from, unit, qty)
+	if !ok {
+		return qty, false
+	}
+	n, ok := FromGrams(table, to, unit, g)
+	if !ok {
+		return qty, false
+	}
+	return n, true
 }
 
 // PantryCategories are where a pantry item lives, in render order (BACKLOG 7.1).
