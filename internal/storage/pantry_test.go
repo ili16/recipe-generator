@@ -188,7 +188,7 @@ func TestPantryMatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecipesUsingIngredients: %v", err)
 	}
-	if got := usedBy[recipe.ID]; len(got) != 1 || got[0] != "milk" {
+	if got := usedBy[recipe.ID]; len(got) != 1 || got[0].Item != "milk" || got[0].SwapFor != "" {
 		t.Fatalf("expected the recipe to use milk only, got %v", got)
 	}
 	if none, err := RecipesUsingIngredients(ctx, userID, []string{"saffron"}); err != nil || len(none) != 0 {

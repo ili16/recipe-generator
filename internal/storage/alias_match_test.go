@@ -89,4 +89,76 @@ func TestPantryMatchUsesCanonicalNotClass(t *testing.T) {
 		t.Errorf("pantry match = %d of %d, want 2 of 3 (onion and parmesan match by canonical; penne must not match spaghetti by class)",
 			got.PantryHave, got.PantryTotal)
 	}
+	// BACKLOG 17.4a: the class match is not silently absent either — it is the third
+	// number. Penne is the one swap on offer, and it stays out of have.
+	if got.PantryClose != 1 {
+		t.Errorf("pantry close = %d, want 1 (penne swaps for spaghetti by class)", got.PantryClose)
+	}
+}
+
+// BACKLOG 17.4b's half of the same fact, from the other direction: an ingredient search
+// for what the kitchen holds finds the recipe that wants a sibling of it, and says so.
+// A swap that came back indistinguishable from a use would have the agent announce a
+// spaghetti dinner to someone who owns penne.
+func TestRecipesUsingIngredientsSeparatesSwaps(t *testing.T) {
+	if os.Getenv("DB_URL") == "" {
+		t.Skip("DB_URL not set, skipping DB integration test")
+	}
+	InitDBPool()
+	ctx := context.Background()
+
+	var userID int
+	if err := Pool.QueryRow(ctx, `INSERT INTO users (oauth_id) VALUES ('test-swap-search') RETURNING id`).Scan(&userID); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	t.Cleanup(func() { Pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, userID) })
+
+	class := func(s string) *string { return &s }
+	if err := UpsertAliases(ctx, []model.Alias{
+		{Name: "spaghetti", Canonical: "spaghetti", Class: class("pasta_dry")},
+		{Name: "penne", Canonical: "penne", Class: class("pasta_dry")},
+		{Name: "zwiebel", Canonical: "onion"},
+		{Name: "onion", Canonical: "onion"},
+	}); err != nil {
+		t.Fatalf("UpsertAliases: %v", err)
+	}
+	t.Cleanup(func() {
+		Pool.Exec(ctx, `DELETE FROM ingredient_alias WHERE name = ANY($1::text[])`,
+			[]string{"spaghetti", "penne", "zwiebel", "onion"})
+	})
+
+	doc := model.RecipeDocument{
+		Title: "Swap Pasta", Language: "en", Servings: i(2),
+		Ingredients: []model.RecipeIngredient{
+			{Item: "Spaghetti", Quantity: f(200)},
+			{Item: "Zwiebel", Quantity: f(1)},
+		},
+		Steps: []model.RecipeStep{{SortOrder: 1, StepText: "Cook"}},
+	}
+	recipe, err := AddRecipeStructured(ctx, userID, doc, "# Swap Pasta", nil, nil, "test-model", "v1", nil)
+	if err != nil {
+		t.Fatalf("AddRecipeStructured: %v", err)
+	}
+	t.Cleanup(func() { Pool.Exec(ctx, `DELETE FROM recipes WHERE id = $1`, recipe.ID) })
+
+	hits, err := RecipesUsingIngredients(ctx, userID, []string{"penne", "onion"})
+	if err != nil {
+		t.Fatalf("RecipesUsingIngredients: %v", err)
+	}
+	var uses, swaps []model.IngredientHit
+	for _, h := range hits[recipe.ID] {
+		if h.SwapFor == "" {
+			uses = append(uses, h)
+		} else {
+			swaps = append(swaps, h)
+		}
+	}
+	// "onion" is the same food as the recipe's "Zwiebel": a use, not a swap.
+	if len(uses) != 1 || uses[0].Item != "zwiebel" {
+		t.Errorf("uses = %v, want the onion only", uses)
+	}
+	// "penne" is a sibling of the recipe's spaghetti: a swap, and named as one.
+	if len(swaps) != 1 || swaps[0].Item != "spaghetti" || swaps[0].SwapFor != "penne" {
+		t.Errorf("swaps = %v, want spaghetti←penne", swaps)
+	}
 }

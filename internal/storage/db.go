@@ -522,7 +522,7 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 		       -- Same prep+cook fallback the client used to do per-recipe; NULLIF keeps
 		       -- "unknown" distinct from "zero minutes".
 		       NULLIF(COALESCE(r.total_minutes, COALESCE(r.prep_minutes, 0) + COALESCE(r.cook_minutes, 0)), 0),
-		       pm.total, pm.have, r.user_id = $1, COALESCE(owner.name, '')
+		       pm.total, pm.have, pm.close, r.user_id = $1, COALESCE(owner.name, '')
 		FROM recipes r
 		JOIN users owner ON owner.id = r.user_id
 		LEFT JOIN recipe_votes rv ON rv.recipe_id = r.id AND rv.user_id = $1
@@ -533,14 +533,24 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 		-- SQL: normalize_item() plus the alias hop (BACKLOG 17.2), so a kitchen holding
 		-- "parmigiano reggiano" covers a recipe asking for parmesan, and a German pantry
 		-- covers an English recipe. With an empty ingredient_alias it is normalize_item().
+		-- close (BACKLOG 17.4a) counts the ingredients the pantry could cover with a
+		-- swap -- same ingredient_alias.class, different food. Deliberately a third
+		-- number and not folded into have: penne is not spaghetti, and a match that
+		-- silently said it was would claim you can cook something you cannot.
 		LEFT JOIN LATERAL (
 			SELECT count(*) AS total,
-			       count(*) FILTER (
-			           WHERE EXISTS (SELECT 1 FROM pantry_items p
-			                         WHERE `+inScope("p", "$1")+` AND canonical_item(p.name) = canonical_item(ri.item))
-			       ) AS have
-			FROM recipe_ingredients ri
-			WHERE ri.recipe_id = r.id AND normalize_item(ri.item) <> ''
+			       count(*) FILTER (WHERE pantry_has) AS have,
+			       count(*) FILTER (WHERE NOT pantry_has AND swap_has) AS close
+			FROM (
+				SELECT EXISTS (SELECT 1 FROM pantry_items p
+				               WHERE `+inScope("p", "$1")+` AND canonical_item(p.name) = canonical_item(ri.item)) AS pantry_has,
+				       EXISTS (SELECT 1 FROM pantry_items p
+				               JOIN ingredient_alias pa ON pa.name = normalize_item(p.name)
+				               JOIN ingredient_alias ra ON ra.name = normalize_item(ri.item)
+				               WHERE `+inScope("p", "$1")+` AND pa.class IS NOT NULL AND pa.class = ra.class) AS swap_has
+				FROM recipe_ingredients ri
+				WHERE ri.recipe_id = r.id AND normalize_item(ri.item) <> ''
+			) m
 		) pm ON TRUE
 		WHERE `+inScope("r", "$1")+` AND r.deleted_at IS NULL ORDER BY r.updated_at DESC`, userid)
 	if err != nil {
@@ -553,7 +563,7 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 		var recipe model.Recipe
 		err := rows.Scan(&recipe.ID, &recipe.Recipename, &recipe.Recipe, &recipe.ManuallyEdited, &recipe.MyVote, &recipe.VariantOfRecipeID,
 			&recipe.SourceType, &recipe.SourceURL, &recipe.CreatedAt, &recipe.Servings, &recipe.LastCookedAt, &recipe.CookedRating, &recipe.ShareToken, &recipe.Calories, &recipe.TotalMinutes,
-			&recipe.PantryTotal, &recipe.PantryHave, &recipe.OwnedByMe, &recipe.OwnerName)
+			&recipe.PantryTotal, &recipe.PantryHave, &recipe.PantryClose, &recipe.OwnedByMe, &recipe.OwnerName)
 		if err != nil {
 			rows.Close()
 			slog.Error("Failed to scan recipe", "error", err)

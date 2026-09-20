@@ -119,7 +119,7 @@ var chatTools = map[string]tool{
 		Run:         toolReviewCookFlow,
 	},
 	"search_my_recipes": {
-		Description: "Search the user's saved recipes by title text, tags, and/or ingredients they use. Returns id, title and tags only.",
+		Description: "Search the user's saved recipes by title text, tags, and/or ingredients they use. Returns id, title and tags, plus uses (the asked-for ingredients the recipe actually needs) and swaps (ingredients it asks for that one of yours could stand in for — penne for spaghetti). A recipe found only through swaps is not cookable as written: name the swap when you offer it.",
 		Params: obj(map[string]any{
 			"query":       str("Text to match against recipe titles"),
 			"tags":        strList("Tag slugs a recipe must all carry"),
@@ -206,7 +206,7 @@ var chatTools = map[string]tool{
 		Run:       toolClearPlanDay,
 	},
 	"get_pantry": {
-		Description: "Read what the user has in the house: name, amount, where it is kept, when it expires, and whether it is a staple they always have. Use it to answer \"what can I make tonight\" and \"what is about to go off\" without making them go and look.",
+		Description: "Read what the user has in the house: name, amount, where it is kept, when it expires, whether it is a staple they always have, and its substitution class where one is known (penne and spaghetti are both pasta_dry). Use it to answer \"what can I make tonight\" and \"what is about to go off\" without making them go and look. A shared class means a swap you may offer, never one you may assume.",
 		Params:      obj(map[string]any{}),
 		NeedsAuth:   true,
 		Run:         toolGetPantry,
@@ -470,7 +470,7 @@ func toolSearchMyRecipes(ctx context.Context, s *chatSession, args json.RawMessa
 
 	// Ingredients are the one filter GetRecipes cannot answer from the list payload — it
 	// carries no ingredient names — so it is a second, indexed lookup (BACKLOG 7.4).
-	var usedBy map[int][]string
+	var usedBy map[int][]model.IngredientHit
 	if len(a.Ingredients) > 0 {
 		usedBy, err = storage.RecipesUsingIngredients(ctx, s.userID, a.Ingredients)
 		if err != nil {
@@ -485,6 +485,11 @@ func toolSearchMyRecipes(ctx context.Context, s *chatSession, args json.RawMessa
 		// Uses names which of the asked-for ingredients this recipe needs, so the model can
 		// say "this one uses the spinach and the feta" without loading the whole recipe.
 		Uses []string `json:"uses,omitempty"`
+		// Swaps are the ingredients this recipe asks for that one of the asked-for names
+		// could stand in for — same class, different food (BACKLOG 17.4b). A recipe that
+		// only matched through these is only cookable if the user accepts the swap, so
+		// the model must name it rather than present the recipe as ready to cook.
+		Swaps []swapHit `json:"swaps,omitempty"`
 	}
 	hits := []hit{}
 	query := strings.ToLower(strings.TrimSpace(a.Query))
@@ -498,9 +503,34 @@ func toolSearchMyRecipes(ctx context.Context, s *chatSession, args json.RawMessa
 		if usedBy != nil && len(usedBy[r.ID]) == 0 {
 			continue
 		}
-		hits = append(hits, hit{ID: r.ID, Title: r.Recipename, Tags: r.Tags, Uses: usedBy[r.ID]})
+		uses, swaps := splitHits(usedBy[r.ID])
+		hits = append(hits, hit{ID: r.ID, Title: r.Recipename, Tags: r.Tags, Uses: uses, Swaps: swaps})
 	}
 	return map[string]any{"count": len(hits), "recipes": hits}, nil, nil
+}
+
+// swapHit is one substitution the search assumed: the recipe wants Needs, the user
+// offered Have. Kept as a pair so the model can say "with your penne for its spaghetti"
+// (BACKLOG 17.4b).
+type swapHit struct {
+	Needs string `json:"needs"`
+	Have  string `json:"have"`
+}
+
+// splitHits separates what a recipe actually uses from what it would need a swap for.
+// A recipe can appear in both lists — it uses your spinach and would take your penne
+// for its spaghetti — and the two must not be added together.
+func splitHits(hits []model.IngredientHit) ([]string, []swapHit) {
+	var uses []string
+	var swaps []swapHit
+	for _, h := range hits {
+		if h.SwapFor == "" {
+			uses = append(uses, h.Item)
+			continue
+		}
+		swaps = append(swaps, swapHit{Needs: h.Item, Have: h.SwapFor})
+	}
+	return uses, swaps
 }
 
 // hasAllTags reports whether have contains every tag in want (empty want matches all).

@@ -30,7 +30,8 @@ const dateLayout = "2006-01-02"
 // the natural reading order; items with no expiry sort last.
 func ListPantryItems(ctx context.Context, userID int) ([]model.PantryItem, error) {
 	rows, err := Pool.Query(ctx, `
-		SELECT id, name, quantity, unit, category, expires_on, staple
+		SELECT id, name, quantity, unit, category, expires_on, staple,
+		       (SELECT a.class FROM ingredient_alias a WHERE a.name = normalize_item(pantry_items.name))
 		FROM pantry_items WHERE `+inScope("pantry_items", "$1")+`
 		ORDER BY expires_on ASC NULLS LAST, name`, userID)
 	if err != nil {
@@ -88,7 +89,8 @@ func UpsertPantryItem(ctx context.Context, userID int, in model.PantryItem) (mod
 		ON CONFLICT (COALESCE(household_id::text, 'u' || user_id), name, COALESCE(unit, '')) DO UPDATE
 		SET quantity = EXCLUDED.quantity, category = EXCLUDED.category,
 		    expires_on = EXCLUDED.expires_on, staple = EXCLUDED.staple, updated_at = NOW()
-		RETURNING id, name, quantity, unit, category, expires_on, staple`,
+		RETURNING id, name, quantity, unit, category, expires_on, staple,
+		          (SELECT a.class FROM ingredient_alias a WHERE a.name = pantry_items.name)`,
 		userID, name, qty, unit, category, expires, in.Staple)
 	return scanPantryItem(row)
 }
@@ -106,12 +108,12 @@ func DeletePantryItem(ctx context.Context, userID, itemID int) error {
 	return nil
 }
 
-// scanPantryItem reads the seven columns every query above selects, in that order, and
+// scanPantryItem reads the eight columns every query above selects, in that order, and
 // renders expires_on as a plain date string.
 func scanPantryItem(row pgx.Row) (model.PantryItem, error) {
 	var item model.PantryItem
 	var expires *time.Time
-	if err := row.Scan(&item.ID, &item.Name, &item.Quantity, &item.Unit, &item.Category, &expires, &item.Staple); err != nil {
+	if err := row.Scan(&item.ID, &item.Name, &item.Quantity, &item.Unit, &item.Category, &expires, &item.Staple, &item.Class); err != nil {
 		return model.PantryItem{}, err
 	}
 	if expires != nil {
@@ -139,8 +141,13 @@ func parseDatePtr(s *string) (*time.Time, error) {
 // same key the pantry and the grocery list use — so "use up the spinach" finds the recipe
 // that lists "Spinach", whatever amount it asks for (BACKLOG 7.4).
 //
+// A hit whose SwapFor is set is a substitution, not a use: the recipe asks for a
+// different food of the same ingredient_alias.class (BACKLOG 17.4b). It is kept apart
+// from an exact hit all the way to the model so the agent can say which swap it assumed
+// instead of quietly promising penne is spaghetti.
+//
 // A recipe absent from the map uses none of them.
-func RecipesUsingIngredients(ctx context.Context, userID int, names []string) (map[int][]string, error) {
+func RecipesUsingIngredients(ctx context.Context, userID int, names []string) (map[int][]model.IngredientHit, error) {
 	normalised := make([]string, 0, len(names))
 	for _, n := range names {
 		if n := model.NormalizeItem(n); n != "" {
@@ -148,29 +155,45 @@ func RecipesUsingIngredients(ctx context.Context, userID int, names []string) (m
 		}
 	}
 	if len(normalised) == 0 {
-		return map[int][]string{}, nil
+		return map[int][]model.IngredientHit{}, nil
 	}
 
 	rows, err := Pool.Query(ctx, `
-		SELECT DISTINCT ri.recipe_id, normalize_item(ri.item)
+		SELECT DISTINCT ri.recipe_id, normalize_item(ri.item), asked.name, asked.exact
 		FROM recipe_ingredients ri
 		JOIN recipes r ON r.id = ri.recipe_id
-		WHERE `+inScope("r", "$1")+` AND r.deleted_at IS NULL
-		  AND canonical_item(ri.item) IN (SELECT canonical_item(n) FROM unnest($2::text[]) n)`,
+		JOIN LATERAL (
+			-- The same food, under any name or language.
+			SELECT n AS name, TRUE AS exact FROM unnest($2::text[]) n
+			WHERE canonical_item(n) = canonical_item(ri.item)
+			UNION ALL
+			-- A food you could swap in: same class, and explicitly NOT the same food.
+			SELECT n, FALSE FROM unnest($2::text[]) n
+			JOIN ingredient_alias na ON na.name = normalize_item(n)
+			JOIN ingredient_alias ra ON ra.name = normalize_item(ri.item)
+			WHERE na.class IS NOT NULL AND na.class = ra.class
+			  AND canonical_item(n) <> canonical_item(ri.item)
+		) asked ON TRUE
+		WHERE `+inScope("r", "$1")+` AND r.deleted_at IS NULL`,
 		userID, normalised)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	out := map[int][]string{}
+	out := map[int][]model.IngredientHit{}
 	for rows.Next() {
 		var recipeID int
-		var item string
-		if err := rows.Scan(&recipeID, &item); err != nil {
+		var hit model.IngredientHit
+		var asked string
+		var exact bool
+		if err := rows.Scan(&recipeID, &hit.Item, &asked, &exact); err != nil {
 			return nil, err
 		}
-		out[recipeID] = append(out[recipeID], item)
+		if !exact {
+			hit.SwapFor = asked
+		}
+		out[recipeID] = append(out[recipeID], hit)
 	}
 	return out, rows.Err()
 }

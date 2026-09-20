@@ -112,6 +112,11 @@ type Recipe struct {
 	// ingredients or the pantry is empty, which is the client's cue to show no badge.
 	PantryHave  int `json:"pantry_have"`
 	PantryTotal int `json:"pantry_total"`
+	// PantryClose is the swap count (BACKLOG 17.4a): ingredients the pantry does not
+	// hold but could stand in for — same ingredient_alias.class, different food, e.g.
+	// penne for spaghetti. Never added to PantryHave: the card says "+1 with a swap"
+	// precisely because a swap is the user's call, not the match's.
+	PantryClose int `json:"pantry_close"`
 	// OwnedByMe and OwnerName describe a household's shared library (BACKLOG 15.3): a
 	// recipe is personal property lent to the household, so every member can open, cook
 	// and plan it and only the owner can rewrite it. The client uses these to name the
@@ -474,6 +479,20 @@ type PantryItem struct {
 	// counts toward a recipe's pantry match, which is the point of marking one; what it
 	// stops is the grocery list shopping for it and a cooked meal deducting it.
 	Staple bool `json:"staple"`
+	// Class is the substitution class of this food, when one has been resolved
+	// (BACKLOG 17.4b): penne and spaghetti are both pasta_dry. It is what lets the
+	// agent offer a swap — and say it is offering one. nil means unresolved, and is
+	// not a claim that nothing could stand in.
+	Class *string `json:"class,omitempty"`
+}
+
+// IngredientHit is one recipe ingredient that answered an ingredient search (BACKLOG
+// 7.4). SwapFor is empty for the same food under any name; when it is set, the recipe
+// asks for Item and the caller offered SwapFor instead — same class, different food
+// (BACKLOG 17.4b), which the agent must say out loud rather than assume silently.
+type IngredientHit struct {
+	Item    string `json:"item"`
+	SwapFor string `json:"swap_for,omitempty"`
 }
 
 // PantryChange is one line of what cooking a meal did to the pantry, so the app can say
