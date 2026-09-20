@@ -96,6 +96,41 @@ func instagramCaption(rawURL string) string {
 	return strings.Join(lines, "\n")
 }
 
+// videoURLRe matches the embed page's own JSON blob, where the mp4 is escaped twice over
+// (`video_url\":\"https:\\/\\/...`). Only the value is captured; unescaping is below.
+var videoURLRe = regexp.MustCompile(`video_url\\":\\"(.*?)\\"`)
+
+// InstagramVideoURL returns the mp4 behind a public reel or video post, or "" when the
+// post has no video, is private, or Instagram changed the embed page. The URL is signed
+// and short-lived, so it is fetched now or not at all — never stored.
+//
+// This is the second read of a reel, reached only when the caption turned out to hold no
+// recipe: the recipe is spoken in the video instead, and the soundtrack is the only text
+// left to read.
+func InstagramVideoURL(rawURL string) string {
+	m := instagramShortcodeRe.FindStringSubmatch(rawURL)
+	if m == nil {
+		return ""
+	}
+	page, err := GetWebsiteAs("https://www.instagram.com/p/"+m[1]+"/embed/captioned/", crawlerUA)
+	if err != nil {
+		return ""
+	}
+	v := videoURLRe.FindStringSubmatch(page)
+	if v == nil {
+		return ""
+	}
+	// The URL is escaped for JSON and again for the script tag holding it, so the
+	// slashes arrive under one, two or three backslashes. Nothing in a CDN URL is a
+	// backslash, so unescape the one sequence that carries meaning and drop the rest
+	// rather than guessing at the nesting depth.
+	u := strings.ReplaceAll(strings.ReplaceAll(v[1], `\u0026`, "&"), `\`, "")
+	if checkFetchURL(u) != nil {
+		return ""
+	}
+	return u
+}
+
 func instagramContent(rawURL string) (string, error) {
 	// The embed page is the good source: the full caption, not a preview of it.
 	if caption := instagramCaption(rawURL); caption != "" {

@@ -19,10 +19,16 @@ var modelPricing = map[string]struct{ PromptPer1M, CompletionPer1M float64 }{
 // unpriced model over-bills rather than silently billing $0 and evading the budget cap.
 var fallbackPricing = modelPricing["gpt-5.6-luna"]
 
-// transcribeCostUSD is a flat per-call estimate for Whisper transcription.
-// ponytail: the current SDK call doesn't return audio duration, so this approximates a
-// short voice note; move to duration-based pricing if /transcribe volume ever matters.
+// transcribeCostUSD is a flat per-call estimate for Whisper transcription, used where
+// the duration is not known — /transcribe, which takes a short voice note from the
+// client. A reel's soundtrack is minutes long and is priced by the minute instead; see
+// TranscribeCostUSDFor.
 var transcribeCostUSD = envFloat("LLM_TRANSCRIBE_COST_USD", 0.003)
+
+// transcribeCostUSDPerMinute is Whisper's list price. A two-minute reel costs about a
+// cent, which is only worth charging correctly because the video path can be handed any
+// length of video.
+var transcribeCostUSDPerMinute = envFloat("LLM_TRANSCRIBE_COST_USD_PER_MINUTE", 0.006)
 
 func envFloat(key string, fallback float64) float64 {
 	if v := os.Getenv(key); v != "" {
@@ -47,5 +53,14 @@ func CostUSD(model string, promptTokens, completionTokens int64) float64 {
 
 // TranscribeCostUSD returns the flat estimated cost of one Whisper transcription call.
 func TranscribeCostUSD() float64 {
+	return transcribeCostUSD
+}
+
+// TranscribeCostUSDFor prices one transcription of known length, never below the flat
+// per-call estimate — a three-second clip still costs a request.
+func TranscribeCostUSDFor(seconds float64) float64 {
+	if cost := seconds / 60 * transcribeCostUSDPerMinute; cost > transcribeCostUSD {
+		return cost
+	}
 	return transcribeCostUSD
 }

@@ -387,7 +387,23 @@ func generateFromURL(ctx context.Context, url, prompt, preferredLanguage string)
 	if prompt != "" {
 		userText += " Additional instructions: " + prompt
 	}
-	return generateStructured(ctx, resolveLanguage(prompt, preferredLanguage), openai.TextContentPart(userText+"\n\n"+content))
+	language := resolveLanguage(prompt, preferredLanguage)
+	doc, err := generateStructured(ctx, language, openai.TextContentPart(userText+"\n\n"+content))
+	if !errors.Is(err, ErrNoRecipeInSource) {
+		return doc, err
+	}
+
+	// The page's text held no recipe. On a reel that usually means the recipe is spoken
+	// rather than written — read the soundtrack and try once more with both. Anything
+	// that is not a readable video (every ordinary webpage) comes straight back, and the
+	// original "no recipe in that" error stands.
+	transcript, terr := videoTranscript(ctx, url)
+	if terr != nil || strings.TrimSpace(transcript) == "" {
+		return model.RecipeDocument{}, err
+	}
+	slog.DebugContext(ctx, "generate/url: retrying with the video's transcript", "chars", len(transcript))
+	return generateStructured(ctx, language, openai.TextContentPart(
+		userText+"\n\n"+content+"\n\nSpoken transcript of the video on that page:\n"+transcript))
 }
 
 func generateFromImage(ctx context.Context, file io.Reader, prompt, preferredLanguage string) (model.RecipeDocument, error) {

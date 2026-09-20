@@ -155,3 +155,22 @@ func TestInstagramShortcode(t *testing.T) {
 		}
 	}
 }
+
+// TestInstagramVideoURLUnescape is the embed page's own escaping, which arrives with the
+// slashes under three backslashes and the query separator as &. Getting this wrong
+// produced a URL that parsed but pointed nowhere, and a reel that read as having no video.
+func TestInstagramVideoURLUnescape(t *testing.T) {
+	page := `{"video_url\":\"https:\\\/\\\/scontent.cdninstagram.com\\\/o1\\\/v\\\/t2\\\/f2\\\/clip.mp4?_nc_cat=109&oh=00_AQK\",`
+	v := videoURLRe.FindStringSubmatch(page)
+	if v == nil {
+		t.Fatal("video_url not matched")
+	}
+	got := strings.ReplaceAll(strings.ReplaceAll(v[1], `&`, "&"), `\`, "")
+	want := "https://scontent.cdninstagram.com/o1/v/t2/f2/clip.mp4?_nc_cat=109&oh=00_AQK"
+	if got != want {
+		t.Errorf("unescaped to %q, want %q", got, want)
+	}
+	if u, err := url.Parse(got); err != nil || u.Host == "" {
+		t.Errorf("unescaped URL does not parse: %v", err)
+	}
+}

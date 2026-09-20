@@ -3,11 +3,13 @@ package utils
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -206,4 +208,47 @@ func randomString() (string, error) {
 	}
 
 	return string(result), nil
+}
+
+// MaxVideoBytes caps a downloaded video. Reels run to tens of megabytes; this is the
+// line past which a "video" is something else and not worth reading.
+const MaxVideoBytes = 120 << 20
+
+// FetchToFile streams a URL to dest through the same guarded client as every other
+// user-supplied fetch (see fetchguard.go), refusing anything over MaxVideoBytes. It is
+// separate from GetWebsiteAs because a video is never a string: reading one into memory
+// to hand it to ffmpeg is a way to be killed by the OOM reaper on a 120MB post.
+func FetchToFile(rawURL, dest string) error {
+	if err := checkFetchURL(rawURL); err != nil {
+		return err
+	}
+	req, err := http.NewRequest("GET", rawURL, nil)
+	if err != nil {
+		return err
+	}
+	// A CDN video URL is signed for a browser, and answers a crawler agent with 403.
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+
+	res, err := fetchClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode >= 400 {
+		return fmt.Errorf("%w: %s", ErrFetchStatus, res.Status)
+	}
+
+	f, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	n, err := io.Copy(f, io.LimitReader(res.Body, MaxVideoBytes+1))
+	if err != nil {
+		return err
+	}
+	if n > MaxVideoBytes {
+		return errors.New("that video is too long to read")
+	}
+	return nil
 }
