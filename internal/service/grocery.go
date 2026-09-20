@@ -48,6 +48,17 @@ func GroceryPairs(ingredients []model.GroceryIngredient) []model.ItemUnit {
 	return pairs
 }
 
+// StockPairs renders the (item, unit) conversions a kitchen's holdings need, so the
+// caller fetches one grams table covering both sides of 16.5's subtraction.
+func StockPairs(stock []model.PantryHolding) []model.ItemUnit {
+	pairs := make([]model.ItemUnit, 0, len(stock))
+	for _, h := range stock {
+		family, _ := model.NormalizeUnit(h.Unit)
+		pairs = append(pairs, model.ItemUnit{Item: model.NormalizeItem(h.Name), Unit: family})
+	}
+	return pairs
+}
+
 // measured is one item's worth of amounts that can be added up, collected before any
 // decision about what unit to render them in.
 type measured struct {
@@ -87,7 +98,22 @@ type measured struct {
 // Amounts that cannot be summed ("to taste", "for garnish") are folded into that item's
 // line as a note rather than dropped, and only become a line of their own when the item
 // has no measured amount anywhere in the week.
-func BuildGroceryList(ingredients []model.GroceryIngredient, staples map[string]bool, grams map[model.ItemUnit]float64, aliases map[string]model.Alias) []model.GroceryLine {
+//
+// stock is what the kitchen already holds (BACKLOG 16.5). A line it covers part of is
+// reduced to the shortfall and carries its full Need, so the list can say "you have 300 g
+// of the 500 g" rather than quietly shopping for less.
+func BuildGroceryList(ingredients []model.GroceryIngredient, staples map[string]bool, grams map[model.ItemUnit]float64, aliases map[string]model.Alias, stock []model.PantryHolding) []model.GroceryLine {
+	// What the kitchen already holds, in grams, per canonical food (BACKLOG 16.5). Only
+	// rows that can be weighed count: an unweighable holding leaves its line alone rather
+	// than reducing it by a guess. Nothing is subtracted on the unconsolidated path —
+	// if the demand itself could not be summed, a subtraction from it is not a number.
+	held := map[string]float64{}
+	for _, h := range stock {
+		if g, ok := model.ToGrams(grams, h.Name, h.Unit, h.Quantity); ok {
+			held[h.Key] += g
+		}
+	}
+
 	items := map[string]*measured{}
 	var order []string // items in first-seen order, which the final sort then overrides
 
@@ -153,7 +179,7 @@ func BuildGroceryList(ingredients []model.GroceryIngredient, staples map[string]
 
 	out := make([]model.GroceryLine, 0, len(order))
 	for _, item := range order {
-		out = append(out, linesFor(item, items[item], grams)...)
+		out = append(out, linesFor(item, items[item], grams, held[item])...)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Category != out[j].Category {
@@ -167,7 +193,7 @@ func BuildGroceryList(ingredients []model.GroceryIngredient, staples map[string]
 // linesFor renders one item's collected amounts. One line when every amount converts to
 // grams, otherwise one per unit family — and the note, which belongs to the item, rides
 // on the first line either way.
-func linesFor(item string, m *measured, grams map[model.ItemUnit]float64) []model.GroceryLine {
+func linesFor(item string, m *measured, grams map[model.ItemUnit]float64, heldGrams float64) []model.GroceryLine {
 	blank := model.GroceryLine{
 		Item:     strings.TrimSpace(m.first.Item),
 		Category: "other",
@@ -188,9 +214,9 @@ func linesFor(item string, m *measured, grams map[model.ItemUnit]float64) []mode
 		return []model.GroceryLine{line}
 	}
 
-	if qty, unit, ok := consolidate(item, m, grams); ok {
+	if qty, need, unit, ok := consolidate(item, m, grams, heldGrams); ok {
 		line := blank
-		line.Quantity, line.Unit, line.Note = &qty, unit, m.note
+		line.Quantity, line.Unit, line.Note, line.Need = &qty, unit, m.note, need
 		return []model.GroceryLine{line}
 	}
 
@@ -219,13 +245,13 @@ func linesFor(item string, m *measured, grams map[model.ItemUnit]float64) []mode
 // The amounts themselves are weighed from each entry's own wording, because that is where
 // the size modifier lives. Rendering back through the bare name is deliberate: a week
 // asking for two large onions and one small one is three onions on the shelf.
-func consolidate(item string, m *measured, grams map[model.ItemUnit]float64) (float64, *string, bool) {
+func consolidate(item string, m *measured, grams map[model.ItemUnit]float64, heldGrams float64) (float64, *float64, *string, bool) {
 	total := 0.0
 	countable := false
 	for _, e := range m.entries {
 		g, ok := model.ToGrams(grams, e.item, e.unit, e.qty)
 		if !ok {
-			return 0, nil, false
+			return 0, nil, nil, false
 		}
 		total += g
 		if family, _ := model.NormalizeUnit(e.unit); family == "" {
@@ -233,27 +259,48 @@ func consolidate(item string, m *measured, grams map[model.ItemUnit]float64) (fl
 		}
 	}
 
-	// Pieces win when the item is bought in them and some recipe asked in them: "3
-	// onions" is a shopping instruction, "450 g onion" is a maths problem. Rounded up,
-	// because half an onion is not on the shelf.
-	if _, ok := grams[model.ItemUnit{Item: item, Unit: ""}]; ok && countable {
-		if pieces, ok := model.FromGrams(grams, item, nil, total); ok {
-			return math.Ceil(pieces), nil, true
+	// render puts a gram amount back into the unit you would actually shop this item in.
+	// Both the shortfall and the full demand go through it, so "2 of 3 onions" are the
+	// same kind of number rather than one in pieces and one in grams.
+	render := func(g float64) (float64, *string, bool) {
+		// Pieces win when the item is bought in them and some recipe asked in them: "3
+		// onions" is a shopping instruction, "450 g onion" is a maths problem. Rounded up,
+		// because half an onion is not on the shelf.
+		if _, ok := grams[model.ItemUnit{Item: item, Unit: ""}]; ok && countable {
+			if pieces, ok := model.FromGrams(grams, item, nil, g); ok {
+				return math.Ceil(pieces), nil, true
+			}
 		}
+		// Otherwise the unit the week's first mention used, so milk stays in ml and flour in
+		// g rather than everything collapsing to grams.
+		unit := m.entries[0].unit
+		family, _ := model.NormalizeUnit(unit)
+		if qty, ok := model.FromGrams(grams, item, unit, g); ok {
+			rounded := math.Round(qty*100) / 100
+			if family == "" {
+				return rounded, nil, true
+			}
+			return rounded, &family, true
+		}
+		return 0, nil, false
 	}
 
-	// Otherwise the unit the week's first mention used, so milk stays in ml and flour in
-	// g rather than everything collapsing to grams.
-	unit := m.entries[0].unit
-	family, _ := model.NormalizeUnit(unit)
-	if qty, ok := model.FromGrams(grams, item, unit, total); ok {
-		rounded := math.Round(qty*100) / 100
-		if family == "" {
-			return rounded, nil, true
-		}
-		return rounded, &family, true
+	qty, unit, ok := render(total)
+	if !ok {
+		return 0, nil, nil, false
 	}
-	return 0, nil, false
+	if heldGrams <= 0 {
+		return qty, nil, unit, true
+	}
+
+	// The pantry covers part of the week. Shop for the rest — and only claim a reduction
+	// when it actually is one: rounding up to whole pieces can leave the shortfall at the
+	// same number as the demand, and "you have 1 of 3" next to "buy 3" is a lie.
+	shop, _, ok := render(math.Max(0, total-heldGrams))
+	if !ok || shop >= qty {
+		return qty, nil, unit, true
+	}
+	return shop, &qty, unit, true
 }
 
 // GroceryAliasNames renders the names a week's ingredients need resolved, so the caller

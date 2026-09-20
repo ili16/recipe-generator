@@ -102,7 +102,13 @@ func HandleGetGroceryList(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.Warn("grocery list: could not read staples", "error", err)
 	}
-	grams, err := storage.GramsTable(r.Context(), service.GroceryPairs(ingredients))
+	// Advisory too: without it the list shops for the whole week even though some of it
+	// is already in the fridge, which is exactly the pre-16.5 behaviour.
+	stock, err := storage.PantryStock(r.Context(), user.ID)
+	if err != nil {
+		slog.Warn("grocery list: could not read pantry stock", "error", err)
+	}
+	grams, err := storage.GramsTable(r.Context(), append(service.GroceryPairs(ingredients), service.StockPairs(stock)...))
 	if err != nil {
 		slog.Warn("grocery list: could not read conversions", "error", err)
 	}
@@ -116,7 +122,7 @@ func HandleGetGroceryList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"starts_on": startsOn.Format(dateLayout),
 		"ends_on":   endsOn.Format(dateLayout),
-		"lines":     service.BuildGroceryList(ingredients, staples, grams, aliases),
+		"lines":     service.BuildGroceryList(ingredients, staples, grams, aliases, stock),
 	})
 }
 

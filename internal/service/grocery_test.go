@@ -20,7 +20,7 @@ func TestBuildGroceryList(t *testing.T) {
 		{PlannedOn: "2026-09-15", RecipeTitle: "Bread", Item: "salt", Quantity: ptrF(5), Unit: ptrS("g"), Category: ptrS("pantry")},
 		{PlannedOn: "2026-09-15", RecipeTitle: "Bread", Item: "Parsley", QuantityText: ptrS("for garnish"), Category: ptrS("produce")},
 		{PlannedOn: "2026-09-14", RecipeTitle: "Roast", Item: "Eggs", Quantity: ptrF(2), Category: ptrS("protein")},
-	}, nil, nil, nil)
+	}, nil, nil, nil, nil)
 
 	// Keyed lowercase: a line's display name is whichever spelling the first row that
 	// created it used ("flour" from Bread, not "Flour" from Roast).
@@ -83,7 +83,7 @@ func TestBuildGroceryListScalesByServings(t *testing.T) {
 		// The recipe doesn't say what it yields, so there is no ratio to scale by.
 		{PlannedOn: "2026-09-16", RecipeTitle: "Cake", PlannedServings: ptrI(8),
 			Item: "Sugar", Quantity: ptrF(80), Unit: ptrS("g"), Category: ptrS("pantry")},
-	}, nil, nil, nil)
+	}, nil, nil, nil, nil)
 
 	byItem := map[string]model.GroceryLine{}
 	for _, l := range lines {
@@ -104,7 +104,7 @@ func TestBuildGroceryListDropsStaples(t *testing.T) {
 		{PlannedOn: "2026-09-14", RecipeTitle: "Roast", Item: "Salt", Quantity: ptrF(5), Unit: ptrS("g"), Category: ptrS("pantry")},
 		{PlannedOn: "2026-09-14", RecipeTitle: "Roast", Item: "Pepper", QuantityText: ptrS("to taste"), Category: ptrS("pantry")},
 		{PlannedOn: "2026-09-14", RecipeTitle: "Roast", Item: "Flour", Quantity: ptrF(250), Unit: ptrS("g"), Category: ptrS("pantry")},
-	}, map[string]bool{"salt": true, "pepper": true}, nil, nil)
+	}, map[string]bool{"salt": true, "pepper": true}, nil, nil, nil)
 
 	if len(lines) != 1 || strings.ToLower(lines[0].Item) != "flour" {
 		t.Fatalf("only flour should survive, got %+v", lines)
@@ -123,7 +123,7 @@ func TestBuildGroceryListConsolidatesAcrossUnits(t *testing.T) {
 		{PlannedOn: "2026-09-17", RecipeTitle: "Stew", Item: "onion", Quantity: ptrF(150), Unit: ptrS("g"), Category: ptrS("produce")},
 		{PlannedOn: "2026-09-15", RecipeTitle: "Sauce", Item: "Milk", Quantity: ptrF(200), Unit: ptrS("ml"), Category: ptrS("dairy")},
 		{PlannedOn: "2026-09-16", RecipeTitle: "Custard", Item: "milk", Quantity: ptrF(0.3), Unit: ptrS("l"), Category: ptrS("dairy")},
-	}, nil, grams, nil)
+	}, nil, grams, nil, nil)
 
 	byItem := map[string]model.GroceryLine{}
 	for _, l := range lines {
@@ -157,7 +157,7 @@ func TestBuildGroceryListFallsBackPerItem(t *testing.T) {
 		{PlannedOn: "2026-09-14", RecipeTitle: "Soup", Item: "Onion", Quantity: ptrF(2), Category: ptrS("produce")},
 		{PlannedOn: "2026-09-15", RecipeTitle: "Stew", Item: "Leek", Quantity: ptrF(1), Category: ptrS("produce")},
 		{PlannedOn: "2026-09-16", RecipeTitle: "Pie", Item: "leek", Quantity: ptrF(80), Unit: ptrS("g"), Category: ptrS("produce")},
-	}, nil, grams, nil)
+	}, nil, grams, nil, nil)
 
 	if len(lines) != 3 {
 		t.Fatalf("leek should split into two lines and onion stay one, got %d: %+v", len(lines), lines)
@@ -182,7 +182,7 @@ func TestGroceryListWeighsSizedIngredients(t *testing.T) {
 	lines := BuildGroceryList([]model.GroceryIngredient{
 		{PlannedOn: "2026-09-14", RecipeTitle: "Roast", Item: "large onion", Quantity: ptrF(2), Category: ptrS("produce")},
 		{PlannedOn: "2026-09-15", RecipeTitle: "Soup", Item: "Onion", Quantity: ptrF(1), Category: ptrS("produce")},
-	}, nil, grams, nil)
+	}, nil, grams, nil, nil)
 
 	if len(lines) != 1 {
 		t.Fatalf("want one consolidated onion line, got %d: %+v", len(lines), lines)
@@ -204,4 +204,66 @@ func qtyOf(q *float64) any {
 		return "nil"
 	}
 	return *q
+}
+
+// BACKLOG 16.5: what the kitchen already holds comes off the week's demand, and the line
+// says so. Three things are pinned here, because each is a way the subtraction could lie:
+// the shortfall is what you shop for, Need still carries the full week, and a holding
+// that rounds away entirely leaves the line alone rather than claiming a reduction.
+func TestBuildGroceryListSubtractsPantry(t *testing.T) {
+	grams := map[model.ItemUnit]float64{
+		{Item: "onion", Unit: ""}:  150,
+		{Item: "milk", Unit: "ml"}: 1,
+		{Item: "leek", Unit: ""}:   100,
+	}
+	ingredients := []model.GroceryIngredient{
+		{PlannedOn: "2026-09-14", RecipeTitle: "Soup", Item: "Onion", Quantity: ptrF(4), Category: ptrS("produce")},
+		{PlannedOn: "2026-09-15", RecipeTitle: "Sauce", Item: "Milk", Quantity: ptrF(500), Unit: ptrS("ml"), Category: ptrS("dairy")},
+		{PlannedOn: "2026-09-16", RecipeTitle: "Pie", Item: "Leek", Quantity: ptrF(2), Category: ptrS("produce")},
+	}
+	lines := BuildGroceryList(ingredients, nil, grams, nil, []model.PantryHolding{
+		{Key: "onion", Name: "onion", Quantity: 2},                   // two of the four
+		{Key: "milk", Name: "milk", Quantity: 300, Unit: ptrS("ml")}, // 300 of the 500
+		{Key: "leek", Name: "leek", Quantity: 10, Unit: ptrS("g")},   // a tenth of one leek
+		{Key: "garlic", Name: "garlic", Quantity: 1},                 // nothing asks for it
+	})
+
+	byItem := map[string]model.GroceryLine{}
+	for _, l := range lines {
+		byItem[strings.ToLower(l.Item)] = l
+	}
+	if len(lines) != 3 {
+		t.Fatalf("a pantry holding must never add a line, got %d: %+v", len(lines), lines)
+	}
+
+	onion := byItem["onion"]
+	if onion.Quantity == nil || *onion.Quantity != 2 || onion.Need == nil || *onion.Need != 4 {
+		t.Errorf("onion should shop for 2 of 4: quantity=%v need=%v", qtyOf(onion.Quantity), qtyOf(onion.Need))
+	}
+	milk := byItem["milk"]
+	if milk.Quantity == nil || *milk.Quantity != 200 || milk.Need == nil || *milk.Need != 500 {
+		t.Errorf("milk should shop for 200 of 500: quantity=%v need=%v", qtyOf(milk.Quantity), qtyOf(milk.Need))
+	}
+
+	// 200 g of leek minus 10 g still rounds up to 2 whole leeks. Claiming a reduction
+	// that is not one ("you have 1 of 2" beside "buy 2") is worse than claiming none.
+	leek := byItem["leek"]
+	if leek.Quantity == nil || *leek.Quantity != 2 || leek.Need != nil {
+		t.Errorf("leek should be an unreduced 2: quantity=%v need=%v", qtyOf(leek.Quantity), qtyOf(leek.Need))
+	}
+}
+
+// A holding nothing can weigh must leave its line at the full week's demand — the one
+// outcome worse than shopping for too much is shopping for too little.
+func TestBuildGroceryListIgnoresUnweighablePantry(t *testing.T) {
+	grams := map[model.ItemUnit]float64{{Item: "onion", Unit: ""}: 150}
+	lines := BuildGroceryList([]model.GroceryIngredient{
+		{PlannedOn: "2026-09-14", RecipeTitle: "Soup", Item: "Onion", Quantity: ptrF(4), Category: ptrS("produce")},
+	}, nil, grams, nil, []model.PantryHolding{
+		{Key: "onion", Name: "onion", Quantity: 1, Unit: ptrS("bunch")},
+	})
+
+	if len(lines) != 1 || lines[0].Quantity == nil || *lines[0].Quantity != 4 || lines[0].Need != nil {
+		t.Fatalf("an unweighable holding must not reduce the line: %+v", lines)
+	}
 }
