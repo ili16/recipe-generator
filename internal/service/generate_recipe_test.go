@@ -79,6 +79,13 @@ func structJSONFields(typ reflect.Type) []string {
 		if name == "" || name == "-" {
 			continue
 		}
+		// llm:"-" is a field the API returns but the model never writes — read-only
+		// rendering aids like grams_per_unit, which is looked up from ingredient_grams
+		// on the way out. Requiring the model to emit one would invite it to guess a
+		// number the table exists to settle.
+		if typ.Field(i).Tag.Get("llm") == "-" {
+			continue
+		}
 		fields = append(fields, name)
 	}
 	return fields

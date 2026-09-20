@@ -111,6 +111,12 @@ any listing/grouping UI. (This block otherwise predates several later migrations
 Both are ordered child tables with a unique `(recipe_id, sort_order)` index, so reordering
 is a single transactional rewrite and rendering never needs a sort heuristic.
 
+Two global, un-scoped lookup tables sit beside these and belong to no user: `ingredient_grams`
+(what one unit of a food weighs, BACKLOG 16.2) and `ingredient_alias` (`canonical` — the same
+food under another name, merged everywhere; `class` — a food you could substitute, merged
+nowhere, BACKLOG 17.2). Both are caches an assist model fills on a miss and never overwrites.
+The SQL side of the key is `normalize_item()` and, with the alias hop, `canonical_item()`.
+
 `recipe_ingredients` splits quantity into `quantity NUMERIC` (for on-device scaling) and
 `quantity_text TEXT` (for un-parseable inputs like "a pinch"). `section` groups ingredients
 into "Dough" / "Sauce" blocks.

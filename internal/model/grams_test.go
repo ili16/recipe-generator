@@ -1,6 +1,11 @@
 package model
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 // ToGrams is the only unit arithmetic in the codebase and two of its callers subtract
 // from somebody's fridge, so the contract that matters most is the last case: unknown
@@ -73,6 +78,82 @@ func TestNormalizeItem(t *testing.T) {
 	} {
 		if got := NormalizeItem(tc.in); got != tc.want {
 			t.Errorf("NormalizeItem(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// BACKLOG 17.1: the size is not part of the name, it is part of the weight. The SQL copy
+// of the strip is normalize_item() in migration 00040 — if these cases change, so does it.
+func TestSplitSize(t *testing.T) {
+	for _, tc := range []struct {
+		in     string
+		factor float64
+		name   string
+	}{
+		{"onion", 1, "onion"},
+		{"medium onion", 1, "onion"},
+		{"large onion", 1.35, "onion"},
+		{"small onion", 0.7, "onion"},
+		{"Große Zwiebel", 1.35, "zwiebel"},
+		{"kleine Zwiebel, gewürfelt", 0.7, "zwiebel"},
+		{"grosse zwiebel", 1.35, "zwiebel"},
+		{"large egg (beaten)", 1.35, "egg"},
+		{"medium", 1, "medium"}, // a bare size word is a food name, not a modifier
+		{"grande", 1, "grande"}, // ... and this one is a coffee
+		{"large  ", 1, "large"}, // nothing left after the strip is not a strip
+		{"chicken breast", 1, "chicken breast"},
+		{"", 1, ""},
+	} {
+		factor, name := SplitSize(tc.in)
+		if factor != tc.factor || name != tc.name {
+			t.Errorf("SplitSize(%q) = (%v, %q), want (%v, %q)", tc.in, factor, name, tc.factor, tc.name)
+		}
+	}
+}
+
+// The factor weighs pieces and only pieces. A large onion is half again an ordinary one;
+// a "large tbsp" is not a measure, and reading one as 1.35 tbsp would put a wrong number
+// on a shopping list.
+func TestToGramsAppliesSizeToPiecesOnly(t *testing.T) {
+	table := map[ItemUnit]float64{
+		{Item: "onion", Unit: ""}:           150,
+		{Item: GramsWildcard, Unit: "tbsp"}: 15,
+	}
+	u := func(s string) *string { return &s }
+
+	if got, ok := ToGrams(table, "large onion", nil, 1); !ok || got != 202.5 {
+		t.Errorf("one large onion = (%v, %v), want (202.5, true)", got, ok)
+	}
+	if got, ok := ToGrams(table, "medium onion", nil, 2); !ok || got != 300 {
+		t.Errorf("two medium onions = (%v, %v), want (300, true)", got, ok)
+	}
+	if got, ok := ToGrams(table, "large olive oil", u("tbsp"), 1); !ok || got != 15 {
+		t.Errorf("a sized named unit must not scale: (%v, %v), want (15, true)", got, ok)
+	}
+	// FromGrams inverts through the same factor, so a deduction writes back what it took.
+	if got, ok := FromGrams(table, "large onion", nil, 202.5); !ok || got != 1 {
+		t.Errorf("202.5 g back into large onions = (%v, %v), want (1, true)", got, ok)
+	}
+}
+
+// normalize_item() in migration 00040 is the SQL copy of SplitSize's strip, and the two
+// run against the same rows: Go writes the key, SQL joins on it. A word in one list and
+// not the other means a pantry line that silently stops matching its own recipe, which is
+// invisible until someone's shopping list grows a second onion. Cheap to assert, so
+// assert it.
+func TestMigrationSizeWordsMatchGo(t *testing.T) {
+	sql, err := os.ReadFile(filepath.Join("..", "..", "db", "migrations", "00040_normalize_item_size.sql"))
+	if err != nil {
+		t.Fatalf("read migration: %v", err)
+	}
+	// Drop the whitespace and stitch the concatenated string literals back together, so
+	// the alternation reads as one run of |-separated words however the SQL wraps it.
+	flat := strings.ReplaceAll(strings.Join(strings.Fields(string(sql)), ""), "'||'", "")
+	for word := range sizeFactors {
+		if !strings.Contains(flat, "|"+word+"|") &&
+			!strings.Contains(flat, "("+word+"|") &&
+			!strings.Contains(flat, "|"+word+")") {
+			t.Errorf("size word %q is in model.sizeFactors but not in normalize_item()", word)
 		}
 	}
 }

@@ -28,6 +28,18 @@ type RecipeIngredient struct {
 	// hand-maintained ingredient→aisle table (BACKLOG 6.1). One of GroceryCategories;
 	// nil on anything generated before 6.1 and grouped as "other".
 	Category *string `json:"category"`
+	// GramsPerUnit is how much ONE of this line's own unit weighs, size modifier and
+	// all -- 202.5 for "large onion", 15 for a tbsp of oil (BACKLOG 17.3). It is read
+	// from ingredient_grams on the way out and never stored, so it is a rendering aid,
+	// not a fact about the recipe.
+	//
+	// The client scales a recipe by a factor the cook chooses, and "1.5 onions" is not
+	// something a person can act on; with this it can say "1.5 onions (~225 g)". nil
+	// means nothing knows -- exactly ToGrams' false -- and the client must then show the
+	// bare number rather than invent a weight.
+	// llm:"-" keeps it out of the generation schema: the model must not invent a
+	// weight, and the whole point of ingredient_grams is that one food is weighed once.
+	GramsPerUnit *float64 `json:"grams_per_unit" llm:"-"`
 }
 
 type RecipeStep struct {
@@ -248,12 +260,69 @@ var GroceryCategories = []string{"produce", "protein", "dairy", "pantry", "other
 // bracket is the food; the rest is thrown away here and kept on the ingredient row, which
 // is still what gets rendered.
 //
-// The SQL copy of this is normalize_item() (migration 00037). Change one, change both.
+// The size is not part of the name either (BACKLOG 17.1). "medium onion", "large egg"
+// and "große Zwiebel" are the same foods as "onion", "egg" and "zwiebel" — what differs
+// is how much one of them weighs, which is SplitSize's factor and belongs in the
+// arithmetic, not in the key. Before this, a library writing onions three ways weighed
+// them three times and a pantry holding "onion" covered none of them.
+//
+// The SQL copy of this is normalize_item() (migrations 00037, 00040). Change one, change
+// both.
 func NormalizeItem(item string) string {
+	_, name := SplitSize(item)
+	return name
+}
+
+// sizeFactors is how much one of a sized piece weighs relative to the ordinary one. The
+// numbers are deliberately coarse: the point is that a large onion is not a small onion,
+// not that it is exactly 1.35 of one.
+//
+// Kept as a hand-written list rather than a table because it is four words per language,
+// not data — and because a wrong entry here is a wrong weight in somebody's shopping
+// list, which is easier to spot in a literal than in a row a model wrote. Inflections are
+// spelled out for the same reason: a stemmer would be more code and less predictable.
+var sizeFactors = map[string]float64{
+	// en
+	"small": 0.7, "medium": 1, "large": 1.35, "big": 1.35,
+	// de
+	"kleine": 0.7, "kleiner": 0.7, "kleines": 0.7, "klein": 0.7,
+	"mittlere": 1, "mittlerer": 1, "mittleres": 1, "mittel": 1,
+	"große": 1.35, "großer": 1.35, "großes": 1.35, "groß": 1.35,
+	"grosse": 1.35, "grosser": 1.35, "grosses": 1.35, "gross": 1.35,
+	// fr
+	"petit": 0.7, "petite": 0.7, "moyen": 1, "moyenne": 1, "grand": 1.35,
+	// es
+	"pequeño": 0.7, "pequeña": 0.7, "mediano": 1, "mediana": 1, "grande": 1.35,
+}
+
+// SplitSize cuts an ingredient name into the size modifier's weight factor and the food
+// itself. It is the whole of NormalizeItem's work plus the size strip, so that the name
+// used as a key and the factor used in the arithmetic are always derived together and
+// cannot drift apart.
+//
+// A size word on its own is a food name, not a modifier — "grande" is a coffee and
+// "petit" could be the start of anything — so a bare one is returned untouched at factor
+// 1. Only ToGrams uses the factor, and only for whole pieces.
+//
+// ponytail: a food whose real name starts with a size word ("large curd cottage cheese")
+// is mis-split. The list is short and hand-picked to keep that rare; the upgrade path is
+// an exceptions set, not a cleverer parser.
+func SplitSize(item string) (factor float64, name string) {
 	if i := strings.IndexAny(item, ",("); i >= 0 {
 		item = item[:i]
 	}
-	return strings.ToLower(strings.TrimSpace(item))
+	item = strings.ToLower(strings.TrimSpace(item))
+
+	word, rest, ok := strings.Cut(item, " ")
+	if !ok {
+		return 1, item
+	}
+	f, isSize := sizeFactors[word]
+	rest = strings.TrimSpace(rest)
+	if !isSize || rest == "" {
+		return 1, item
+	}
+	return f, rest
 }
 
 // NormalizeUnit canonicalises a unit to the one it is summed in — kg sums with g, l with
@@ -309,6 +378,35 @@ type ItemUnit struct {
 // is 5 g of most things. An item-specific row always wins over it.
 const GramsWildcard = "*"
 
+// Alias is one row of ingredient_alias (BACKLOG 17.2): what a food is really called, and
+// what it could be swapped for. The two are not the same claim and are never used for the
+// same thing -- see the migration.
+type Alias struct {
+	Name      string
+	Canonical string
+	// Class is the substitutable family ("pasta_dry"), or nil when the food has no
+	// sensible stand-in. Only the substitution surfaces read it; nothing that merges a
+	// grocery line or subtracts from a fridge ever may.
+	Class *string
+}
+
+// CanonicalItem is NormalizeItem plus the alias hop: the name two recipes must agree on
+// before anything can be summed, matched or deducted. "parmigiano reggiano" and
+// "parmesan" are one shopping line; so are a German recipe's "zwiebel" and an English
+// one's "onion".
+//
+// An unresolved name resolves to itself, so every caller behaves exactly as it did before
+// the table had a row for it. That is what makes it safe to put at every join at once.
+//
+// The SQL copy is canonical_item() (migration 00041). Change one, change both.
+func CanonicalItem(aliases map[string]Alias, item string) string {
+	name := NormalizeItem(item)
+	if a, ok := aliases[name]; ok && a.Canonical != "" {
+		return a.Canonical
+	}
+	return name
+}
+
 // GramsRow is one row of ingredient_grams — Grams is how much one Unit of Item weighs.
 type GramsRow struct {
 	ItemUnit
@@ -330,8 +428,15 @@ func ToGrams(table map[ItemUnit]float64, item string, unit *string, qty float64)
 	if family == "g" {
 		return qty * factor, true
 	}
-	if g, ok := table[ItemUnit{NormalizeItem(item), family}]; ok {
-		return qty * factor * g, true
+	// The size modifier scales whole pieces and nothing else: a large onion is half
+	// again an ordinary one, but a "large tbsp" is not a measure (BACKLOG 17.1). The
+	// wildcard row is a property of the unit, never of the food, so it is never sized.
+	size, name := SplitSize(item)
+	if family != "" {
+		size = 1
+	}
+	if g, ok := table[ItemUnit{name, family}]; ok {
+		return qty * factor * size * g, true
 	}
 	if g, ok := table[ItemUnit{GramsWildcard, family}]; ok {
 		return qty * factor * g, true

@@ -645,8 +645,10 @@ See DATA_MODEL.md for the canonical schema and RECIPE_TAGS.md for the tagging ta
 Migrations `00001`–`00006` create it from scratch; there is no legacy database to preserve.
 `00020` adds `collections` + `recipe_collections` (BACKLOG 8.1); `00026` adds `pantry_items`
 (BACKLOG 7.1); `00036` adds `pantry_items.staple`, `meal_plan_items.cooked_at` and
-`ingredient_grams` (BACKLOG 16). `recipes.deleted_at` has
-existed since `00001` but only became meaningful with BACKLOG 8.2's soft delete.
+`ingredient_grams` (BACKLOG 16). `00040` teaches `normalize_item()` to strip a leading size
+word and `00041` adds `ingredient_alias` + `canonical_item()` + `pg_trgm` (BACKLOG 17).
+`recipes.deleted_at` has existed since `00001` but only became meaningful with BACKLOG 8.2's
+soft delete.
 
 ## Code Map
 
@@ -660,6 +662,9 @@ existed since `00001` but only became meaningful with BACKLOG 8.2's soft delete.
   (`service.LearnGrams`), so this is for the library that predates them. Safe to re-run, and
   re-running **is** the retry: a pair the model dropped was never written, so it is still on
   the worklist
+- cmd/backfill-aliases: the same shape again for `ingredient_alias` (BACKLOG 17.2) — resolves
+  every food in use that has no canonical name yet. **Run it before `backfill-grams` on a cold
+  database**, so each food is weighed once rather than once per language it was written in
 - internal/auth: JWKS validation, introspection, JIT user provisioning, admin role, typed request context
 - internal/ratelimit: in-memory per-IP/per-user token-bucket request limiter
 - internal/worker: the periodic background pass — cooking-profile recompute, and purging
@@ -715,6 +720,10 @@ existed since `00001` but only became meaningful with BACKLOG 8.2's soft delete.
   rolled back, which is what the agent's approval card shows
 - internal/service/grams.go: filling `ingredient_grams` from the assist model
   (`EnsureGrams`), and `LearnGrams`, the detached version every recipe save fires
+- internal/storage/alias.go + internal/service/alias.go: the same pattern for
+  `ingredient_alias` (BACKLOG 17.2) — `EnsureAliases` / `LearnAliases` / `NearestCanonical`.
+  `grams.go` is the template and the resemblance is deliberate: same batch size, same
+  echo-the-key-back join, same `DO NOTHING`, same detachment
 - internal/storage/duplicates.go: the advisory, time-capped duplicate lookup behind
   `save_recipe`'s prompt (BACKLOG 8.3)
 - internal/storage/conversations.go: server-held chat threads for /chat, ownership-checked on
@@ -739,7 +748,30 @@ existed since `00001` but only became meaningful with BACKLOG 8.2's soft delete.
   text and is still what renders — only the *key* is the bare food. **There are two copies
   of this rule**: `model.NormalizeItem` and the SQL `normalize_item()` from migration
   `00037`, which every storage query calls. Change one, change both — `internal/model/grams_test.go`
-  pins the cases.
+  pins the cases. **Since BACKLOG 17.1 it also drops a leading size word** (`medium onion` is
+  `onion`), and the weight that word implies moves into `model.SplitSize`'s factor, which
+  `ToGrams` applies to whole pieces only. `TestMigrationSizeWordsMatchGo` fails if the Go list
+  and migration `00040`'s SQL alternation drift apart.
+
+- **`ToGrams` must be given the ingredient's ORIGINAL wording, not a pre-normalised key.**
+  The size modifier lives in that text and `ToGrams` reads it there; passing an already
+  normalised name silently yields a factor of 1. This was a real bug in 17.1 — `consolidate`
+  and `DeductPantry` both did it, and the feature worked only in unit tests. They now carry
+  the written text to the weighing step (`measured.entries[].item`, `rawNeed.written`) while
+  the group key stays the bare food. `TestGroceryListWeighsSizedIngredients` pins it.
+
+- **`canonical` merges, `class` does not, and the difference is the whole of `ingredient_alias`.**
+  `canonical` is the same food under another name (`zwiebel` → `onion`) and is safe to merge in
+  the pantry match, the grocery list and the deduction — that is what `canonical_item()` does at
+  every join. `class` is a food you could *substitute* (`spaghetti`/`penne` → `pasta_dry`) and
+  must never reach any of them: a pantry that quietly claimed to hold spaghetti would send
+  someone to the kitchen with the wrong box. `TestPantryMatchUsesCanonicalNotClass` pins both
+  halves, and BACKLOG 17.4 is the only thing allowed to read `class`.
+
+- **Grams are keyed per language, aliases are not.** `zwiebel → 150` and `onion → 150` are the
+  same answer stored twice, deliberately: it costs one nano call and avoids threading an alias
+  map through `ToGrams`' signature at every call site. Canonical governs matching and grouping,
+  never weighing.
 
 - **One tagger.** The structured schema returns `tags` as a constrained enum. The second
   one (`classifyTags`, a substring match over a plain-text reply) died with

@@ -106,11 +106,17 @@ func HandleGetGroceryList(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.Warn("grocery list: could not read conversions", "error", err)
 	}
+	// Advisory in the same way: without aliases a German recipe's zwiebel and an English
+	// one's onion stay two lines, which is exactly the old behaviour.
+	aliases, err := storage.AliasTable(r.Context(), service.GroceryAliasNames(ingredients))
+	if err != nil {
+		slog.Warn("grocery list: could not read aliases", "error", err)
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"starts_on": startsOn.Format(dateLayout),
 		"ends_on":   endsOn.Format(dateLayout),
-		"lines":     service.BuildGroceryList(ingredients, staples, grams),
+		"lines":     service.BuildGroceryList(ingredients, staples, grams, aliases),
 	})
 }
 

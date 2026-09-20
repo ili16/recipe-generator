@@ -415,6 +415,19 @@ func GetRecipeByID(ctx context.Context, userID, recipeID int) (model.Recipe, err
 		}
 	}
 
+	// What one of each line's unit weighs, for the client's servings scaler (BACKLOG
+	// 17.3). One query for the whole recipe, and advisory in the same way the grocery
+	// list's lookup is: without it every line simply renders without a gram hint.
+	if pairs := gramsPairsOfDoc(doc.Ingredients); len(pairs) > 0 {
+		if table, gErr := gramsTableTx(ctx, Pool, pairs); gErr == nil {
+			for i, ing := range doc.Ingredients {
+				if g, ok := model.ToGrams(table, ing.Item, ing.Unit, 1); ok {
+					doc.Ingredients[i].GramsPerUnit = &g
+				}
+			}
+		}
+	}
+
 	stepRows, err := Pool.Query(ctx, `
 		SELECT sort_order, step_text, timer_seconds, temperature_c, phase, parallel_group
 		FROM recipe_steps WHERE recipe_id = $1 ORDER BY sort_order`, recipeID)
@@ -516,13 +529,15 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 		-- Pantry match (BACKLOG 7.3): how many of this recipe's ingredients the caller
 		-- already has. Matched on the normalised *name* only — "250 g flour" and "2 cups
 		-- flour" are the same pantry item, so comparing amounts would report a miss on the
-		-- very case the match exists to handle. normalize_item() is model.NormalizeItem in SQL,
-		-- which is also how pantry_items.name was written.
+		-- very case the match exists to handle. canonical_item() is model.CanonicalItem in
+		-- SQL: normalize_item() plus the alias hop (BACKLOG 17.2), so a kitchen holding
+		-- "parmigiano reggiano" covers a recipe asking for parmesan, and a German pantry
+		-- covers an English recipe. With an empty ingredient_alias it is normalize_item().
 		LEFT JOIN LATERAL (
 			SELECT count(*) AS total,
 			       count(*) FILTER (
 			           WHERE EXISTS (SELECT 1 FROM pantry_items p
-			                         WHERE `+inScope("p", "$1")+` AND p.name = normalize_item(ri.item))
+			                         WHERE `+inScope("p", "$1")+` AND canonical_item(p.name) = canonical_item(ri.item))
 			       ) AS have
 			FROM recipe_ingredients ri
 			WHERE ri.recipe_id = r.id AND normalize_item(ri.item) <> ''
@@ -574,4 +589,17 @@ func GetRecipes(userid int) ([]model.Recipe, error) {
 
 	slog.Debug("db: query recipes done", "userID", userid, "count", len(recipes), "dur_ms", time.Since(t).Milliseconds())
 	return recipes, nil
+}
+
+// gramsPairsOfDoc renders the conversions a recipe's ingredient list needs. It is
+// service.GramsPairsOf's key-building half, duplicated here because storage cannot import
+// service -- and deliberately kept to the same two normalisers so a key built here and a
+// key built there are the same key.
+func gramsPairsOfDoc(ingredients []model.RecipeIngredient) []model.ItemUnit {
+	pairs := make([]model.ItemUnit, 0, len(ingredients))
+	for _, ing := range ingredients {
+		family, _ := model.NormalizeUnit(ing.Unit)
+		pairs = append(pairs, model.ItemUnit{Item: model.NormalizeItem(ing.Item), Unit: family})
+	}
+	return pairs
 }

@@ -990,6 +990,7 @@ func HandleUpdateRecipe(w http.ResponseWriter, r *http.Request) {
 	updated, err := storage.UpdateRecipeStructured(r.Context(), user.ID, updateReq.ID, updateReq.Structured, content, !updateReq.AISourced, updateReq.ChangePrompt)
 	if err == nil {
 		service.LearnGrams(updateReq.Structured.Ingredients)
+		service.LearnAliases(updateReq.Structured.Ingredients)
 	}
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

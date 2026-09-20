@@ -156,7 +156,8 @@ func RecipesUsingIngredients(ctx context.Context, userID int, names []string) (m
 		FROM recipe_ingredients ri
 		JOIN recipes r ON r.id = ri.recipe_id
 		WHERE `+inScope("r", "$1")+` AND r.deleted_at IS NULL
-		  AND normalize_item(ri.item) = ANY($2::text[])`, userID, normalised)
+		  AND canonical_item(ri.item) IN (SELECT canonical_item(n) FROM unnest($2::text[]) n)`,
+		userID, normalised)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +218,7 @@ func DeductPantry(ctx context.Context, tx pgx.Tx, userID, recipeID int, scale fl
 	// What the recipe needs, summed per item: an ingredient listed in two sections is one
 	// demand on one pantry line.
 	rows, err := tx.Query(ctx, `
-		SELECT normalize_item(item), quantity, unit FROM recipe_ingredients
+		SELECT canonical_item(item), item, quantity, unit FROM recipe_ingredients
 		WHERE recipe_id = $1 AND normalize_item(item) <> '' AND quantity IS NOT NULL`, recipeID)
 	if err != nil {
 		return nil, nil, err
@@ -229,14 +230,18 @@ func DeductPantry(ctx context.Context, tx pgx.Tx, userID, recipeID int, scale fl
 	needed := map[string]*demand{}
 	var pairs []model.ItemUnit
 	type rawNeed struct {
-		item string
-		qty  float64
-		unit *string
+		// item is the bare food and the key everything joins on; written is the
+		// ingredient's own wording, which is the only thing that still carries the size
+		// modifier ("2 large onions" weigh more than "2 onions", BACKLOG 17.1).
+		item    string
+		written string
+		qty     float64
+		unit    *string
 	}
 	var raws []rawNeed
 	for rows.Next() {
 		var r rawNeed
-		if err := rows.Scan(&r.item, &r.qty, &r.unit); err != nil {
+		if err := rows.Scan(&r.item, &r.written, &r.qty, &r.unit); err != nil {
 			rows.Close()
 			return nil, nil, err
 		}
@@ -259,14 +264,20 @@ func DeductPantry(ctx context.Context, tx pgx.Tx, userID, recipeID int, scale fl
 		names = append(names, r.item)
 	}
 	pantryRows, err := tx.Query(ctx, `
-		SELECT id, name, quantity, unit FROM pantry_items
-		WHERE `+inScope("pantry_items", "$1")+` AND NOT staple AND name = ANY($2::text[])
+		SELECT id, canonical_item(name), name, quantity, unit FROM pantry_items
+		WHERE `+inScope("pantry_items", "$1")+` AND NOT staple
+		  AND canonical_item(name) = ANY($2::text[])
 		FOR UPDATE`, userID, names)
 	if err != nil {
 		return nil, nil, err
 	}
 	type held struct {
-		id   int
+		id int
+		// key is the canonical food, which is what the recipe's demand is keyed on.
+		// name is what its owner actually typed, and is what gets reported back to
+		// them -- being told parmesan was used when the jar says parmigiano reggiano
+		// is a small lie the join does not need us to tell.
+		key  string
 		name string
 		qty  *float64
 		unit *string
@@ -274,7 +285,7 @@ func DeductPantry(ctx context.Context, tx pgx.Tx, userID, recipeID int, scale fl
 	var have []held
 	for pantryRows.Next() {
 		var h held
-		if err := pantryRows.Scan(&h.id, &h.name, &h.qty, &h.unit); err != nil {
+		if err := pantryRows.Scan(&h.id, &h.key, &h.name, &h.qty, &h.unit); err != nil {
 			pantryRows.Close()
 			return nil, nil, err
 		}
@@ -302,7 +313,7 @@ func DeductPantry(ctx context.Context, tx pgx.Tx, userID, recipeID int, scale fl
 			d = &demand{known: true}
 			needed[r.item] = d
 		}
-		g, ok := model.ToGrams(table, r.item, r.unit, r.qty*scale)
+		g, ok := model.ToGrams(table, r.written, r.unit, r.qty*scale)
 		if !ok {
 			d.known = false
 			continue
@@ -313,7 +324,7 @@ func DeductPantry(ctx context.Context, tx pgx.Tx, userID, recipeID int, scale fl
 	applied := []model.PantryChange{}
 	skipped := []string{}
 	for _, h := range have {
-		d, ok := needed[h.name]
+		d, ok := needed[h.key]
 		if !ok {
 			continue
 		}

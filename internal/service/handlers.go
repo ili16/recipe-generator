@@ -102,6 +102,7 @@ func HandleAddRecipe(w http.ResponseWriter, r *http.Request) {
 	telemetry.RecordSave(r.Context(), max(0, len(req.History)-1), err == nil)
 	if err == nil {
 		LearnGrams(req.Structured.Ingredients)
+		LearnAliases(req.Structured.Ingredients)
 	}
 	if err != nil {
 		http.Error(w, "Error adding recipe", http.StatusInternalServerError)

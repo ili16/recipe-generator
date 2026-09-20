@@ -1365,6 +1365,7 @@ func (s *chatSession) saveDraft(ctx context.Context, ref string, tags []string) 
 		return 0, model.RecipeDocument{}, errors.New("could not save that recipe")
 	}
 	LearnGrams(doc.Ingredients)
+	LearnAliases(doc.Ingredients)
 	if s.draftInfo == nil {
 		s.draftInfo = map[string]draftInfo{}
 	}
