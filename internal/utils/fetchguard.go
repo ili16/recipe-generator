@@ -41,6 +41,11 @@ const (
 // vague: the caller is told the fetch failed, never which internal address answered.
 var ErrBlockedURL = errors.New("refusing to fetch that URL")
 
+// ErrFetchStatus is a page that answered with an error status. Kept distinct from a
+// transport failure because the common cases are ordinary and worth reading: 404 for a
+// dead recipe link, 429 when a platform is rate-limiting this IP.
+var ErrFetchStatus = errors.New("the page returned an error status")
+
 // blockedRanges are networks with no legitimate recipe page on them, beyond what
 // netip's own predicates already cover (loopback, private, link-local, multicast,
 // unspecified).
@@ -151,7 +156,13 @@ func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error
 var fetchClient = &http.Client{
 	Timeout: fetchTimeout,
 	Transport: &http.Transport{
-		DialContext:           safeDialContext,
+		DialContext: safeDialContext,
+		// A custom DialContext disables Go's automatic HTTP/2, and HTTP/1.1 is enough
+		// on its own to get a bot answer from some hosts: Instagram serves 429 and a
+		// redirect to the login page over HTTP/1.1 and 200 with og: tags over HTTP/2,
+		// same IP, same User-Agent. Measured 2026-09-20. The dialer is still ours, so
+		// every address is still vetted before connect.
+		ForceAttemptHTTP2:     true,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: fetchTimeout,
 		DisableKeepAlives:     false,

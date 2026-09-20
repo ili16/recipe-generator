@@ -324,9 +324,11 @@ func TestSessionDrafts(t *testing.T) {
 	if _, leaked := summary["ingredients"].([]model.RecipeIngredient); leaked {
 		t.Error("draft summary carries the full ingredient list")
 	}
-	if art == nil || art.Kind != "recipe" {
-		t.Fatalf("expected a recipe artifact, got %+v", art)
+	// Parking a draft shows the user nothing. display_recipe is the card.
+	if art != nil {
+		t.Fatalf("addDraft emitted an artifact: %+v", art)
 	}
+	art = displayArtifact(t, session, "draft_1")
 	// Provenance is parked with the draft, since saveDraft is the only thing that can
 	// write it and by then the URL is long gone (BACKLOG.md 3.7).
 	if got := session.draftInfo["draft_1"].origin; got == nil || got.SourceURL != "https://example.com/x" {
@@ -347,10 +349,10 @@ func TestSessionDrafts(t *testing.T) {
 
 	// A transform does: it names the card it changed, which is how the client finds the
 	// before-document it already holds.
-	_, derived, err := session.addDraft(testDraft, 0, nil, "draft_1")
-	if err != nil {
+	if _, _, err := session.addDraft(testDraft, 0, nil, "draft_1"); err != nil {
 		t.Fatalf("addDraft(derived): %v", err)
 	}
+	derived := displayArtifact(t, session, "draft_2")
 	if got := derived.Data.(map[string]any)["derived_from"]; got != "draft_1" {
 		t.Errorf("derived_from = %v, want draft_1", got)
 	}
@@ -488,5 +490,27 @@ func TestResolvePlanDaysSkipsPast(t *testing.T) {
 	if _, _, err := session.resolvePlanDays(context.Background(),
 		[]planDayArg{{Date: yesterday, RecipeID: 1}}); err == nil {
 		t.Error("a past-only day list should be refused")
+	}
+}
+
+// displayArtifact runs display_recipe for one ref and returns the card it emitted.
+func displayArtifact(t *testing.T, session *chatSession, ref string) *artifact {
+	t.Helper()
+	_, art, err := toolDisplayRecipe(context.Background(), session, json.RawMessage(`{"target":"`+ref+`"}`))
+	if err != nil {
+		t.Fatalf("display_recipe(%s): %v", ref, err)
+	}
+	if art == nil || art.Kind != "recipe" {
+		t.Fatalf("display_recipe(%s) emitted no recipe card: %+v", ref, art)
+	}
+	return art
+}
+
+// A recipe the model never displays must stay off the screen — and one it asks for that
+// does not exist is an error it can report, not a blank card.
+func TestDisplayRecipeRejectsUnknownRef(t *testing.T) {
+	session := &chatSession{drafts: map[string]model.RecipeDocument{}}
+	if _, art, err := toolDisplayRecipe(context.Background(), session, json.RawMessage(`{"target":"draft_9"}`)); err == nil || art != nil {
+		t.Errorf("displayed a draft that does not exist: art=%+v err=%v", art, err)
 	}
 }

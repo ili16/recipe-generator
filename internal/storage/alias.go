@@ -62,6 +62,71 @@ func UpsertAliases(ctx context.Context, rows []model.Alias) error {
 	return err
 }
 
+// ClassGroups is the audit's worklist (cmd/backfill-aliases -audit): every substitution
+// family the model wrote, with its members. Only the model's own rows, so a hand-corrected
+// one is never put back up for review.
+//
+// Groups of one are left out, and that is not an optimisation: a class can only ever
+// produce a swap by matching one row against another, so a family with a single member is
+// invisible to every reader and there is nothing to get wrong. It also cuts the worklist
+// from every food to the few dozen families they fall into -- which is the right unit
+// anyway, because a bad class is never wrong in one row. "black pepper -> spice" is
+// defensible alone; "spice = {vanilla bean, black pepper}" is the bug.
+func ClassGroups(ctx context.Context) (map[string][]string, error) {
+	rows, err := Pool.Query(ctx, `
+		SELECT class, array_agg(name ORDER BY name)
+		FROM ingredient_alias
+		WHERE class IS NOT NULL AND source = 'llm'
+		GROUP BY class HAVING count(*) > 1
+		ORDER BY class`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string][]string{}
+	for rows.Next() {
+		var class string
+		var members []string
+		if err := rows.Scan(&class, &members); err != nil {
+			return nil, err
+		}
+		out[class] = members
+	}
+	return out, rows.Err()
+}
+
+// CorrectAliasClasses moves foods out of a family they do not belong in. It is the one
+// write that overwrites a resolved row, and it is deliberately narrow: only class, only
+// rows the model itself wrote, and only when the answer actually differs.
+//
+// canonical is untouched on purpose. It is an identity every stored gram row, grocery
+// line and pantry match has already been consistent with (see UpsertAliases), so moving
+// one is a migration and not an audit. class carries none of that weight -- nothing
+// merges on it, nothing subtracts on it, it only ever offers.
+//
+// Returns how many rows actually changed, which is what the audit reports.
+func CorrectAliasClasses(ctx context.Context, classes map[string]*string) (int, error) {
+	if len(classes) == 0 {
+		return 0, nil
+	}
+	names := make([]string, 0, len(classes))
+	next := make([]*string, 0, len(classes))
+	for n, c := range classes {
+		names = append(names, n)
+		next = append(next, c)
+	}
+	tag, err := Pool.Exec(ctx, `
+		UPDATE ingredient_alias a SET class = v.class
+		FROM unnest($1::text[], $2::text[]) AS v(name, class)
+		WHERE a.name = v.name AND a.source = 'llm'
+		  AND a.class IS DISTINCT FROM v.class`, names, next)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // MissingAliasNames is the backfill's worklist (cmd/backfill-aliases): every food that
 // appears in a live recipe or in somebody's pantry and has no alias row yet.
 func MissingAliasNames(ctx context.Context) ([]string, error) {

@@ -307,6 +307,12 @@ func generateStructured(ctx context.Context, language string, parts ...openai.Ch
 // edit, and the new instruction as a real multi-turn conversation so the model stays
 // consistent with everything that came before. onDelta is nil outside the generate path
 // (refine and meal-plan-variant calls never stream).
+// ErrNoRecipeInSource is a source that was read fine and holds no recipe — the usual
+// case is a Reel or a Short whose recipe is spoken in the video or sits in the comments,
+// where the caption alone is a hook and a hashtag. The wording is the user's next step,
+// because they have one: the video's own screen usually shows the ingredients.
+var ErrNoRecipeInSource = errors.New("there was no recipe in that — the ingredients and steps were not in the text. If it is a video, the recipe is probably on screen or in the comments: ask the user to screenshot that part and send the image, or to paste the ingredients and steps")
+
 func generateStructuredFromMessages(ctx context.Context, callType string, messages []openai.ChatCompletionMessageParamUnion) (model.RecipeDocument, error) {
 	doc, _, err := llm.Call[model.RecipeDocument](ctx, llm.Spec{
 		Model:    recipeModel,
@@ -317,8 +323,13 @@ func generateStructuredFromMessages(ctx context.Context, callType string, messag
 	if err != nil {
 		return model.RecipeDocument{}, err
 	}
-	if doc.Title == "" && len(doc.Ingredients) == 0 && len(doc.Steps) == 0 {
-		return model.RecipeDocument{}, errors.New("no recipe found in the provided content")
+	// A document with no ingredients or no steps is not a recipe, whatever it calls
+	// itself. The model answers a thin source (a login-walled post, a caption that is
+	// only a hashtag) with a titled shell — "Unspecified Recipe", nothing in it — and
+	// the old guard, which asked for all three to be empty, let that through to be
+	// shown and saved. The caller turns this into "I could not read that".
+	if len(doc.Ingredients) == 0 || len(doc.Steps) == 0 {
+		return model.RecipeDocument{}, ErrNoRecipeInSource
 	}
 	return doc, nil
 }

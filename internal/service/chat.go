@@ -112,6 +112,9 @@ type draftInfo struct {
 	// description). Recorded on the recipe at save time so the library can say where
 	// it came from (BACKLOG.md 3.7).
 	origin *model.GenerationOrigin
+	// derivedFrom is the draft_ref or `recipe:<id>` this document was made out of, so
+	// display_recipe can tell the client which card this one replaces (BACKLOG 10.3).
+	derivedFrom string
 }
 
 // sessionState is the in-memory side of a conversation. Drafts live here for every

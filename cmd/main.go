@@ -986,6 +986,10 @@ func HandleUpsertPantryItem(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error saving pantry item", http.StatusInternalServerError)
 		return
 	}
+	// The same background learning a recipe save and the agent's own pantry tool trigger.
+	// The name reaching this handler is the one nobody else resolves: typed by hand, in
+	// whatever language the kitchen is labelled in.
+	service.LearnPantryItems(item)
 	writeJSON(w, http.StatusOK, item)
 }
 

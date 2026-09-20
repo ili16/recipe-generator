@@ -30,6 +30,13 @@ func EncodeImageToBase64(imageData io.Reader) (string, error) {
 // tool, and the JS-derived data URLs resolveJSFetchContent follows — so the SSRF guard in
 // fetchguard.go sits on this one function. Do not reintroduce a bare http.Client.
 func GetWebsite(link string) (string, error) {
+	return GetWebsiteAs(link, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+}
+
+// GetWebsiteAs is GetWebsite with the User-Agent chosen by the caller. Instagram serves a
+// bare JS shell to a browser UA and the og: tags to a crawler one, so social.go needs this;
+// everything else wants the browser UA and calls GetWebsite.
+func GetWebsiteAs(link, userAgent string) (string, error) {
 	if err := checkFetchURL(link); err != nil {
 		return "", err
 	}
@@ -39,8 +46,7 @@ func GetWebsite(link string) (string, error) {
 		return "", err
 	}
 
-	// Set headers to mimic a browser
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+	req.Header.Set("User-Agent", userAgent)
 
 	res, err := fetchClient.Do(req)
 	if err != nil {
@@ -53,6 +59,14 @@ func GetWebsite(link string) (string, error) {
 		}
 	}(res.Body)
 
+	// A status check belongs here, not in any one caller: without it a 404, a 429 or a
+	// redirect to a login page returns ("", nil) and the caller builds a recipe out of an
+	// empty string. Instagram's rate limiting is what surfaced this, but every fetched
+	// recipe URL was exposed to it.
+	if res.StatusCode >= 400 {
+		return "", fmt.Errorf("%w: %s", ErrFetchStatus, res.Status)
+	}
+
 	content, err := io.ReadAll(io.LimitReader(res.Body, MaxFetchBytes))
 	if err != nil {
 		return "", err
@@ -64,6 +78,12 @@ func GetWebsite(link string) (string, error) {
 // GetWebsiteContent fetches a URL and, when the page is a client-side SPA that
 // loads its data via JS fetch() calls, follows those data URLs automatically.
 func GetWebsiteContent(rawURL string) (string, error) {
+	// A social link is not a page — see social.go. Handled first because the generic
+	// path below "succeeds" on one, returning a JS bundle with no recipe in it.
+	if text, err, handled := socialContent(rawURL); handled {
+		return text, err
+	}
+
 	html, err := GetWebsite(rawURL)
 	if err != nil {
 		return "", err
