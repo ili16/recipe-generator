@@ -50,6 +50,10 @@ type RecipeIngredient struct {
 	// the recipe, so nothing here may reach a save or the generation schema.
 	SwappedFrom *string  `json:"swapped_from,omitempty" llm:"-"`
 	SwapOptions []string `json:"swap_options,omitempty" llm:"-"`
+	// InPantry marks a line the caller's kitchen already holds (BACKLOG 16.7): the same
+	// canonical_item() match GetRecipes counts into PantryHave, per line. Read-only and
+	// never stored, like the two above.
+	InPantry bool `json:"in_pantry,omitempty" llm:"-"`
 }
 
 type RecipeStep struct {
@@ -69,10 +73,14 @@ type RecipeStep struct {
 }
 
 type RecipeDocument struct {
-	Title        string   `json:"title"`
-	Summary      *string  `json:"summary"`
-	Language     string   `json:"language"`
-	Tags         []string `json:"tags"`
+	Title    string   `json:"title"`
+	Summary  *string  `json:"summary"`
+	Language string   `json:"language"`
+	Tags     []string `json:"tags"`
+	// Cuisine and Techniques are graph nodes (BACKLOG 18.1): free-form lowercase English,
+	// written by the same call that writes the recipe. Cuisine nil means unknown.
+	Cuisine      *string  `json:"cuisine"`
+	Techniques   []string `json:"techniques"`
 	Servings     *int     `json:"servings"`
 	TotalMinutes *int     `json:"total_minutes"`
 	PrepMinutes  *int     `json:"prep_minutes"`

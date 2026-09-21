@@ -134,13 +134,14 @@ func AddRecipeStructured(ctx context.Context, userID int, doc model.RecipeDocume
 			(user_id, household_id, title, summary, language, servings, total_minutes, prep_minutes, cook_minutes,
 			 difficulty, calories, protein_g, carbs_g, fat_g,
 			 source_type, content, ai_model, ai_prompt_version, current_version,
-			 variant_of_recipe_id)
-		VALUES ($1,`+stampHousehold+`,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+			 variant_of_recipe_id, cuisine, techniques)
+		VALUES ($1,`+stampHousehold+`,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
 		RETURNING id`,
 		userID, doc.Title, doc.Summary, doc.Language,
 		doc.Servings, doc.TotalMinutes, doc.PrepMinutes, doc.CookMinutes, doc.Difficulty,
 		doc.Calories, doc.ProteinG, doc.CarbsG, doc.FatG, sourceType, content,
 		aiModel, promptVersion, len(history), variantOfRecipeID,
+		doc.Cuisine, nonNil(doc.Techniques),
 	).Scan(&recipeID)
 	if err != nil {
 		return model.Recipe{}, err
@@ -226,12 +227,14 @@ func UpdateRecipeStructured(ctx context.Context, userID, recipeID int, doc model
 		SET title = $1, summary = $2, language = $3, servings = $4, total_minutes = $5,
 		    prep_minutes = $6, cook_minutes = $7, difficulty = $8, content = $9, manually_edited = $10,
 		    calories = $11, protein_g = $12, carbs_g = $13, fat_g = $14,
+		    cuisine = $17, techniques = $18,
 		    current_version = current_version + 1, updated_at = NOW()
 		WHERE id = $15 AND user_id = $16 AND deleted_at IS NULL
 		RETURNING id, current_version`,
 		doc.Title, doc.Summary, doc.Language, doc.Servings, doc.TotalMinutes, doc.PrepMinutes,
 		doc.CookMinutes, doc.Difficulty, content, manuallyEdited,
 		doc.Calories, doc.ProteinG, doc.CarbsG, doc.FatG, recipeID, userID,
+		doc.Cuisine, nonNil(doc.Techniques),
 	).Scan(&id, &version)
 	if err != nil {
 		return model.Recipe{}, err
@@ -380,6 +383,7 @@ func GetRecipeByID(ctx context.Context, userID, recipeID int) (model.Recipe, err
 		SELECT r.id, r.title, r.content, r.manually_edited,
 		       r.summary, r.language, r.servings, r.total_minutes, r.prep_minutes, r.cook_minutes, r.difficulty,
 		       r.calories, r.protein_g, r.carbs_g, r.fat_g,
+		       r.cuisine, r.techniques,
 		       rv.vote
 		FROM recipes r
 		LEFT JOIN recipe_votes rv ON rv.recipe_id = r.id AND rv.user_id = $2
@@ -389,6 +393,7 @@ func GetRecipeByID(ctx context.Context, userID, recipeID int) (model.Recipe, err
 		&recipe.ID, &recipe.Recipename, &recipe.Recipe, &recipe.ManuallyEdited,
 		&doc.Summary, &doc.Language, &doc.Servings, &doc.TotalMinutes, &doc.PrepMinutes, &doc.CookMinutes, &doc.Difficulty,
 		&doc.Calories, &doc.ProteinG, &doc.CarbsG, &doc.FatG,
+		&doc.Cuisine, &doc.Techniques,
 		&recipe.MyVote,
 	)
 	if err != nil {
@@ -434,6 +439,11 @@ func GetRecipeByID(ctx context.Context, userID, recipeID int) (model.Recipe, err
 		slog.Warn("could not read swap options", "recipeID", recipeID, "error", optErr)
 		options = nil
 	}
+	inPantry, pantryErr := PantryLines(ctx, userID, recipeID)
+	if pantryErr != nil {
+		slog.Warn("could not read pantry lines", "recipeID", recipeID, "error", pantryErr)
+		inPantry = nil
+	}
 
 	// What one of each line's unit weighs, for the client's servings scaler (BACKLOG
 	// 17.3). One query for the whole recipe, and advisory in the same way the grocery
@@ -457,6 +467,8 @@ func GetRecipeByID(ctx context.Context, userID, recipeID int) (model.Recipe, err
 
 	for i, sortOrder := range sortOrders {
 		if replacement, ok := swaps[sortOrder]; ok {
+			// A swap's replacement is picked from the pantry, so the line is covered.
+			doc.Ingredients[i].InPantry = true
 			ing := &doc.Ingredients[i]
 			written := ing.Item
 			ing.SwappedFrom = &written
@@ -468,6 +480,9 @@ func GetRecipeByID(ctx context.Context, userID, recipeID int) (model.Recipe, err
 			ing.Item = replacement
 		}
 		doc.Ingredients[i].SwapOptions = options[sortOrder]
+		if inPantry[sortOrder] {
+			doc.Ingredients[i].InPantry = true
+		}
 	}
 
 	if table != nil {
@@ -662,4 +677,12 @@ func gramsPairsOfDoc(ingredients []model.RecipeIngredient) []model.ItemUnit {
 		pairs = append(pairs, model.ItemUnit{Item: model.NormalizeItem(ing.Item), Unit: family})
 	}
 	return pairs
+}
+
+// nonNil keeps techniques NOT NULL: a nil slice would be sent as SQL NULL.
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }

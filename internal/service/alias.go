@@ -18,6 +18,9 @@ import (
 // whole library is one or two calls, and a bad response costs a batch rather than the run.
 const aliasBatchSize = 100
 
+// knownCanonicalsCap bounds the reuse list shown to the resolver (~1.5k tokens).
+const knownCanonicalsCap = 400
+
 // The two answers this prompt gives are deliberately different kinds of claim, and the
 // wording works hard to keep them apart. canonical is an identity and gets merged into
 // shopping lists and subtracted from fridges; class is only ever a suggestion. A model
@@ -43,6 +46,11 @@ because you cannot put an onion where a carrot was. "spice" is wrong for the sam
 a vanilla bean is replaced by vanilla extract or vanilla paste, never by black pepper, so
 its class is "vanilla" and not "spice". If nothing sensibly replaces the food -- salt,
 water, egg -- answer null. Null is a better answer than a class that is merely a shelf.
+
+You may be shown canonicals that already exist. If a name is the same food as one of them,
+in any language, answer with that exact canonical rather than inventing a second spelling:
+"trockenhefe" is "instant yeast" when "instant yeast" is listed. Only mint a new canonical
+when none of them is the same food.
 
 Answer for every name you were given, echoing each name back exactly as it was given.`
 
@@ -132,6 +140,10 @@ func classifyAliases(ctx context.Context, names []string) (map[string]model.Alia
 	}
 
 	var b strings.Builder
+	// Best effort: without the list it is the old behaviour, so a failed read is not fatal.
+	if known, err := storage.KnownCanonicals(ctx, knownCanonicalsCap); err == nil && len(known) > 0 {
+		fmt.Fprintf(&b, "Existing canonicals: %s\n\nNames:\n", strings.Join(known, ", "))
+	}
 	for _, n := range names {
 		fmt.Fprintf(&b, "%s\n", n)
 	}
@@ -459,4 +471,96 @@ func sameClass(a, b *string) bool {
 		return a == b
 	}
 	return *a == *b
+}
+
+const auditCanonicalPrompt = `You check a cooking app's ingredient names for one food split across two spellings.
+
+Each line is a substitution class and the distinct canonical names inside it. Report every
+set of canonicals that are the SAME food -- what a cook would buy as one item -- including
+the same food in two languages ("trockenhefe" and "instant yeast"). Spaghetti and penne are
+different foods. Say nothing about groups that are fine.
+
+Give each set as canonical names spelled exactly as given.`
+
+// CanonicalSplit is a set of canonicals the audit believes are one food.
+type CanonicalSplit struct {
+	Class      string
+	Canonicals []string
+}
+
+// AuditCanonicals reports foods split across canonicals within a class (BACKLOG 18.0). It
+// writes nothing: canonical is an identity, so merging is a migration, not an audit fix.
+func AuditCanonicals(ctx context.Context) ([]CanonicalSplit, error) {
+	groups, err := storage.ClassCanonicals(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read classes: %w", err)
+	}
+	classes := make([]string, 0, len(groups))
+	for c := range groups {
+		classes = append(classes, c)
+	}
+	slices.Sort(classes)
+
+	type set struct {
+		Class      string   `json:"class"`
+		Canonicals []string `json:"canonicals"`
+	}
+	type answer struct {
+		Same []set `json:"same"`
+	}
+	var splits []CanonicalSplit
+	for chunk := range slices.Chunk(classes, auditBatchSize) {
+		var b strings.Builder
+		known := map[string]map[string]bool{}
+		for _, c := range chunk {
+			fmt.Fprintf(&b, "%s: %s\n", c, strings.Join(groups[c], ", "))
+			known[c] = map[string]bool{}
+			for _, m := range groups[c] {
+				known[c][m] = true
+			}
+		}
+		out, _, err := llm.Call[answer](ctx, llm.Spec{
+			Model:    assistModel,
+			CallType: "alias_canonical_audit",
+			Messages: []openai.ChatCompletionMessageParamUnion{
+				openai.SystemMessage(auditCanonicalPrompt),
+				openai.UserMessage(b.String()),
+			},
+			Schema: &llm.Schema{Name: "canonical_audit", Schema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"same": map[string]any{
+						"type": "array",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"class":      map[string]any{"type": "string"},
+								"canonicals": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+							},
+							"required":             []string{"class", "canonicals"},
+							"additionalProperties": false,
+						},
+					},
+				},
+				"required":             []string{"same"},
+				"additionalProperties": false,
+			}},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("audit canonicals: %w", err)
+		}
+		for _, s := range out.Same {
+			// The model writes names back; keep only sets of real canonicals from that class.
+			var ok []string
+			for _, c := range s.Canonicals {
+				if known[s.Class][c] {
+					ok = append(ok, c)
+				}
+			}
+			if len(ok) > 1 {
+				splits = append(splits, CanonicalSplit{Class: s.Class, Canonicals: ok})
+			}
+		}
+	}
+	return splits, nil
 }

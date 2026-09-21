@@ -97,3 +97,30 @@ func SwapOptions(ctx context.Context, userID, recipeID int) (map[int][]string, e
 	}
 	return out, rows.Err()
 }
+
+// PantryLines reports which lines of a recipe the caller's kitchen already holds
+// (BACKLOG 16.7), keyed by sort_order. It is the per-line form of GetRecipes' pantry
+// match and uses the same canonical_item() predicate, so the badge count and the marks
+// cannot disagree.
+func PantryLines(ctx context.Context, userID, recipeID int) (map[int]bool, error) {
+	rows, err := Pool.Query(ctx, `
+		SELECT ri.sort_order FROM recipe_ingredients ri
+		WHERE ri.recipe_id = $2
+		  AND EXISTS (SELECT 1 FROM pantry_items p
+		              WHERE `+inScope("p", "$1")+` AND canonical_item(p.name) = canonical_item(ri.item))`,
+		userID, recipeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[int]bool{}
+	for rows.Next() {
+		var sortOrder int
+		if err := rows.Scan(&sortOrder); err != nil {
+			return nil, err
+		}
+		out[sortOrder] = true
+	}
+	return out, rows.Err()
+}

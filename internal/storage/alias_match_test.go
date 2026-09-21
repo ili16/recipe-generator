@@ -95,6 +95,16 @@ func TestPantryMatchUsesCanonicalNotClass(t *testing.T) {
 	if got.PantryClose != 1 {
 		t.Errorf("pantry close = %d, want 1 (penne swaps for spaghetti by class)", got.PantryClose)
 	}
+
+	// BACKLOG 16.7: the per-line marks agree with the count — onion and parmesan, not
+	// spaghetti.
+	lines, err := PantryLines(ctx, userID, recipe.ID)
+	if err != nil {
+		t.Fatalf("PantryLines: %v", err)
+	}
+	if len(lines) != got.PantryHave {
+		t.Errorf("PantryLines marked %d lines, GetRecipes counted %d", len(lines), got.PantryHave)
+	}
 }
 
 // BACKLOG 17.4b's half of the same fact, from the other direction: an ingredient search

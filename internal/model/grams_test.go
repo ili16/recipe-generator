@@ -165,8 +165,8 @@ func TestSwapQuantity(t *testing.T) {
 	g := "g"
 	piece := (*string)(nil)
 	table := map[ItemUnit]float64{
-		{"onion", ""}:   150,
-		{"shallot", ""}: 50,
+		{"onion", ""}:      150,
+		{"shallot", ""}:    50,
 		{"spaghetti", "g"}: 1, // never consulted: g is the identity
 	}
 

@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/ili16/recipe-generator/internal/service"
 	"github.com/ili16/recipe-generator/internal/storage"
@@ -91,13 +92,26 @@ func main() {
 // would change and writes nothing unless asked, because the reviewer is the same kind of
 // model as the author and its disagreement is a question, not a verdict.
 func runAudit(ctx context.Context, apply bool) {
+	// BACKLOG 18.0: one food under two canonicals. Report-only; merging is a migration.
+	splits, err := service.AuditCanonicals(ctx)
+	if err != nil {
+		slog.Error("canonical audit failed", "error", err)
+		os.Exit(1)
+	}
+	for _, s := range splits {
+		fmt.Printf("SPLIT  %-20s %s\n", s.Class, strings.Join(s.Canonicals, " = "))
+	}
+	if len(splits) > 0 {
+		fmt.Println("Same food, several canonicals: pick one and UPDATE ingredient_alias SET canonical = ..., source = 'manual' (add a migration).")
+	}
+
 	fixes, err := service.AuditClasses(ctx)
 	if err != nil {
 		slog.Error("audit failed", "error", err)
 		os.Exit(1)
 	}
 	if len(fixes) == 0 {
-		fmt.Println("nothing to do: every substitution class holds together")
+		fmt.Printf("%d canonical split(s); every substitution class holds together\n", len(splits))
 		return
 	}
 

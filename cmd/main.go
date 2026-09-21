@@ -91,6 +91,11 @@ func main() {
 	mux.HandleFunc("GET /api/v1/recipes/trash", authenticator.Require(HandleGetTrash))
 	mux.HandleFunc("POST /api/v1/recipes/{id}/restore", authenticator.Require(HandleRestoreRecipe))
 	mux.HandleFunc("GET /api/v1/recipes/{id}", authenticator.Require(HandleGetRecipeByID))
+	mux.HandleFunc("GET /api/v1/recipes/{id}/similar", authenticator.Require(HandleSimilarRecipes))
+	mux.HandleFunc("GET /api/v1/graph/similar-ingredients", authenticator.Require(HandleSimilarIngredients))
+	mux.HandleFunc("GET /api/v1/graph", authenticator.Require(HandleGraph))
+	mux.HandleFunc("GET /api/v1/graph/neighbours", authenticator.Require(HandleNeighbours))
+	mux.HandleFunc("GET /api/v1/graph/overlap", authenticator.Require(HandleRecipeOverlap))
 	mux.HandleFunc("GET /api/v1/recipes/{id}/history", authenticator.Require(HandleGetRecipeHistory))
 
 	mux.HandleFunc("GET /api/v1/user-info", authenticator.Require(HandleGetUserInfo))
@@ -749,6 +754,107 @@ func HandleGetRecipeHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, versions)
+}
+
+func HandleSimilarRecipes(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil || id <= 0 {
+		http.Error(w, "invalid recipe id", http.StatusBadRequest)
+		return
+	}
+	out, err := storage.SimilarRecipes(r.Context(), user.ID, id, 10)
+	if err != nil {
+		slog.Error("similar recipes", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func HandleSimilarIngredients(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Error(w, "name required", http.StatusBadRequest)
+		return
+	}
+	canonical, related, err := storage.SimilarIngredients(r.Context(), user.ID, name)
+	if err != nil {
+		slog.Error("similar ingredients", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"canonical": canonical, "related": related})
+}
+
+// HandleGraph returns every edge in the caller's scope, for the Map screen's whole-library view.
+func HandleGraph(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	edges, err := storage.GraphEdges(r.Context(), user.ID, 0)
+	if err != nil {
+		slog.Error("graph", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if edges == nil {
+		edges = []storage.GraphEdge{}
+	}
+	writeJSON(w, http.StatusOK, edges)
+}
+
+// HandleRecipeOverlap returns recipe↔recipe edges for the map's Overlap mode: each recipe's
+// few closest neighbours by shared food, with the shared foods themselves.
+func HandleRecipeOverlap(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	top, _ := strconv.Atoi(r.URL.Query().Get("top"))
+	if top <= 0 {
+		top = 4
+	}
+	links, err := storage.RecipeOverlap(r.Context(), user.ID, top)
+	if err != nil {
+		slog.Error("recipe overlap", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, links)
+}
+
+func HandleNeighbours(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	q := r.URL.Query()
+	if q.Get("type") == "" || q.Get("node") == "" {
+		http.Error(w, "type and node required", http.StatusBadRequest)
+		return
+	}
+	depth, _ := strconv.Atoi(q.Get("depth"))
+	edges, err := storage.Neighbours(r.Context(), user.ID, q.Get("type"), q.Get("node"), depth)
+	if err != nil {
+		slog.Error("neighbours", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, edges)
 }
 
 func HandleGetRecipes(w http.ResponseWriter, r *http.Request) {

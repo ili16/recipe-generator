@@ -140,6 +140,28 @@ var chatTools = map[string]tool{
 		NeedsAuth:   true,
 		Run:         toolGetRecipe,
 	},
+	"similar_recipes": {
+		Description: "Recipes in the user's library that are like one of their saved recipes, best match first. Matches on shared ingredients (a Zwiebel and an onion count as the same food), ingredient classes, cuisine and technique — not on wording. Use it for 'something like this' or 'what else do I have like the curry'.",
+		Params:      obj(map[string]any{"id": integer("The saved recipe's id")}, "id"),
+		NeedsAuth:   true,
+		Run:         toolSimilarRecipes,
+	},
+	"similar_ingredients": {
+		Description: "Foods related to an ingredient, in any language: its other spellings and the foods of the same class in the user's kitchen. Use it for 'what can I use instead of X' style questions before suggesting a swap.",
+		Params:      obj(map[string]any{"name": str("The ingredient, e.g. 'Zwiebel' or 'butter'")}, "name"),
+		NeedsAuth:   true,
+		Run:         toolSimilarIngredients,
+	},
+	"neighbours": {
+		Description: "Explore the user's recipe graph around one node: everything within depth hops (1-3). type is recipe, ingredient, cuisine, technique, tag or meal; node is a recipe id, an ingredient name or a slug. Use it to answer 'what do I cook with X' or 'what is my Italian food made of'.",
+		Params: obj(map[string]any{
+			"type":  str("recipe | ingredient | cuisine | technique | tag | meal"),
+			"node":  str("A recipe id, ingredient name, or cuisine/technique/tag slug"),
+			"depth": integer("Hops to follow, 1-3; defaults to 1"),
+		}, "type", "node"),
+		NeedsAuth: true,
+		Run:       toolNeighbours,
+	},
 	"rename_recipe": {
 		Description: "Rename one of the user's saved recipes. Use it when the user asks for a different name, or when a saved recipe carries a name that only made sense in the conversation that produced it (\"Half-Batch Cr\u00e8me Br\u00fbl\u00e9e\"). The new title names the dish, not the request: no serving counts, no source, no wording of the change that produced it.",
 		Params: obj(map[string]any{
@@ -673,6 +695,50 @@ func toolGetRecipe(ctx context.Context, s *chatSession, args json.RawMessage) (a
 	}
 	return map[string]any{"id": recipe.ID, "recipe": recipe.Structured},
 		&artifact{Kind: "recipe", Data: map[string]any{"recipe_id": recipe.ID, "document": recipe.Structured}}, nil
+}
+
+func toolSimilarRecipes(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
+	var a struct {
+		ID int `json:"id"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return nil, nil, errors.New("could not read the arguments")
+	}
+	out, err := storage.SimilarRecipes(ctx, s.userID, a.ID, 10)
+	if err != nil {
+		return nil, nil, errors.New("could not search your library")
+	}
+	return map[string]any{"recipes": out}, nil, nil
+}
+
+func toolSimilarIngredients(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
+	var a struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil || a.Name == "" {
+		return nil, nil, errors.New("could not read the arguments")
+	}
+	canonical, related, err := storage.SimilarIngredients(ctx, s.userID, a.Name)
+	if err != nil {
+		return nil, nil, errors.New("could not search your library")
+	}
+	return map[string]any{"canonical": canonical, "related": related}, nil, nil
+}
+
+func toolNeighbours(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
+	var a struct {
+		Type  string `json:"type"`
+		Node  string `json:"node"`
+		Depth int    `json:"depth"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil || a.Type == "" || a.Node == "" {
+		return nil, nil, errors.New("could not read the arguments")
+	}
+	edges, err := storage.Neighbours(ctx, s.userID, a.Type, a.Node, a.Depth)
+	if err != nil {
+		return nil, nil, errors.New("could not search your library")
+	}
+	return map[string]any{"edges": edges}, nil, nil
 }
 
 func toolRenameRecipe(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {

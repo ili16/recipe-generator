@@ -179,3 +179,51 @@ func NearestCanonical(ctx context.Context, name string) (string, error) {
 	}
 	return out, err
 }
+
+// KnownCanonicals is what the resolver is shown so it reuses a food's existing canonical
+// instead of minting a second one (BACKLOG 18.0): the most-used first, capped, because the
+// prompt has to stay small and the rare ones are the least likely to be the answer.
+func KnownCanonicals(ctx context.Context, limit int) ([]string, error) {
+	rows, err := Pool.Query(ctx, `
+		SELECT canonical FROM ingredient_alias
+		GROUP BY canonical ORDER BY count(*) DESC, canonical LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ClassCanonicals lists, per class, the distinct canonicals in it (only classes with more
+// than one) -- the audit's worklist for one food split across canonicals (BACKLOG 18.0).
+func ClassCanonicals(ctx context.Context) (map[string][]string, error) {
+	rows, err := Pool.Query(ctx, `
+		SELECT class, array_agg(DISTINCT canonical ORDER BY canonical)
+		FROM ingredient_alias WHERE class IS NOT NULL
+		GROUP BY class HAVING count(DISTINCT canonical) > 1
+		ORDER BY class`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string][]string{}
+	for rows.Next() {
+		var class string
+		var members []string
+		if err := rows.Scan(&class, &members); err != nil {
+			return nil, err
+		}
+		out[class] = members
+	}
+	return out, rows.Err()
+}

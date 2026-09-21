@@ -164,9 +164,9 @@ func TestTruncateRunes(t *testing.T) {
 		{"", 5, ""},
 		{"abc", 5, "abc"},
 		{"abcdef", 3, "abc"},
-		{"ééé", 3, "ééé"},   // 6 bytes, 3 runes — must not be cut
-		{"ééééé", 2, "éé"},  // cut on a rune boundary
-		{"a🍳b", 2, "a🍳"}, // 4-byte rune
+		{"ééé", 3, "ééé"},  // 6 bytes, 3 runes — must not be cut
+		{"ééééé", 2, "éé"}, // cut on a rune boundary
+		{"a🍳b", 2, "a🍳"},   // 4-byte rune
 	} {
 		if got := truncateRunes(tc.in, tc.n); got != tc.want {
 			t.Errorf("truncateRunes(%q, %d) = %q, want %q", tc.in, tc.n, got, tc.want)

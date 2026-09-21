@@ -167,6 +167,8 @@ func recipeJSONSchema() map[string]any {
 				"type":  "array",
 				"items": map[string]any{"type": "string", "enum": AllTagSlugs},
 			},
+			"cuisine":       llm.Nullable("string"),
+			"techniques":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 			"servings":      llm.Nullable("integer"),
 			"total_minutes": llm.Nullable("integer"),
 			"prep_minutes":  llm.Nullable("integer"),
@@ -186,7 +188,7 @@ func recipeJSONSchema() map[string]any {
 			"steps":       map[string]any{"type": "array", "items": stepSchema},
 		},
 		"required": []string{
-			"title", "summary", "language", "tags",
+			"title", "summary", "language", "tags", "cuisine", "techniques",
 			"servings", "total_minutes", "prep_minutes", "cook_minutes", "difficulty",
 			"calories", "protein_g", "carbs_g", "fat_g",
 			"ingredients", "steps",
@@ -262,6 +264,7 @@ func ReviewCookFlow(ctx context.Context, doc model.RecipeDocument) (model.Recipe
 	// nutrition is not worth a second round-trip, so pin them back instead.
 	out.Ingredients = doc.Ingredients
 	out.Title, out.Tags, out.Servings = doc.Title, doc.Tags, doc.Servings
+	out.Cuisine, out.Techniques = doc.Cuisine, doc.Techniques
 	out.Calories, out.ProteinG, out.CarbsG, out.FatG = doc.Calories, doc.ProteinG, doc.CarbsG, doc.FatG
 	return out, nil
 }
