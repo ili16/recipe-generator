@@ -60,6 +60,18 @@ func metaContent(page, prop string) string {
 // including the /<author>/reel/<code>/ shape Instagram redirects to.
 var instagramShortcodeRe = regexp.MustCompile(`/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)`)
 
+// InstagramShortcode returns the post id in a URL, or "" if there is none. It is the
+// stable identity of a post — /reel/<code>/, /p/<code>/ and /<author>/reel/<code>/?igsh=…
+// are the same reel — which is what makes it the cache key for that reel's transcript
+// (BACKLOG 11.9).
+func InstagramShortcode(rawURL string) string {
+	m := instagramShortcodeRe.FindStringSubmatch(rawURL)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
 // captionRe matches the embed page's caption block: everything between the Caption div
 // and either the comment link or its close.
 var captionRe = regexp.MustCompile(`(?s)<div class="Caption">(.*?)(?:<div class="CaptionComments">|</div>)`)
@@ -71,11 +83,11 @@ var tagRe = regexp.MustCompile(`<[^>]*>`)
 // instagramCaption reads the whole caption off the server-rendered embed page. Empty
 // when the post is gone, private, or the page shape changed — the caller falls back.
 func instagramCaption(rawURL string) string {
-	m := instagramShortcodeRe.FindStringSubmatch(rawURL)
-	if m == nil {
+	code := InstagramShortcode(rawURL)
+	if code == "" {
 		return ""
 	}
-	page, err := GetWebsiteAs("https://www.instagram.com/p/"+m[1]+"/embed/captioned/", crawlerUA)
+	page, err := GetWebsiteAs("https://www.instagram.com/p/"+code+"/embed/captioned/", crawlerUA)
 	if err != nil {
 		return ""
 	}
@@ -108,11 +120,11 @@ var videoURLRe = regexp.MustCompile(`video_url\\":\\"(.*?)\\"`)
 // recipe: the recipe is spoken in the video instead, and the soundtrack is the only text
 // left to read.
 func InstagramVideoURL(rawURL string) string {
-	m := instagramShortcodeRe.FindStringSubmatch(rawURL)
-	if m == nil {
+	code := InstagramShortcode(rawURL)
+	if code == "" {
 		return ""
 	}
-	page, err := GetWebsiteAs("https://www.instagram.com/p/"+m[1]+"/embed/captioned/", crawlerUA)
+	page, err := GetWebsiteAs("https://www.instagram.com/p/"+code+"/embed/captioned/", crawlerUA)
 	if err != nil {
 		return ""
 	}

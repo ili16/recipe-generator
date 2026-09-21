@@ -724,6 +724,11 @@ soft delete.
   `ingredient_alias` (BACKLOG 17.2) — `EnsureAliases` / `LearnAliases` / `NearestCanonical`.
   `grams.go` is the template and the resemblance is deliberate: same batch size, same
   echo-the-key-back join, same `DO NOTHING`, same detachment
+- internal/storage/video_transcripts.go: the transcript cache behind `videoTranscript`
+  (BACKLOG 11.9, migration `00047`). Global and userID-free for `grams.go`'s reason — a public
+  reel's soundtrack is not a fact about a household. Keyed on the Instagram **shortcode**, so
+  the several URL shapes of one reel are one entry, and the read reports `found` separately
+  from the text because a silent reel's `""` is an answer worth caching
 - internal/storage/duplicates.go: the advisory, time-capped duplicate lookup behind
   `save_recipe`'s prompt (BACKLOG 8.3)
 - internal/storage/conversations.go: server-held chat threads for /chat, ownership-checked on
