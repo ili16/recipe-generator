@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { View, Text, StyleSheet, ScrollView, TouchableOpacity } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { Collection, Recipe, RecipeDocument, RecipeVersion } from '../../types';
@@ -75,6 +75,13 @@ const RecipeCard: React.FC<Props> = ({
   const pantryClose = recipe.pantry_close ?? 0;
   const mealType = mealTypeSlug(recipe.tags);
   const totalMinutes = totalTimeMinutes(recipe);
+
+  // The list payload has no structured document (it is fetched on demand), and the
+  // per-line pantry marks (BACKLOG 16.7) live on it — so opening a card loads it.
+  useEffect(() => {
+    if (expanded && !recipe.structured) void ensureStructured(recipe);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expanded, recipe.id]);
 
   const startEdit = async () => {
     const doc = (await ensureStructured(recipe)) ?? {
@@ -185,7 +192,13 @@ const RecipeCard: React.FC<Props> = ({
                       // what the pantry holds and what it could stand in for, separately.
                       ? t('recipes.pantrySwap', { have: pantryHave, total: pantryTotal, count: pantryClose })
                       : t('recipes.pantryPartial', { have: pantryHave, total: pantryTotal })}
-                  icon={<Ionicons name="file-tray-stacked-outline" size={11} color={theme.accent} />}
+                  // BACKLOG 16.7: full coverage gets the one filled badge on the card.
+                  tone={pantryHave === pantryTotal ? 'success' : 'accent'}
+                  icon={<Ionicons
+                    name={pantryHave === pantryTotal ? 'checkmark-circle' : 'file-tray-stacked-outline'}
+                    size={11}
+                    color={pantryHave === pantryTotal ? theme.onSuccess : theme.accent}
+                  />}
                 />
               )}
               {!!recipe.share_token && (

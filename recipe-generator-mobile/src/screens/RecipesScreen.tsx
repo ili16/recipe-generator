@@ -10,7 +10,7 @@ import { useEscapeBack } from '../hooks/useEscapeBack';
 import { useRecipeLibrary } from '../hooks/useRecipeLibrary';
 import RecipeToolbar, { SortMode } from './recipes/RecipeToolbar';
 import RecipeCard from './recipes/RecipeCard';
-import { QuickFilter, matchesQuickFilters } from './recipes/quickFilters';
+import { QuickFilter, matchesQuickFilters, pantryRatio } from './recipes/quickFilters';
 import { Button, Card, Text as UIText } from '../components/ui';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Recipes'>;
@@ -91,6 +91,10 @@ const RecipesScreen: React.FC<Props> = ({ navigation }) => {
     if (sortMode === 'name') {
       list = [...list].sort((a, b) => a.recipename.localeCompare(b.recipename));
     }
+    if (sortMode === 'pantry') {
+      // Stable, so ties keep the recent-first order the server sent.
+      list = [...list].sort((a, b) => pantryRatio(b) - pantryRatio(a) || (b.pantry_have ?? 0) - (a.pantry_have ?? 0));
+    }
     return list;
   }, [lib.recipes, lib.collections, search, selectedTags, sortMode, activeCollectionId, quickFilters]);
 
@@ -141,7 +145,7 @@ const RecipesScreen: React.FC<Props> = ({ navigation }) => {
         selectedTags={selectedTags}
         onToggleTag={toggleTagFilter}
         sortMode={sortMode}
-        onToggleSort={() => setSortMode(m => (m === 'recent' ? 'name' : 'recent'))}
+        onToggleSort={() => setSortMode(m => (m === 'recent' ? 'name' : m === 'name' ? 'pantry' : 'recent'))}
         collections={lib.collections}
         activeCollectionId={activeCollectionId}
         onSelectCollection={setActiveCollectionId}
@@ -159,6 +163,9 @@ const RecipesScreen: React.FC<Props> = ({ navigation }) => {
       />
 
 
+      {!trashMode && lib.recipes.length > 0 && (
+        <Button title={t('nav.map')} variant="ghost" size="sm" onPress={() => navigation.navigate('Map')} style={{ marginHorizontal: 16 }} />
+      )}
       {trashMode ? (
         lib.trash.length === 0 ? (
           <View style={styles.emptyContainer}>

@@ -31,6 +31,11 @@ export function check(): void {
   assert.equal(m(r({ servings: 2 }), 'batch'), false);
   assert.equal(m(r({}), 'batch'), false);
 
+  // 80% is inclusive; no ingredients or an empty pantry never qualifies.
+  assert.equal(m(r({ pantry_have: 4, pantry_total: 5 }), 'pantry'), true);
+  assert.equal(m(r({ pantry_have: 3, pantry_total: 5 }), 'pantry'), false);
+  assert.equal(m(r({ pantry_have: 0, pantry_total: 0 }), 'pantry'), false);
+
   // Filters narrow: both must hold.
   assert.equal(m(r({ my_vote: 1, total_minutes: 15 }), 'favourite', 'fast'), true);
   assert.equal(m(r({ my_vote: 1, total_minutes: 90 }), 'favourite', 'fast'), false);

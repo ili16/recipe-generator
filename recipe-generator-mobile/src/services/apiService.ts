@@ -396,6 +396,23 @@ class ApiService {
     await this.client.put(`${API_ENDPOINTS.GET_RECIPE}/${recipeId}/swaps/${sortOrder}`, { replacement });
   }
 
+  async getGraph(): Promise<GraphEdge[]> {
+    const response = await this.client.get<GraphEdge[]>('graph');
+    return response.data ?? [];
+  }
+
+  // Recipe↔recipe edges for the map's Overlap mode: each recipe's few closest neighbours
+  // by shared food, scored server-side so the scoring lives in one place (BACKLOG 18.3).
+  async getRecipeOverlap(): Promise<RecipeLink[]> {
+    const response = await this.client.get<RecipeLink[] | null>('graph/overlap');
+    return response.data ?? [];
+  }
+
+  async getGraphNeighbours(type: string, node: string, depth = 1): Promise<GraphEdge[]> {
+    const response = await this.client.get<GraphEdge[] | null>('graph/neighbours', { params: { type, node, depth } });
+    return response.data ?? [];
+  }
+
   async getRecipeHistory(recipeId: number): Promise<RecipeVersion[]> {
     const response = await this.client.get<RecipeVersion[]>(`${API_ENDPOINTS.GET_RECIPE}/${recipeId}/history`);
     return response.data;
@@ -624,6 +641,22 @@ class ApiService {
     );
     return response.data;
   }
+}
+
+export interface GraphEdge {
+  src_type: string;
+  src: string;
+  rel: string;
+  dst_type: string;
+  dst: string;
+  weight: number;
+}
+
+export interface RecipeLink {
+  a: number;
+  b: number;
+  score: number;
+  shared: string[];
 }
 
 export default new ApiService();

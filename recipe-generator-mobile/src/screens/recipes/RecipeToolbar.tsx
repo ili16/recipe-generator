@@ -9,7 +9,7 @@ import { Chip } from '../../components/ui';
 import { Collection } from '../../types';
 import { QuickFilter, QUICK_FILTER_LABEL_KEYS } from './quickFilters';
 
-export type SortMode = 'recent' | 'name';
+export type SortMode = 'recent' | 'name' | 'pantry';
 
 interface Props {
   search: string;
@@ -60,7 +60,7 @@ const RecipeToolbar: React.FC<Props> = ({ search, onSearch, selectedTags, onTogg
               </Text>
             </TouchableOpacity>
             <TouchableOpacity style={styles.sortToggle} onPress={onToggleSort}>
-              <Text style={styles.sortToggleText}>{sortMode === 'recent' ? t('recipes.sortRecent') : t('recipes.sortAlpha')}</Text>
+              <Text style={styles.sortToggleText}>{t(sortMode === 'recent' ? 'recipes.sortRecent' : sortMode === 'name' ? 'recipes.sortAlpha' : 'recipes.sortPantry')}</Text>
             </TouchableOpacity>
             {/* Exports what is on screen, not the whole table: the filters above are
                 how you choose what to take with you (BACKLOG 13.1). */}

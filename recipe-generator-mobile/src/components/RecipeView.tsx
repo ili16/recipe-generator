@@ -173,6 +173,14 @@ const RecipeView: React.FC<Props> = ({ structured, markdown, showSteps = true, s
       {structured!.ingredients.length > 0 && (
         <View style={styles.section}>
           <Text style={styles.sectionLabel}>{t('edit.ingredients')}</Text>
+          {/* BACKLOG 16.7: only when the kitchen holds something, so an empty pantry
+              shows no legend and no marks. */}
+          {structured!.ingredients.some(i => i.in_pantry) && (
+            <View style={styles.pantryLegend}>
+              <Ionicons name="checkmark-circle" size={13} color={theme.success} />
+              <Text style={styles.optLabel}>{t('recipes.pantryLegend')}</Text>
+            </View>
+          )}
           {[...sections.entries()].map(([section, items]) => (
             <View key={section || '__default'}>
               {section !== '' && <Text style={styles.subsectionLabel}>{section}</Text>}
@@ -182,7 +190,17 @@ const RecipeView: React.FC<Props> = ({ structured, markdown, showSteps = true, s
                 const swappable = !!onSwap && (!!ing.swapped_from || (ing.swap_options?.length ?? 0) > 0);
                 const line = (
                   <>
-                    <View style={styles.ingBullet} />
+                    {ing.in_pantry ? (
+                      <Ionicons
+                        name="checkmark-circle"
+                        size={14}
+                        color={theme.success}
+                        style={styles.ingCheck}
+                        accessibilityLabel={t('recipes.pantryLegend')}
+                      />
+                    ) : (
+                      <View style={styles.ingBullet} />
+                    )}
                     <Text style={styles.ingText}>
                       {fmtIngredient(scaleIngredient(ing, scale), scale !== 1)}
                       {ing.optional ? <Text style={styles.optLabel}>  optional</Text> : null}
@@ -294,6 +312,8 @@ const makeStyles = (t: Theme) => StyleSheet.create({
   // than one that admits it only moved the amounts.
   scaledNote: { ...type.caption, color: t.muted, marginTop: 8 },
   ingBullet: { width: 5, height: 5, borderRadius: 2.5, backgroundColor: t.accent, marginTop: 7 },
+  ingCheck: { marginTop: 3 },
+  pantryLegend: { flexDirection: 'row', alignItems: 'center', gap: 4, marginBottom: 6 },
   ingText: { flex: 1, ...type.body, fontSize: 14, color: t.text, lineHeight: 20 },
   optLabel: { ...type.caption, color: t.muted, fontStyle: 'italic' },
 

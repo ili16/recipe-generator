@@ -243,7 +243,9 @@ export function useRecipeLibrary() {
     if (recipe.structured) return recipe.structured;
     try {
       const full = await apiService.getRecipeById(recipe.id);
-      applyRecipes(recipes.map(r => (r.id === recipe.id ? full : r)));
+      // Merge only the document: `full` is a detail payload and carries no pantry
+      // counts, so replacing the row would drop the card's pantry badge (BACKLOG 16.7).
+      applyRecipes(recipes.map(r => (r.id === recipe.id ? { ...r, structured: full.structured } : r)));
       return full.structured ?? null;
     } catch {
       showAlert(t('common.error'), t('library.detailsFailed'), 'error');

@@ -17,6 +17,7 @@ import GroceryListScreen from '../screens/GroceryListScreen';
 import PantryScreen from '../screens/PantryScreen';
 import HouseholdScreen from '../screens/HouseholdScreen';
 import ThreadListScreen from '../screens/chat/ThreadList';
+import MapScreen from '../screens/MapScreen';
 import { Recipe } from '../types';
 
 export type RootStackParamList = {
@@ -34,6 +35,7 @@ export type RootStackParamList = {
   MealPlan: undefined;
   GroceryList: undefined;
   Pantry: undefined;
+  Map: undefined;
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -98,6 +100,7 @@ const AppNavigator: React.FC = () => {
         component={ThreadListScreen}
         options={{ title: t('chat.history.title') }}
       />
+      <Stack.Screen name="Map" component={MapScreen} options={{ title: t('nav.map') }} />
       <Stack.Screen
         name="Household"
         component={HouseholdScreen}

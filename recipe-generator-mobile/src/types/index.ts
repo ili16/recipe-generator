@@ -98,6 +98,8 @@ export interface RecipeDocument {
     // scaler can turn "1.5 onions" into something a cook can act on. Absent means
     // nothing knows, and the scaler must then show the bare number.
     grams_per_unit?: number | null;
+    // The caller's kitchen already holds this line (BACKLOG 16.7). Read-only.
+    in_pantry?: boolean;
     // The cook's own substitution on this line (BACKLOG 17.4c). `swapped_from` is what
     // the recipe actually says and is present only on a swapped line — `item` then
     // already carries the replacement, with the amount converted by weight.

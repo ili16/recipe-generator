@@ -227,11 +227,12 @@ export const Chip: React.FC<{
 export const Badge: React.FC<{
   label: string;
   icon?: ReactNode;
-  tone?: 'accent' | 'neutral';
+  tone?: 'accent' | 'neutral' | 'success';
   style?: StyleProp<ViewStyle>;
 }> = ({ label, icon, tone = 'accent', style }) => {
   const { theme } = useTheme();
   const neutral = tone === 'neutral';
+  const success = tone === 'success';
   return (
     <View
       style={[
@@ -242,7 +243,7 @@ export const Badge: React.FC<{
           paddingHorizontal: space.sm,
           paddingVertical: space.xs - 1,
           borderRadius: radius.full,
-          backgroundColor: neutral ? theme.surfaceRaised : theme.accentFaded,
+          backgroundColor: neutral ? theme.surfaceRaised : success ? theme.success : theme.accentFaded,
           borderWidth: neutral ? 1 : 0,
           borderColor: theme.border,
         },
@@ -250,7 +251,7 @@ export const Badge: React.FC<{
       ]}
     >
       {icon}
-      <RNText style={[typeScale.caption as TextStyle, { color: neutral ? theme.subtext : theme.accent, fontWeight: '600' }]}>
+      <RNText style={[typeScale.caption as TextStyle, { color: neutral ? theme.subtext : success ? theme.onSuccess : theme.accent, fontWeight: '600' }]}>
         {label}
       </RNText>
     </View>
