@@ -57,6 +57,14 @@ var ChatAgentSystemPrompt string
 //go:embed prompts/pantry_scan.txt
 var PantryScanPrompt string
 
+// VideoFramesPrompt reads the text burned into a cooking reel's frames (BACKLOG.md
+// 11.10) — the half the soundtrack leaves out, because the voiceover says "a good glug"
+// while the screen says "2 tbsp". Not part of PromptVersion: it produces the raw text
+// that feeds a generation, never a RecipeDocument itself.
+//
+//go:embed prompts/video_frames.txt
+var VideoFramesPrompt string
+
 // ThreadSummaryPrompt compresses the dropped span of an over-long thread into one
 // system message (BACKLOG.md 2.6). Cheap tier — it summarises text that is already in
 // hand, not a recipe.

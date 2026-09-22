@@ -22,33 +22,33 @@ func TestVideoTranscriptCache(t *testing.T) {
 		Pool.Exec(ctx, `DELETE FROM video_transcripts WHERE source_key = ANY($1)`, []string{spoken, silent})
 	})
 
-	if _, found, err := VideoTranscript(ctx, spoken); err != nil || found {
+	if _, _, found, err := VideoTranscript(ctx, spoken); err != nil || found {
 		t.Fatalf("empty cache: found=%v err=%v, want false/nil", found, err)
 	}
 
-	if err := PutVideoTranscript(ctx, spoken, "first the flour, then the water", 127); err != nil {
+	if err := PutVideoTranscript(ctx, spoken, "first the flour, then the water", "200g Mehl", 127); err != nil {
 		t.Fatalf("PutVideoTranscript: %v", err)
 	}
-	text, found, err := VideoTranscript(ctx, spoken)
-	if err != nil || !found || text != "first the flour, then the water" {
-		t.Fatalf("after write: %q found=%v err=%v", text, found, err)
+	text, screen, found, err := VideoTranscript(ctx, spoken)
+	if err != nil || !found || text != "first the flour, then the water" || screen != "200g Mehl" {
+		t.Fatalf("after write: %q/%q found=%v err=%v", text, screen, found, err)
 	}
 
 	// A reel with no speech in it. "" is an answer — without found, the caller would
 	// re-download and re-transcribe 27 MB every time to rediscover the same silence.
-	if err := PutVideoTranscript(ctx, silent, "", 31); err != nil {
+	if err := PutVideoTranscript(ctx, silent, "", "", 31); err != nil {
 		t.Fatalf("PutVideoTranscript(silent): %v", err)
 	}
-	if text, found, err := VideoTranscript(ctx, silent); err != nil || !found || text != "" {
-		t.Fatalf("silent reel: %q found=%v err=%v, want \"\"/true/nil", text, found, err)
+	if text, screen, found, err := VideoTranscript(ctx, silent); err != nil || !found || text != "" || screen != "" {
+		t.Fatalf("silent reel: %q/%q found=%v err=%v, want \"\"/true/nil", text, screen, found, err)
 	}
 
 	// DO NOTHING, like UpsertGrams: a second reader does not move an answer already
 	// stored, so two turns racing on one reel cannot disagree about what it said.
-	if err := PutVideoTranscript(ctx, spoken, "something else entirely", 9); err != nil {
+	if err := PutVideoTranscript(ctx, spoken, "something else entirely", "500g Zucker", 9); err != nil {
 		t.Fatalf("second write: %v", err)
 	}
-	if text, _, _ := VideoTranscript(ctx, spoken); text != "first the flour, then the water" {
+	if text, _, _, _ := VideoTranscript(ctx, spoken); text != "first the flour, then the water" {
 		t.Fatalf("second write moved the row: %q", text)
 	}
 }

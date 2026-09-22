@@ -396,17 +396,34 @@ func generateFromURL(ctx context.Context, url, prompt, preferredLanguage string)
 		return doc, err
 	}
 
-	// The page's text held no recipe. On a reel that usually means the recipe is spoken
-	// rather than written — read the soundtrack and try once more with both. Anything
-	// that is not a readable video (every ordinary webpage) comes straight back, and the
-	// original "no recipe in that" error stands.
-	transcript, terr := videoTranscript(ctx, url)
-	if terr != nil || strings.TrimSpace(transcript) == "" {
+	// The page's text held no recipe. On a reel that usually means the recipe is in the
+	// video rather than the page — spoken over it, and written on it — so read both and
+	// try once more with everything. Anything that is not a readable video (every
+	// ordinary webpage) comes straight back, and the original "no recipe in that" error
+	// stands.
+	reading, terr := videoTranscript(ctx, url)
+	if terr != nil {
 		return model.RecipeDocument{}, err
 	}
-	slog.DebugContext(ctx, "generate/url: retrying with the video's transcript", "chars", len(transcript))
-	return generateStructured(ctx, language, openai.TextContentPart(
-		userText+"\n\n"+content+"\n\nSpoken transcript of the video on that page:\n"+transcript))
+	transcript, screen := strings.TrimSpace(reading.Transcript), strings.TrimSpace(reading.ScreenText)
+	if transcript == "" && screen == "" {
+		return model.RecipeDocument{}, err
+	}
+	slog.DebugContext(ctx, "generate/url: retrying with the video itself",
+		"transcript_chars", len(transcript), "screen_chars", len(screen))
+
+	// The screen is labelled as the authority on amounts, because it is: the voiceover
+	// says "a good glug" over a frame that says 2 tbsp, and without this the model
+	// averages the two into a guess (BACKLOG 11.10).
+	source := userText + "\n\n" + content
+	if transcript != "" {
+		source += "\n\nSpoken transcript of the video on that page:\n" + transcript
+	}
+	if screen != "" {
+		source += "\n\nText shown on screen in that video — where this and the transcript disagree" +
+			" about an amount, an ingredient or a temperature, this is the one to trust:\n" + screen
+	}
+	return generateStructured(ctx, language, openai.TextContentPart(source))
 }
 
 func generateFromImage(ctx context.Context, file io.Reader, prompt, preferredLanguage string) (model.RecipeDocument, error) {
