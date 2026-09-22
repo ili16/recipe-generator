@@ -8,6 +8,7 @@
 import React, { ReactNode, useMemo } from 'react';
 import {
   ActivityIndicator,
+  Animated,
   Modal,
   Platform,
   Pressable,
@@ -23,6 +24,10 @@ import {
 import { Theme, useTheme } from '../../context/ThemeContext';
 import { useLanguage } from '../../context/LanguageContext';
 import { layout, radius, space, type as typeScale } from '../../theme';
+import { useSwipe } from '../../hooks/useSwipe';
+
+export { SwipeRow } from './SwipeRow';
+export type { SwipeAction } from './SwipeRow';
 
 /** True on a wide viewport. The one breakpoint (5.1) — do not compare widths anywhere else. */
 export const useIsWide = () => useWindowDimensions().width >= layout.breakpointWide;
@@ -301,7 +306,11 @@ export const SignInRequired: React.FC<{
 /* ── Sheet ────────────────────────────────────────────────────────────────── */
 
 /**
- * Bottom sheet: tap the scrim to dismiss. No drag handle — nothing needs one yet.
+ * Bottom sheet: drag it down to dismiss, or tap the scrim.
+ *
+ * The drag is the point on a phone — the scrim is the top third of the screen and the thumb
+ * is at the bottom. Downwards only: there is nowhere above for the sheet to go, so `useSwipe`
+ * is given no `onLeft` and the sheet simply does not move upwards.
  *
  * The sheet body is a `Pressable` with a no-op `onPress` so it becomes the touch responder
  * and the scrim's dismiss never fires for a press *inside* the sheet. Without it, focusing a
@@ -315,14 +324,29 @@ export const Sheet: React.FC<{
   children?: ReactNode;
 }> = ({ visible, onClose, title, children }) => {
   const { theme } = useTheme();
+  const { t } = useLanguage();
   const styles = useMemo(() => makeSheetStyles(theme), [theme]);
+  const { panHandlers, offset } = useSwipe({ axis: 'y', threshold: 80, onRight: onClose });
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
-      <Pressable style={styles.overlay} onPress={onClose} accessibilityLabel="Close">
-        <Pressable style={styles.sheet} onPress={() => { /* swallow: see the note above */ }}>
-          {title ? <Text variant="label" tone="muted">{title}</Text> : null}
-          {children}
-        </Pressable>
+      <Pressable style={styles.overlay} onPress={onClose} accessibilityLabel={t('common.close')}>
+        <Animated.View style={{ transform: [{ translateY: offset }] }}>
+          <Pressable style={styles.sheet} onPress={() => { /* swallow: see the note above */ }}>
+            {/* The handle carries the whole gesture: the sheet body holds rows and inputs
+                that need their own touches, and a drag starting on one of those is far more
+                likely to be a mis-scroll than a dismiss. */}
+            <View
+              style={styles.grabZone}
+              accessibilityRole="button"
+              accessibilityLabel={t('common.close')}
+              {...panHandlers}
+            >
+              <View style={styles.grabber} />
+            </View>
+            {title ? <Text variant="label" tone="muted">{title}</Text> : null}
+            {children}
+          </Pressable>
+        </Animated.View>
       </Pressable>
     </Modal>
   );
@@ -334,6 +358,8 @@ const makeSheetStyles = (t: Theme) => StyleSheet.create({
     backgroundColor: t.overlay,
     justifyContent: 'flex-end',
   },
+  grabZone: { alignItems: 'center', paddingBottom: space.sm, marginTop: -space.md },
+  grabber: { width: 36, height: 4, borderRadius: radius.full, backgroundColor: t.border },
   sheet: {
     backgroundColor: t.surface,
     borderTopLeftRadius: radius.xl,

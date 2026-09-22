@@ -5,6 +5,7 @@ import authService from '../services/authService';
 import { mealPlanCacheKeys } from '../constants';
 import { MealPlanItem, MEAL_SLOTS, Recipe } from '../types';
 import { toISODate, addDays, parseISODate } from '../utils/mealPlanDates';
+import { missingFromOffline } from '../utils/offlineRecipeStore';
 
 interface MealPlanContextValue {
   /** Every meal planned for a date, in the order the day is eaten (BACKLOG 6.4). */
@@ -75,6 +76,33 @@ export const MealPlanProvider: React.FC<{ children: ReactNode }> = ({ children }
       refreshRecipes();
     })();
   }, [refreshRecipes]);
+
+  // Make the next 7 days cookable without a network (BACKLOG 12.4). The list payload
+  // carries no structured document, so being able to *see* a planned week offline is not
+  // the same as being able to cook one: each planned recipe has to be fetched once, while
+  // there is still signal. `getRecipeById` is what fills the cache, so this is a
+  // prefetch, not a second cache — and `missingFromOffline` means it spends a request per
+  // recipe exactly once.
+  useEffect(() => {
+    if (!hydrated.current) return;
+    const today = toISODate(new Date());
+    const until = toISODate(addDays(new Date(), 7));
+    const ids = Object.entries(itemsByDate)
+      .filter(([iso]) => iso >= today && iso <= until)
+      .flatMap(([, items]) => items.map(i => i.recipe_id));
+    if (ids.length === 0) return;
+    let cancelled = false;
+    missingFromOffline([...new Set(ids)]).then(missing => {
+      if (cancelled) return;
+      // Sequential on purpose: this runs in the background behind a screen the user is
+      // already reading, and a week of parallel requests would compete with it.
+      return missing.reduce(
+        (chain, id) => chain.then(() => cancelled ? undefined : apiService.getRecipeById(id).then(() => {}, () => {})),
+        Promise.resolve<void>(undefined),
+      );
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [itemsByDate]);
 
   const persistItems = useCallback((next: Record<string, MealPlanItem[]>) => {
     if (!userIdRef.current) return;

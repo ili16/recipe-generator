@@ -1,11 +1,11 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import { View, StyleSheet, TouchableOpacity } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { MealPlanItem, MealSlot, MEAL_SLOTS, Recipe } from '../../types';
 import { Theme, useTheme } from '../../context/ThemeContext';
 import { useLanguage } from '../../context/LanguageContext';
 import { radius, space } from '../../theme';
-import { Badge, Text } from '../../components/ui';
+import { Badge, SwipeRow, Text, useIsWide } from '../../components/ui';
 import { totalTimeMinutes } from '../../utils/recipeTime';
 
 /**
@@ -77,6 +77,9 @@ const DayCard: React.FC<Props> = ({ day, onCook, onSwap, onMore, onAdd, onClear,
   const { theme } = useTheme();
   const { t } = useLanguage();
   const styles = useMemo(() => makeStyles(theme), [theme]);
+  // On a phone a meal is one line until you ask for more; a wide viewport has the room for
+  // the full body and keeps rendering exactly what it rendered before (BACKLOG 12.5).
+  const compact = !useIsWide();
 
   const allRepeats = day.meals.length > 0 && day.meals.every(m => m.kind !== 'cook');
   // Every slot taken: "Add a meal" could only ever replace something, and a control whose
@@ -134,6 +137,7 @@ const DayCard: React.FC<Props> = ({ day, onCook, onSwap, onMore, onAdd, onClear,
           // the rows apart once it isn't.
           showSlot={day.meals.length > 1 || meal.slot !== 'dinner'}
           divided={i > 0}
+          compact={compact}
           onCook={onCook}
           onSwap={onSwap}
           onMore={onMore}
@@ -162,6 +166,8 @@ const MealRow: React.FC<{
   weekday: string;
   showSlot: boolean;
   divided: boolean;
+  /** Narrow: one line, the rest behind a tap. */
+  compact: boolean;
   onCook: (recipe: Recipe) => void;
   onSwap: (slot: MealSlot) => void;
   onMore: (meal: PlannedMeal) => void;
@@ -169,10 +175,11 @@ const MealRow: React.FC<{
   householdSize: number | null;
   onScale: (meal: PlannedMeal, servings: number) => void;
   onUncook: (meal: PlannedMeal) => void;
-}> = ({ meal, weekday, showSlot, divided, onCook, onSwap, onMore, onClear, householdSize, onScale, onUncook }) => {
+}> = ({ meal, weekday, showSlot, divided, compact, onCook, onSwap, onMore, onClear, householdSize, onScale, onUncook }) => {
   const { theme } = useTheme();
   const { t } = useLanguage();
   const styles = useMemo(() => makeStyles(theme), [theme]);
+  const [expanded, setExpanded] = useState(false);
 
   const doc = meal.recipe?.structured;
   const minutes = totalTimeMinutes(doc);
@@ -185,133 +192,204 @@ const MealRow: React.FC<{
   const needed = householdSize != null ? householdSize * (1 + meal.covers) : null;
   const mismatch = !repeat && planned != null && needed != null && planned !== needed;
 
+  // Collapsed is the phone's default: slot, title, time, and the one button that matters.
+  const collapsed = compact && !expanded;
+
+  // The swipes (BACKLOG 12.5). Both are accelerators — Swap and Clear are still buttons and
+  // still sheet rows, because a gesture is invisible to a screen reader.
+  // A cooked meal gets neither: its ingredients are already out of the pantry, so clearing it
+  // would silently strand that deduction, and swapping a meal you have eaten is nonsense.
+  const swipeSwap = meal.cooked || repeat
+    ? undefined
+    : { icon: 'swap-horizontal' as const, label: t('plan.swap'), onAction: () => onSwap(meal.slot) };
+  const swipeClear = meal.cooked
+    ? undefined
+    : {
+        icon: 'close' as const,
+        label: t(repeat ? 'plan.notEatingThis' : 'common.clear'),
+        tone: 'danger' as const,
+        onAction: () => onClear(meal),
+      };
+
   return (
-    <View style={[styles.body, divided && styles.divided, meal.cooked && styles.cookedBody]}>
-      {showSlot && (
-        <Text variant="caption" tone="muted">
-          {t(slotLabelKey(meal.slot)).toUpperCase()}
-          {repeat ? ` · ${t(kindLabelKey(meal.kind))}` : ''}
-        </Text>
-      )}
-      <Text variant="title" numberOfLines={2}>{meal.title}</Text>
-
-      {meal.cooked && (
-        <View style={styles.cookedRow}>
-          <Ionicons name="checkmark-circle" size={14} color={theme.accent} />
-          <Text variant="caption" tone="accent">{t('plan.cooked')}</Text>
-        </View>
-      )}
-
-      {repeat && (
-        <Text variant="caption" tone="accent">
-          {t(meal.kind === 'leftover' ? 'plan.leftoversFrom' : 'plan.batchCookedOn', { day: meal.carriedFrom })}
-        </Text>
-      )}
-
-      {doc?.summary ? (
-        <Text variant="body" tone="subtle" numberOfLines={2}>{doc.summary}</Text>
-      ) : null}
-
-      {/* A fact and the one-tap fix, where the servings badge already is: not a modal, not
-          a blocking error, not a red border (BACKLOG 9.12). */}
-      {mismatch && (
-        <TouchableOpacity
-          style={styles.mismatch}
-          onPress={() => onScale(meal, needed!)}
-          accessibilityRole="button"
-          accessibilityLabel={t('plan.scaleA11y', { planned, needed })}
-        >
-          <Ionicons name="alert-circle-outline" size={14} color={theme.accent} />
-          <Text variant="caption" tone="accent">
-            {t('plan.mismatch', { planned, needed })}
-          </Text>
-        </TouchableOpacity>
-      )}
-
-      <View style={styles.badges}>
-        {minutes > 0 && (
-          <Badge
-            tone="neutral"
-            label={t(repeat ? 'plan.minutesWhenCooked' : 'plan.minutes', { minutes })}
-            icon={<Ionicons name="time-outline" size={12} color={theme.accent} />}
-          />
-        )}
-        {/* How much gets cooked belongs to the day that cooks, so a leftover reads its
-            share of that pot rather than a number it could edit (BACKLOG 9.11). */}
-        {repeat ? (
-          meal.portion && (
-            <Badge
-              tone="neutral"
-              label={t('plan.portionOf', { index: meal.portion.index, total: meal.portion.total })}
-              icon={<Ionicons name="people-outline" size={12} color={theme.accent} />}
-            />
-          )
-        ) : (meal.servings ?? doc?.servings) != null ? (
-          <Badge
-            tone="neutral"
-            label={meal.servings != null
-              ? t('plan.cookingForCount', { count: meal.servings })
-              : t('plan.servingsCount', { count: doc?.servings })}
-            icon={<Ionicons name="people-outline" size={12} color={theme.accent} />}
-          />
-        ) : null}
-      </View>
-
-      {/* A leftover is food that already exists, so every action that edits a *plan* was
-          nonsense on it: swapping the contents of the fridge, stepping up how much of it was
-          cooked, asking the assistant to change a plate. One decision is left — am I eating
-          this — so that is the one control (BACKLOG 9.11). */}
-      {meal.cooked ? (
-        <View style={styles.actions}>
-          {/* Undo puts the meal back on the plan and back on the grocery list. It does not
-              put the pantry back — WeekView says so, rather than letting the user assume. */}
-          <TouchableOpacity
-            style={styles.ghostBtn}
-            onPress={() => onUncook(meal)}
-            accessibilityRole="button"
-          >
-            <Ionicons name="arrow-undo-outline" size={14} color={theme.subtext} />
-            <Text variant="label" tone="subtle">{t('plan.undoCook')}</Text>
-          </TouchableOpacity>
-        </View>
-      ) : repeat ? (
-        <View style={styles.actions}>
-          <TouchableOpacity
-            style={styles.ghostBtn}
-            onPress={() => onClear(meal)}
-            accessibilityRole="button"
-            accessibilityLabel={t('plan.notEatingA11y', { weekday, slot: t(slotLabelKey(meal.slot)).toLowerCase() })}
-          >
-            <Ionicons name="close" size={14} color={theme.subtext} />
-            <Text variant="label" tone="subtle">{t('plan.notEatingThis')}</Text>
-          </TouchableOpacity>
+    <SwipeRow
+      left={swipeSwap}
+      right={swipeClear}
+      style={styles.rowRadius}
+      onPress={collapsed ? () => setExpanded(true) : undefined}
+      onLongPress={() => onMore(meal)}
+      accessibilityLabel={t('plan.moreOptionsA11y', { weekday, slot: t(slotLabelKey(meal.slot)).toLowerCase() })}
+    >
+      <View style={[styles.body, divided && styles.divided, meal.cooked && styles.cookedBody]}>
+      {collapsed ? (
+        <View style={styles.compactRow}>
+          <View style={styles.compactText}>
+            {showSlot && (
+              <Text variant="caption" tone="muted">
+                {t(slotLabelKey(meal.slot)).toUpperCase()}
+                {repeat ? ` · ${t(kindLabelKey(meal.kind))}` : ''}
+              </Text>
+            )}
+            <Text variant="body" numberOfLines={1}>{meal.title}</Text>
+          </View>
+          {/* The mismatch is a correctness signal, so it survives the collapse as an icon —
+              the one-tap fix is inside, where there is room to say what it would do. */}
+          {mismatch && <Ionicons name="alert-circle-outline" size={16} color={theme.accent} />}
+          {minutes > 0 && <Text variant="caption" tone="subtle">{t('plan.minutes', { minutes })}</Text>}
+          {meal.cooked ? (
+            <Ionicons name="checkmark-circle" size={20} color={theme.accent} />
+          ) : !repeat && meal.recipe ? (
+            <TouchableOpacity
+              style={styles.cookIcon}
+              onPress={() => onCook(meal.recipe!)}
+              accessibilityRole="button"
+              accessibilityLabel={t('plan.startCooking')}
+            >
+              <Ionicons name="flame" size={16} color={theme.onAccent} />
+            </TouchableOpacity>
+          ) : null}
+          <Ionicons name="chevron-down" size={14} color={theme.muted} />
         </View>
       ) : (
-      <View style={styles.actions}>
-        {/* Cook needs the full recipe, which the library cache may not hold yet for a recipe
-            saved elsewhere this session. No recipe, no button — rather than a button that
-            fails. */}
-        {meal.recipe && (
-          <TouchableOpacity style={styles.cookBtn} onPress={() => onCook(meal.recipe!)} accessibilityRole="button">
-            <Ionicons name="flame-outline" size={14} color={theme.onAccent} />
-            <Text variant="label" style={{ color: theme.onAccent }}>{t('plan.startCooking')}</Text>
+        <>
+          {showSlot && (
+            <Text variant="caption" tone="muted">
+              {t(slotLabelKey(meal.slot)).toUpperCase()}
+              {repeat ? ` · ${t(kindLabelKey(meal.kind))}` : ''}
+            </Text>
+          )}
+          <Text variant="title" numberOfLines={2}>{meal.title}</Text>
+
+          {meal.cooked && (
+            <View style={styles.cookedRow}>
+              <Ionicons name="checkmark-circle" size={14} color={theme.accent} />
+              <Text variant="caption" tone="accent">{t('plan.cooked')}</Text>
+            </View>
+          )}
+
+          {repeat && (
+            <Text variant="caption" tone="accent">
+              {t(meal.kind === 'leftover' ? 'plan.leftoversFrom' : 'plan.batchCookedOn', { day: meal.carriedFrom })}
+            </Text>
+          )}
+
+          {doc?.summary ? (
+            <Text variant="body" tone="subtle" numberOfLines={2}>{doc.summary}</Text>
+          ) : null}
+
+          {/* A fact and the one-tap fix, where the servings badge already is: not a modal, not
+              a blocking error, not a red border (BACKLOG 9.12). */}
+          {mismatch && (
+            <TouchableOpacity
+              style={styles.mismatch}
+              onPress={() => onScale(meal, needed!)}
+              accessibilityRole="button"
+              accessibilityLabel={t('plan.scaleA11y', { planned, needed })}
+            >
+              <Ionicons name="alert-circle-outline" size={14} color={theme.accent} />
+              <Text variant="caption" tone="accent">
+                {t('plan.mismatch', { planned, needed })}
+              </Text>
+            </TouchableOpacity>
+          )}
+
+          <View style={styles.badges}>
+            {minutes > 0 && (
+              <Badge
+                tone="neutral"
+                label={t(repeat ? 'plan.minutesWhenCooked' : 'plan.minutes', { minutes })}
+                icon={<Ionicons name="time-outline" size={12} color={theme.accent} />}
+              />
+            )}
+            {/* How much gets cooked belongs to the day that cooks, so a leftover reads its
+                share of that pot rather than a number it could edit (BACKLOG 9.11). */}
+            {repeat ? (
+              meal.portion && (
+                <Badge
+                  tone="neutral"
+                  label={t('plan.portionOf', { index: meal.portion.index, total: meal.portion.total })}
+                  icon={<Ionicons name="people-outline" size={12} color={theme.accent} />}
+                />
+              )
+            ) : (meal.servings ?? doc?.servings) != null ? (
+              <Badge
+                tone="neutral"
+                label={meal.servings != null
+                  ? t('plan.cookingForCount', { count: meal.servings })
+                  : t('plan.servingsCount', { count: doc?.servings })}
+                icon={<Ionicons name="people-outline" size={12} color={theme.accent} />}
+              />
+            ) : null}
+          </View>
+
+          {/* A leftover is food that already exists, so every action that edits a *plan* was
+              nonsense on it: swapping the contents of the fridge, stepping up how much of it was
+              cooked, asking the assistant to change a plate. One decision is left — am I eating
+              this — so that is the one control (BACKLOG 9.11). */}
+          {meal.cooked ? (
+            <View style={styles.actions}>
+              {/* Undo puts the meal back on the plan and back on the grocery list. It does not
+                  put the pantry back — WeekView says so, rather than letting the user assume. */}
+              <TouchableOpacity
+                style={styles.ghostBtn}
+                onPress={() => onUncook(meal)}
+                accessibilityRole="button"
+              >
+                <Ionicons name="arrow-undo-outline" size={14} color={theme.subtext} />
+                <Text variant="label" tone="subtle">{t('plan.undoCook')}</Text>
+              </TouchableOpacity>
+            </View>
+          ) : repeat ? (
+            <View style={styles.actions}>
+              <TouchableOpacity
+                style={styles.ghostBtn}
+                onPress={() => onClear(meal)}
+                accessibilityRole="button"
+                accessibilityLabel={t('plan.notEatingA11y', { weekday, slot: t(slotLabelKey(meal.slot)).toLowerCase() })}
+              >
+                <Ionicons name="close" size={14} color={theme.subtext} />
+                <Text variant="label" tone="subtle">{t('plan.notEatingThis')}</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+          <View style={styles.actions}>
+            {/* Cook needs the full recipe, which the library cache may not hold yet for a recipe
+                saved elsewhere this session. No recipe, no button — rather than a button that
+                fails. */}
+            {meal.recipe && (
+              <TouchableOpacity style={styles.cookBtn} onPress={() => onCook(meal.recipe!)} accessibilityRole="button">
+                <Ionicons name="flame-outline" size={14} color={theme.onAccent} />
+                <Text variant="label" style={{ color: theme.onAccent }}>{t('plan.startCooking')}</Text>
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity style={styles.ghostBtn} onPress={() => onSwap(meal.slot)} accessibilityRole="button">
+              <Ionicons name="swap-horizontal" size={14} color={theme.accent} />
+              <Text variant="label" tone="accent">{t('plan.swap')}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.ghostBtn}
+              onPress={() => onMore(meal)}
+              accessibilityRole="button"
+              accessibilityLabel={t('plan.moreOptionsA11y', { weekday, slot: t(slotLabelKey(meal.slot)).toLowerCase() })}
+            >
+              <Ionicons name="ellipsis-horizontal" size={16} color={theme.subtext} />
+            </TouchableOpacity>
+          </View>
+          )}
+        {compact && (
+          <TouchableOpacity
+            style={styles.collapseRow}
+            onPress={() => setExpanded(false)}
+            accessibilityRole="button"
+            accessibilityLabel={t('plan.showLess')}
+          >
+            <Ionicons name="chevron-up" size={14} color={theme.muted} />
           </TouchableOpacity>
         )}
-        <TouchableOpacity style={styles.ghostBtn} onPress={() => onSwap(meal.slot)} accessibilityRole="button">
-          <Ionicons name="swap-horizontal" size={14} color={theme.accent} />
-          <Text variant="label" tone="accent">{t('plan.swap')}</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={styles.ghostBtn}
-          onPress={() => onMore(meal)}
-          accessibilityRole="button"
-          accessibilityLabel={t('plan.moreOptionsA11y', { weekday, slot: t(slotLabelKey(meal.slot)).toLowerCase() })}
-        >
-          <Ionicons name="ellipsis-horizontal" size={16} color={theme.subtext} />
-        </TouchableOpacity>
-      </View>
+        </>
       )}
-    </View>
+      </View>
+    </SwipeRow>
   );
 };
 
@@ -344,6 +422,16 @@ const makeStyles = (t: Theme) => StyleSheet.create({
   cookedBody: { opacity: 0.6 },
   cookedRow: { flexDirection: 'row', alignItems: 'center', gap: space.xs },
   body: { padding: space.md, gap: space.sm },
+  // The SwipeRow wrapper rounds its own corners; inside a card that already has them, a row
+  // must not.
+  rowRadius: { borderRadius: 0 },
+  compactRow: { flexDirection: 'row', alignItems: 'center', gap: space.sm },
+  compactText: { flex: 1, gap: 2 },
+  cookIcon: {
+    width: 36, height: 36, borderRadius: radius.full,
+    alignItems: 'center', justifyContent: 'center', backgroundColor: t.accent,
+  },
+  collapseRow: { alignItems: 'center', paddingTop: space.xs },
   divided: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: t.border },
   addRow: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: space.xs,

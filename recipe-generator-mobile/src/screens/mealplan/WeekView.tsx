@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { View, StyleSheet, ScrollView, TouchableOpacity } from 'react-native';
+import { Animated, View, StyleSheet, ScrollView, TouchableOpacity } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import apiService from '../../services/apiService';
-import { Recipe, MealPlanItem, MealSlot, MEAL_SLOTS } from '../../types';
+import { Recipe, MealPlanItem, MealSlot } from '../../types';
 import { useTheme, Theme } from '../../context/ThemeContext';
 import { useAlert } from '../../context/AlertContext';
 import { useLanguage } from '../../context/LanguageContext';
@@ -19,6 +19,7 @@ import { buildWeek } from './planDays';
 import { usePreferences } from '../../hooks/usePreferences';
 import { radius, space } from '../../theme';
 import { Button, Chip, Sheet, SheetRow, Text } from '../../components/ui';
+import { useSwipe } from '../../hooks/useSwipe';
 
 interface Props {
   selectedDate: Date;
@@ -55,11 +56,23 @@ const WeekView: React.FC<Props> = ({ selectedDate, onChangeDate, navigation }) =
   // PlannedMeal itself: a snapshot goes stale the moment the stepper writes, so the number
   // never moved and every tap re-sent the same value (BACKLOG 9.8).
   const [sheetKey, setSheetKey] = useState<{ iso: string; slot: MealSlot } | null>(null);
-  const [picker, setPicker] = useState<{ iso: string; slot: MealSlot } | null>(null);
-  const [slotChoiceDay, setSlotChoiceDay] = useState<string | null>(null);
+  // The slot is undefined when the picker was opened by "Add a meal": the picker asks for it
+  // with a row of chips instead of a whole sheet of its own (BACKLOG 12.5).
+  const [picker, setPicker] = useState<{ iso: string; slot?: MealSlot } | null>(null);
   // The batch-cook control (BACKLOG 9.13): which cooking day is being extended, and the
   // days ticked so far. One control, two directions — unticking a day is the undo.
   const [covers, setCovers] = useState<{ item: MealPlanItem; picked: string[] } | null>(null);
+
+  // Changing the week is a swipe on the week strip, not only a pair of 16px chevrons. It sits
+  // on the strip rather than over the day cards on purpose: the cards swipe too (a meal's
+  // Swap and Clear), and two horizontal gestures stacked on the same pixels means whichever
+  // wins the responder is the one the user did not mean.
+  const weekSwipe = useSwipe({
+    axis: 'x',
+    threshold: 56,
+    onLeft: () => onChangeDate(addDays(selectedDate, 7)),
+    onRight: () => onChangeDate(addDays(selectedDate, -7)),
+  });
 
   const { theme } = useTheme();
   const { showAlert, confirmAction } = useAlert();
@@ -85,9 +98,9 @@ const WeekView: React.FC<Props> = ({ selectedDate, onChangeDate, navigation }) =
   // Writing to a taken slot is a delete plus an insert server-side (storage/mealplan.go),
   // so ask first — the agent path already does, and the UI path silently destroyed a meal
   // (BACKLOG 9.10). An empty slot still writes silently: adding is not a decision.
-  const assign = async (recipe: Recipe) => {
+  const assign = async (recipe: Recipe, slot: MealSlot) => {
     if (!picker) return;
-    const { iso, slot } = picker;
+    const { iso } = picker;
     const taken = mealAt(iso, slot);
     setPicker(null);
     if (taken) {
@@ -266,6 +279,7 @@ const WeekView: React.FC<Props> = ({ selectedDate, onChangeDate, navigation }) =
   const sheetItem = sheetMeal?.item ?? null;
   const sheetWeekday = sheetDay?.weekday ?? '';
   const planned = days.filter(d => d.meals.length > 0).length;
+  const showsThisWeek = weekStartISO === toISODate(startOfWeek(new Date(), prefs?.week_start_day ?? 'monday'));
   // Unset servings mean "as the recipe is written", so the stepper starts from what the
   // recipe yields (or 2, when the library cache doesn't know) rather than from zero.
   const sheetServings = sheetItem?.servings ?? sheetMeal?.recipe?.structured?.servings ?? 2;
@@ -273,7 +287,11 @@ const WeekView: React.FC<Props> = ({ selectedDate, onChangeDate, navigation }) =
   return (
     <View style={styles.container}>
       <ScrollView contentContainerStyle={styles.list}>
-        <View style={styles.weekNav}>
+        <Animated.View
+          style={[styles.weekNav, { transform: [{ translateX: weekSwipe.offset }] }]}
+          {...weekSwipe.panHandlers}
+          accessibilityHint={t('plan.swipeWeekHint')}
+        >
           <TouchableOpacity
             onPress={() => onChangeDate(addDays(selectedDate, -7))}
             style={styles.navButton}
@@ -282,12 +300,20 @@ const WeekView: React.FC<Props> = ({ selectedDate, onChangeDate, navigation }) =
           >
             <Ionicons name="chevron-back" size={16} color={theme.subtext} />
           </TouchableOpacity>
-          <Text variant="caption" tone="subtle">
-            {weekStart.toLocaleDateString(locale, { month: 'short', day: 'numeric' })}
-            {' – '}
-            {addDays(weekStart, 6).toLocaleDateString(locale, { month: 'short', day: 'numeric' })}
-            {`  ·  ${t('plan.plannedOfSeven', { count: planned })}`}
-          </Text>
+          <View style={styles.weekLabel}>
+            <Text variant="caption" tone="subtle">
+              {weekStart.toLocaleDateString(locale, { month: 'short', day: 'numeric' })}
+              {' – '}
+              {addDays(weekStart, 6).toLocaleDateString(locale, { month: 'short', day: 'numeric' })}
+              {`  ·  ${t('plan.plannedOfSeven', { count: planned })}`}
+            </Text>
+            {/* There was no way back to the current week once you had paged away. */}
+            {!showsThisWeek && (
+              <TouchableOpacity onPress={() => onChangeDate(new Date())} accessibilityRole="button">
+                <Text variant="caption" tone="accent">{t('plan.backToThisWeek')}</Text>
+              </TouchableOpacity>
+            )}
+          </View>
           <TouchableOpacity
             onPress={() => onChangeDate(addDays(selectedDate, 7))}
             style={styles.navButton}
@@ -296,7 +322,7 @@ const WeekView: React.FC<Props> = ({ selectedDate, onChangeDate, navigation }) =
           >
             <Ionicons name="chevron-forward" size={16} color={theme.subtext} />
           </TouchableOpacity>
-        </View>
+        </Animated.View>
 
         {days.map(day => (
           <DayCard
@@ -305,7 +331,7 @@ const WeekView: React.FC<Props> = ({ selectedDate, onChangeDate, navigation }) =
             onCook={recipe => navigation.navigate('CookingMode', { recipe })}
             onSwap={slot => setPicker({ iso: day.iso, slot })}
             onMore={meal => setSheetKey({ iso: meal.item.planned_on, slot: meal.slot })}
-            onAdd={() => setSlotChoiceDay(day.iso)}
+            onAdd={() => setPicker({ iso: day.iso })}
             onClear={meal => clear(meal.item)}
             householdSize={prefs?.household_size ?? null}
             onScale={(meal, servings) => setServings(meal.item, servings)}
@@ -393,29 +419,6 @@ const WeekView: React.FC<Props> = ({ selectedDate, onChangeDate, navigation }) =
         {sheetItem && <SheetRow label={t('common.clear')} destructive onPress={() => clear(sheetItem)} />}
       </Sheet>
 
-      {/* Which meal the new dish is — asked only when adding a second one, since the
-          empty card and Swap already know the slot they mean. */}
-      <Sheet visible={slotChoiceDay !== null} onClose={() => setSlotChoiceDay(null)} title={t('plan.whichMeal')}>
-        {MEAL_SLOTS.map(slot => {
-          // A slot that is taken says so and says what it would cost, rather than reading
-          // like the three empty ones next to it (BACKLOG 9.10).
-          const taken = slotChoiceDay ? mealAt(slotChoiceDay, slot) : undefined;
-          return (
-            <SheetRow
-              key={slot}
-              label={taken
-                ? t('plan.replaceSlot', { slot: t(slotLabelKey(slot)).toLowerCase(), title: taken.title })
-                : t(slotLabelKey(slot))}
-              destructive={!!taken}
-              onPress={() => {
-                setPicker({ iso: slotChoiceDay!, slot });
-                setSlotChoiceDay(null);
-              }}
-            />
-          );
-        })}
-      </Sheet>
-
       {/* Tick the days this pot covers. Reopening it on a day that already batch-cooks
           shows what it covers now, so unticking is the undo (BACKLOG 9.13). */}
       <Sheet visible={covers !== null} onClose={() => setCovers(null)} title={t('plan.whichDaysCovered')}>
@@ -448,6 +451,9 @@ const WeekView: React.FC<Props> = ({ selectedDate, onChangeDate, navigation }) =
         visible={picker !== null}
         recipes={recipes}
         slot={picker?.slot}
+        takenSlots={picker ? Object.fromEntries(
+          (dayOf(picker.iso)?.meals ?? []).map(m => [m.slot, m.title]),
+        ) as Partial<Record<MealSlot, string>> : {}}
         onSelect={assign}
         onClose={() => setPicker(null)}
       />
@@ -462,7 +468,9 @@ const makeStyles = (t: Theme) => StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    paddingVertical: space.sm,
   },
+  weekLabel: { alignItems: 'center', gap: 2 },
   navButton: { padding: space.xs },
   servingsRow: {
     flexDirection: 'row',

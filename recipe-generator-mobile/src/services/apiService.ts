@@ -4,6 +4,8 @@ import { API_BASE_URL, API_ENDPOINTS } from '../constants';
 import { Recipe, RecipeDocument, RecipeResponse, PatchRecipePayload, GenerationOrigin, EditTurn, RecipeVersion, UserPreferences, MealPlanWeek, MealPlanItem, MealSlot, MealPlanSuggestion, GroceryList, GroceryTick, SharedPlan, ChatStreamEvent, ChatAttachment, Collection, PantryItem, FeedbackPayload, Household, CookedResult, ConversationSummary, ConversationThread, Usage } from '../types';
 import authService from './authService';
 import { currentLocale } from '../i18n';
+import { isOffline } from '../utils/offlineRecipes';
+import { offlineRecipe, rememberForOffline } from '../utils/offlineRecipeStore';
 
 // The language sent on every /chat turn. It is the only language signal the backend has
 // left since POST /generate (and its `language` form field) was deleted — the agent uses
@@ -81,8 +83,17 @@ class ApiService {
     defaultEvent: string,
     signal?: AbortSignal,
   ): Promise<void> {
-    const send = (token: string | null) =>
-      fetch(`${API_BASE_URL}/${path}`, { ...init(token), signal });
+    // A raw fetch rejects with a bare TypeError when there is no network, where axios
+    // rejects with an ApiError carrying no status. Normalising here is what lets one
+    // `isOffline` check cover both (BACKLOG 12.4).
+    const send = async (token: string | null) => {
+      try {
+        return await fetch(`${API_BASE_URL}/${path}`, { ...init(token), signal });
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') throw err;
+        throw new ApiError(err instanceof Error ? err.message : 'request failed');
+      }
+    };
 
     let response = await send(await authService.getAccessToken());
     if (response.status === 401) {
@@ -384,9 +395,21 @@ class ApiService {
     return response.data;
   }
 
+  // The one read that returns a recipe's structured document, and so the one place worth
+  // an offline copy: cooking mode and the library card both come through here
+  // (BACKLOG 12.4). Every success tops the cache up; a request that never reached the
+  // server falls back to it, so a hob with no wifi still has steps. A 4xx/5xx does not —
+  // a deleted recipe must not come back from a cache.
   async getRecipeById(recipeId: number): Promise<Recipe> {
-    const response = await this.client.get<Recipe>(`${API_ENDPOINTS.GET_RECIPE}/${recipeId}`);
-    return response.data;
+    try {
+      const response = await this.client.get<Recipe>(`${API_ENDPOINTS.GET_RECIPE}/${recipeId}`);
+      void rememberForOffline([response.data]);
+      return response.data;
+    } catch (err) {
+      const cached = isOffline(err) ? await offlineRecipe(recipeId) : null;
+      if (cached) return cached;
+      throw err;
+    }
   }
 
   // What the cook uses instead on one ingredient line (BACKLOG 17.4c). An empty

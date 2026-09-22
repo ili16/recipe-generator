@@ -67,6 +67,7 @@ const RecipeView: React.FC<Props> = ({ structured, markdown, showSteps = true, s
   const [ownServings, setOwnServings] = useState<number | null>(null);
   // Which line's swap sheet is open, null for none.
   const [swapping, setSwapping] = useState<{ sortOrder: number; ing: Ingredient } | null>(null);
+  const [hideInPantry, setHideInPantry] = useState(false);
   const baseServings = structured?.servings ?? null;
   const wanted = servings ?? ownServings ?? baseServings;
   const setWanted = (n: number) => {
@@ -100,8 +101,12 @@ const RecipeView: React.FC<Props> = ({ structured, markdown, showSteps = true, s
   // recipes with no sections fall into a single unlabeled group.
   // sortOrder rides along because the grouping below loses the line's position in the
   // recipe, and that position is the key a swap is filed under.
+  // Hiding what the kitchen already holds turns the list into "what I still need" — the
+  // question it is usually read for (BACKLOG 12.6). Per-reading, so nothing is persisted.
+  const heldCount = structured!.ingredients.filter(i => i.in_pantry).length;
   const sections = new Map<string, Array<{ ing: Ingredient; sortOrder: number }>>();
   structured!.ingredients.forEach((ing, i) => {
+    if (hideInPantry && ing.in_pantry) return;
     const key = ing.section ?? '';
     if (!sections.has(key)) sections.set(key, []);
     sections.get(key)!.push({ ing, sortOrder: i + 1 });
@@ -175,11 +180,20 @@ const RecipeView: React.FC<Props> = ({ structured, markdown, showSteps = true, s
           <Text style={styles.sectionLabel}>{t('edit.ingredients')}</Text>
           {/* BACKLOG 16.7: only when the kitchen holds something, so an empty pantry
               shows no legend and no marks. */}
-          {structured!.ingredients.some(i => i.in_pantry) && (
-            <View style={styles.pantryLegend}>
+          {heldCount > 0 && (
+            // The legend was already here; making it the control costs no new chrome.
+            <TouchableOpacity
+              style={styles.pantryLegend}
+              onPress={() => setHideInPantry(v => !v)}
+              accessibilityRole="button"
+              accessibilityState={{ checked: hideInPantry }}
+            >
               <Ionicons name="checkmark-circle" size={13} color={theme.success} />
               <Text style={styles.optLabel}>{t('recipes.pantryLegend')}</Text>
-            </View>
+              <Text style={styles.pantryToggle}>
+                {t(hideInPantry ? 'recipes.showInPantry' : 'recipes.hideInPantry', { count: heldCount })}
+              </Text>
+            </TouchableOpacity>
           )}
           {[...sections.entries()].map(([section, items]) => (
             <View key={section || '__default'}>
@@ -314,6 +328,7 @@ const makeStyles = (t: Theme) => StyleSheet.create({
   ingBullet: { width: 5, height: 5, borderRadius: 2.5, backgroundColor: t.accent, marginTop: 7 },
   ingCheck: { marginTop: 3 },
   pantryLegend: { flexDirection: 'row', alignItems: 'center', gap: 4, marginBottom: 6 },
+  pantryToggle: { ...type.caption, color: t.accent },
   ingText: { flex: 1, ...type.body, fontSize: 14, color: t.text, lineHeight: 20 },
   optLabel: { ...type.caption, color: t.muted, fontStyle: 'italic' },
 

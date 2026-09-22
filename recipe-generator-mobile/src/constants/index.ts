@@ -78,5 +78,9 @@ export const mealPlanCacheKeys = (userId: string) => ({
   recipes: `mealplan_cache_recipes_v1_${userId}`,
 });
 
+// The cooking-mode offline cache (BACKLOG 12.4) — full recipe documents, user-keyed for
+// the same reason the meal-plan cache is.
+export const cookCacheKey = (userId: string) => `cook_cache_v1_${userId}`;
+
 // App Constants
 export const MAX_RECIPE_NAME_LENGTH = 25;

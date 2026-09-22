@@ -4,6 +4,7 @@ import { useTheme, Theme } from '../../context/ThemeContext';
 import { useLanguage } from '../../context/LanguageContext';
 import { type } from '../../theme';
 import { makeChromeStyles } from './styles';
+import { isOffline } from '../../utils/offlineRecipes';
 
 // The two panels that hang off a cooking step: the note the user takes, and a
 // question to the AI about this step.
@@ -78,8 +79,10 @@ export const AskAiPanel: React.FC<{
     try {
       const reply = await onAsk(q, stepText);
       setExchange(prev => [...prev, { q, a: reply || t('cooking.noAnswer') }]);
-    } catch {
-      setExchange(prev => [...prev, { q, a: t('cooking.askFailed') }]);
+    } catch (err) {
+      // BACKLOG 12.4: cooking mode works without a network, Ask AI cannot — and a cook
+      // with wet hands should not have to guess which.
+      setExchange(prev => [...prev, { q, a: t(isOffline(err) ? 'cooking.offlineAi' : 'cooking.askFailed') }]);
     } finally {
       setLoading(false);
     }

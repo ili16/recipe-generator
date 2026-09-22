@@ -7,11 +7,12 @@ import apiService from '../services/apiService';
 import { PantryCategory, PantryItem } from '../types';
 import { useTheme, Theme } from '../context/ThemeContext';
 import { space, radius } from '../theme';
-import { Text, Button, Chip, Badge, SignInRequired, Sheet, SheetRow } from '../components/ui';
+import { Text, Button, Chip, Badge, SignInRequired, Sheet, SheetRow, SwipeRow } from '../components/ui';
 import { useEscapeBack } from '../hooks/useEscapeBack';
 import { useIsAuthenticated } from '../hooks/useIsAuthenticated';
 import { useLanguage } from '../context/LanguageContext';
 import { daysUntil, expiryLabel, stockCheckDue, USE_FIRST_DAYS } from '../utils/pantryExpiry';
+import { readStaplesCollapsed, writeStaplesCollapsed } from '../utils/pantryViewStore';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Pantry'>;
 
@@ -55,6 +56,11 @@ const PantryScreen: React.FC<Props> = ({ navigation }) => {
   // The row whose options are open. One sheet serves both tiers: the verbs differ, the
   // component does not (BACKLOG 16.6).
   const [sheetItem, setSheetItem] = useState<PantryItem | null>(null);
+  // The things the kitchen always has are the things you never need to read (BACKLOG 12.6).
+  // Folded away by default, and the fold is remembered.
+  const [staplesCollapsed, setStaplesCollapsed] = useState(true);
+  useEffect(() => { readStaplesCollapsed().then(setStaplesCollapsed); }, []);
+  const toggleStaples = () => setStaplesCollapsed(v => { writeStaplesCollapsed(!v); return !v; });
   const scroller = useRef<ScrollView>(null);
   const { theme } = useTheme();
   const { t } = useLanguage();
@@ -280,35 +286,54 @@ const PantryScreen: React.FC<Props> = ({ navigation }) => {
 
       {staples.length > 0 ? (
         <View style={styles.section}>
-          <Text variant="label" tone="subtle">{t('pantry.staples')}</Text>
-          {staples.map(item => (
-            <View key={item.id} style={styles.itemRow}>
-              {/* One tap flips the only thing that ever changes. Everything rarer —
-                  renaming it, taking it off the list — is one tap deeper, in the sheet. */}
-              <TouchableOpacity
-                style={styles.stockRow}
-                onPress={() => setStock(item, !item.running_low)}
-                accessibilityRole="checkbox"
-                accessibilityState={{ checked: !item.running_low }}
-                accessibilityLabel={item.name}
-              >
-                <Ionicons
-                  name={item.running_low ? 'alert-circle-outline' : 'checkmark-circle'}
-                  size={20}
-                  color={item.running_low ? theme.accent : theme.muted}
-                />
-                <Text style={styles.flex}>{item.name}</Text>
-                {item.running_low && <Badge label={t('pantry.low')} tone="accent" />}
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => setSheetItem(item)}
-                accessibilityRole="button"
-                accessibilityLabel={t('pantry.itemActions', { name: item.name })}
-                style={styles.removeButton}
-              >
-                <Ionicons name="ellipsis-horizontal" size={18} color={theme.muted} />
-              </TouchableOpacity>
-            </View>
+          <TouchableOpacity
+            style={styles.sectionToggle}
+            onPress={toggleStaples}
+            accessibilityRole="button"
+            accessibilityState={{ expanded: !staplesCollapsed }}
+            accessibilityLabel={t(staplesCollapsed ? 'pantry.showStaples' : 'pantry.hideStaples', { count: staples.length })}
+          >
+            <Text variant="label" tone="subtle">{t('pantry.staplesCount', { count: staples.length })}</Text>
+            <Ionicons name={staplesCollapsed ? 'chevron-down' : 'chevron-up'} size={14} color={theme.muted} />
+          </TouchableOpacity>
+          {!staplesCollapsed && staples.map(item => (
+            <SwipeRow
+              key={item.id}
+              left={{
+                icon: item.running_low ? 'checkmark-circle' : 'alert-circle-outline',
+                label: t(item.running_low ? 'pantry.haveIt' : 'pantry.runningLow'),
+                onAction: () => setStock(item, !item.running_low),
+              }}
+              right={{ icon: 'trash-outline', label: t('common.remove'), tone: 'danger', onAction: () => remove(item) }}
+            >
+              <View style={styles.itemRow}>
+                {/* One tap flips the only thing that ever changes. Everything rarer —
+                    renaming it, taking it off the list — is one tap deeper, in the sheet. */}
+                <TouchableOpacity
+                  style={styles.stockRow}
+                  onPress={() => setStock(item, !item.running_low)}
+                  accessibilityRole="checkbox"
+                  accessibilityState={{ checked: !item.running_low }}
+                  accessibilityLabel={item.name}
+                >
+                  <Ionicons
+                    name={item.running_low ? 'alert-circle-outline' : 'checkmark-circle'}
+                    size={20}
+                    color={item.running_low ? theme.accent : theme.muted}
+                  />
+                  <Text style={styles.flex}>{item.name}</Text>
+                  {item.running_low && <Badge label={t('pantry.low')} tone="accent" />}
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => setSheetItem(item)}
+                  accessibilityRole="button"
+                  accessibilityLabel={t('pantry.itemActions', { name: item.name })}
+                  style={styles.removeButton}
+                >
+                  <Ionicons name="ellipsis-horizontal" size={18} color={theme.muted} />
+                </TouchableOpacity>
+              </View>
+            </SwipeRow>
           ))}
         </View>
       ) : items !== null && (
@@ -344,24 +369,32 @@ const PantryScreen: React.FC<Props> = ({ navigation }) => {
                 const days = item.expires_on != null ? daysUntil(item.expires_on) : null;
                 const amount = amountLabel(item);
                 return (
-                  <TouchableOpacity
+                  // Swipe is the accelerator; the tap still opens the sheet that holds every
+                  // verb, including these two (BACKLOG 12.5).
+                  <SwipeRow
                     key={item.id}
-                    style={styles.itemRow}
+                    left={{
+                      icon: item.running_low ? 'checkmark-circle' : 'alert-circle-outline',
+                      label: t(item.running_low ? 'pantry.haveIt' : 'pantry.runningLow'),
+                      onAction: () => setStock(item, !item.running_low),
+                    }}
+                    right={{ icon: 'trash-outline', label: t('pantry.usedItUp'), tone: 'danger', onAction: () => remove(item) }}
                     onPress={() => setSheetItem(item)}
-                    accessibilityRole="button"
                     accessibilityLabel={t('pantry.itemActions', { name: item.name })}
                   >
-                    <View style={styles.flex}>
-                      <Text>{amount ? `${amount} · ` : ''}{item.name}</Text>
+                    <View style={styles.itemRow}>
+                      <View style={styles.flex}>
+                        <Text>{amount ? `${amount} · ` : ''}{item.name}</Text>
+                      </View>
+                      {item.running_low && <Badge label={t('pantry.low')} tone="accent" />}
+                      {days !== null && (
+                        <Badge
+                          label={expiryLabel(days, t)}
+                          tone={days <= USE_FIRST_DAYS ? 'accent' : 'neutral'}
+                        />
+                      )}
                     </View>
-                    {item.running_low && <Badge label={t('pantry.low')} tone="accent" />}
-                    {days !== null && (
-                      <Badge
-                        label={expiryLabel(days, t)}
-                        tone={days <= USE_FIRST_DAYS ? 'accent' : 'neutral'}
-                      />
-                    )}
-                  </TouchableOpacity>
+                  </SwipeRow>
                 );
               })}
             </View>
@@ -410,6 +443,7 @@ const makeStyles = (t: Theme) => StyleSheet.create({
     color: t.text, backgroundColor: t.surface,
   },
   section: { gap: space.sm },
+  sectionToggle: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: space.xs },
   stapleRow: { flexDirection: 'row', alignItems: 'center', gap: space.sm, paddingVertical: space.xs },
   itemRow: { flexDirection: 'row', alignItems: 'center', gap: space.sm, paddingVertical: space.xs },
   stockRow: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: space.sm, paddingVertical: space.xs },

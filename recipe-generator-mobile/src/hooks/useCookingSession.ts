@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import apiService from '../services/apiService';
 import { recordCook } from '../utils/feedbackPromptStore';
+import { isOffline } from '../utils/offlineRecipes';
 import { Recipe, RecipeResponse } from '../types';
 import { useAlert } from '../context/AlertContext';
 import { useLanguage } from '../context/LanguageContext';
@@ -178,7 +179,10 @@ export function useCookingSession(initialRecipe: Recipe, onSaved: () => void) {
       }
       setRefinedRecipe({ recipename: document.title, recipe: '', structured: document });
       setPhase('refined');
-    } catch {
+    } catch (err) {
+      // The steps and the ingredients are cached; the agent is not (BACKLOG 12.4). Say
+      // which of the two failed, or the cook retries a thing that cannot work.
+      if (isOffline(err)) showAlert(t('cooking.offlineTitle'), t('cooking.offlineAi'), 'error');
       setPhase('done');
     }
   };
@@ -203,7 +207,8 @@ export function useCookingSession(initialRecipe: Recipe, onSaved: () => void) {
       }
       setRefinedRecipe({ recipename: document.title, recipe: '', structured: document });
       setPhase('refined');
-    } catch {
+    } catch (err) {
+      if (isOffline(err)) showAlert(t('cooking.offlineTitle'), t('cooking.offlineAi'), 'error');
       setPhase('overview');
     }
   };
