@@ -566,11 +566,14 @@ func toolSearchMyRecipes(ctx context.Context, s *chatSession, args json.RawMessa
 		// only matched through these is only cookable if the user accepts the swap, so
 		// the model must name it rather than present the recipe as ready to cook.
 		Swaps []swapHit `json:"swaps,omitempty"`
+		// rank orders the hits, it is not part of the tool's answer.
+		rank int
 	}
 	hits := []hit{}
 	query := strings.ToLower(strings.TrimSpace(a.Query))
 	for _, r := range recipes {
-		if query != "" && !strings.Contains(strings.ToLower(r.Recipename), query) {
+		rank := matchRank(r, query)
+		if rank == 0 {
 			continue
 		}
 		if !hasAllTags(r.Tags, a.Tags) {
@@ -580,9 +583,37 @@ func toolSearchMyRecipes(ctx context.Context, s *chatSession, args json.RawMessa
 			continue
 		}
 		uses, swaps := splitHits(usedBy[r.ID])
-		hits = append(hits, hit{ID: r.ID, Title: r.Recipename, Tags: r.Tags, Uses: uses, Swaps: swaps})
+		hits = append(hits, hit{ID: r.ID, Title: r.Recipename, Tags: r.Tags, Uses: uses, Swaps: swaps, rank: rank})
 	}
+	sort.SliceStable(hits, func(i, j int) bool { return hits[i].rank > hits[j].rank })
 	return map[string]any{"count": len(hits), "recipes": hits}, nil, nil
+}
+
+// matchRank scores a free-text query against a recipe the library already holds in
+// memory — GetRecipes carries the rendered document, so searching the body costs no
+// extra query (BACKLOG 18.4).
+//
+// 2 is the name or a tag: what the user almost certainly meant. 1 is somewhere in the
+// document — "the one with the miso" is a steps question, and matching only the title
+// answered it with nothing — but a staple in step four is weaker evidence than a word
+// in the name, so body hits sort last instead of drowning the real ones. 0 is no match.
+func matchRank(r model.Recipe, query string) int {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return 2
+	}
+	if strings.Contains(strings.ToLower(r.Recipename), query) {
+		return 2
+	}
+	for _, tag := range r.Tags {
+		if strings.Contains(strings.ToLower(tag), query) {
+			return 2
+		}
+	}
+	if strings.Contains(strings.ToLower(r.Recipe), query) {
+		return 1
+	}
+	return 0
 }
 
 // swapHit is one substitution the search assumed: the recipe wants Needs, the user
