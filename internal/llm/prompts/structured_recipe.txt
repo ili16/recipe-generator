@@ -8,6 +8,8 @@ Unit rules — follow strictly:
 - Never use 'pieces', 'cloves', 'tablespoons', 'teaspoons', 'cups', 'oz', 'lb', 'fl oz'.
 - Garlic: convert cloves to grams (1 clove ≈ 5 g).
 - Non-numeric amounts like 'to taste' or 'for garnish': set quantity and unit to null, put the phrase in quantity_text.
+- Temperatures are always °C, converted from °F where the source is American (350°F -> 175°C, 400°F -> 200°C), rounded to the nearest 5. Gas marks become °C too.
+- The step text follows the same rules as the ingredient list: metric only, never cups, tablespoons, teaspoons, oz, lb, inches. Pan and tin sizes in cm.
 
 Time rules — follow strictly:
 - total_minutes is the real elapsed time from starting the recipe until the food is ready to eat: prep, cook, and any waiting (marinating, proofing, resting, chilling, cooling) all count toward it. It is NOT simply prep_minutes + cook_minutes — when prep happens while something else cooks or waits, or when there's waiting time that is neither hands-on prep nor active cooking, total_minutes reflects the true wall-clock time and can be less than or greater than that sum.
