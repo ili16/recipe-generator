@@ -4,7 +4,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useTheme, Theme } from '../context/ThemeContext';
 import { useLanguage } from '../context/LanguageContext';
 import { type } from '../theme';
-import { NAV_ITEMS, HISTORY_NAV_ITEM, PROFILE_NAV_ITEM, NavItem } from '../navigation/navItems';
+import { navItemsFor, HISTORY_NAV_ITEM, PROFILE_NAV_ITEM, NavItem } from '../navigation/navItems';
 import { RootStackParamList } from '../navigation/AppNavigator';
 
 /**
@@ -18,9 +18,10 @@ interface Props {
   onToggleCollapse?: () => void;
   /** Opens the report sheet (BACKLOG 9.16). Not a nav item — it goes nowhere. */
   onReport?: () => void;
+  authed: boolean;
 }
 
-const Sidebar: React.FC<Props> = ({ activeRoute, onNavigate, collapsed = false, onToggleCollapse, onReport }) => {
+const Sidebar: React.FC<Props> = ({ activeRoute, onNavigate, collapsed = false, onToggleCollapse, onReport, authed }) => {
   const { theme } = useTheme();
   const { t } = useLanguage();
   const styles = useMemo(() => makeStyles(theme), [theme]);
@@ -56,7 +57,7 @@ const Sidebar: React.FC<Props> = ({ activeRoute, onNavigate, collapsed = false, 
         </TouchableOpacity>
       </View>
       <View style={styles.list}>
-        {NAV_ITEMS.map(renderItem)}
+        {navItemsFor(authed).map(renderItem)}
       </View>
       <View style={styles.footer}>
         {onReport && (
@@ -72,8 +73,8 @@ const Sidebar: React.FC<Props> = ({ activeRoute, onNavigate, collapsed = false, 
             {!collapsed && <Text style={styles.itemLabel} numberOfLines={1}>{t('nav.report')}</Text>}
           </TouchableOpacity>
         )}
-        {renderItem(HISTORY_NAV_ITEM)}
-        {renderItem(PROFILE_NAV_ITEM)}
+        {authed && renderItem(HISTORY_NAV_ITEM)}
+        {authed && renderItem(PROFILE_NAV_ITEM)}
       </View>
     </View>
   );

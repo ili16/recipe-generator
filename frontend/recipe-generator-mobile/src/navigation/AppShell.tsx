@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { View, StyleSheet, TouchableOpacity, Platform } from 'react-native';
 import { NavigationContainer, createNavigationContainerRef } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
@@ -9,7 +9,8 @@ import { Text, useIsDesktopNav } from '../components/ui';
 import { space } from '../theme';
 import { useKeyboardOpen } from '../hooks/useKeyboardOpen';
 import { FeedbackSheet } from '../components/FeedbackSheet';
-import { NAV_ITEMS } from './navItems';
+import { NAV_ITEMS, navItemsFor } from './navItems';
+import authService from '../services/authService';
 import AppNavigator, { RootStackParamList } from './AppNavigator';
 
 const navigationRef = createNavigationContainerRef<RootStackParamList>();
@@ -28,14 +29,14 @@ type NavigateFn = (route: keyof RootStackParamList) => void;
  * It hides itself while the keyboard is up (`useKeyboardOpen`): on a phone the keyboard already
  * owns half the screen, and the tabs are unreachable behind it anyway.
  */
-const TabBar: React.FC<{ activeRoute: string; onNavigate: NavigateFn }> = ({ activeRoute, onNavigate }) => {
+const TabBar: React.FC<{ activeRoute: string; onNavigate: NavigateFn; authed: boolean }> = ({ activeRoute, onNavigate, authed }) => {
   const { theme } = useTheme();
   const { t } = useLanguage();
   const styles = useMemo(() => makeStyles(theme), [theme]);
 
   return (
     <View style={styles.tabBar}>
-      {NAV_ITEMS.map((item) => {
+      {navItemsFor(authed).map((item) => {
         const active = item.route === activeRoute;
         return (
           <TouchableOpacity
@@ -60,14 +61,14 @@ const TabBar: React.FC<{ activeRoute: string; onNavigate: NavigateFn }> = ({ act
  * above every screen — a title the tab bar already gives, on a phone that has none to spare. All
  * that is left is the way into Profile, which narrow has no rail for.
  */
-const TopBar: React.FC<{ onPress: () => void; onReport: () => void; onHistory: () => void }> = ({ onPress, onReport, onHistory }) => {
+const TopBar: React.FC<{ onPress: () => void; onReport: () => void; onHistory: () => void; authed: boolean }> = ({ onPress, onReport, onHistory, authed }) => {
   const { theme } = useTheme();
   const { t } = useLanguage();
   const styles = useMemo(() => makeStyles(theme), [theme]);
 
   return (
     <View style={styles.topBar}>
-      <TouchableOpacity
+      {authed && <TouchableOpacity
         style={styles.topBtn}
         onPress={onHistory}
         hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
@@ -75,7 +76,7 @@ const TopBar: React.FC<{ onPress: () => void; onReport: () => void; onHistory: (
         accessibilityLabel={t('chat.history.title')}
       >
         <Ionicons name="time-outline" size={23} color={theme.subtext} />
-      </TouchableOpacity>
+      </TouchableOpacity>}
       <TouchableOpacity
         style={styles.topBtn}
         onPress={onReport}
@@ -85,7 +86,7 @@ const TopBar: React.FC<{ onPress: () => void; onReport: () => void; onHistory: (
       >
         <Ionicons name="megaphone-outline" size={24} color={theme.subtext} />
       </TouchableOpacity>
-      <TouchableOpacity
+      {authed && <TouchableOpacity
         style={styles.topBtn}
         onPress={onPress}
         hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
@@ -93,7 +94,7 @@ const TopBar: React.FC<{ onPress: () => void; onReport: () => void; onHistory: (
         accessibilityLabel={t('nav.profile')}
       >
         <Ionicons name="person-circle-outline" size={26} color={theme.subtext} />
-      </TouchableOpacity>
+      </TouchableOpacity>}
     </View>
   );
 };
@@ -106,6 +107,12 @@ const AppShell: React.FC = () => {
   // One sheet for the whole app (BACKLOG 9.16), so the top bar and the rail open the same
   // instance and every screen can reach it without its own copy.
   const [reportOpen, setReportOpen] = useState(false);
+
+  // Re-checked on every route change, so signing in or out flips the nav without a reload.
+  const [authed, setAuthed] = useState(false);
+  useEffect(() => {
+    authService.isAuthenticated().then(setAuthed).catch(() => setAuthed(false));
+  }, [activeRoute]);
 
   const isDesktopNav = useIsDesktopNav();
   const keyboardOpen = useKeyboardOpen();
@@ -133,6 +140,7 @@ const AppShell: React.FC = () => {
           collapsed={railCollapsed}
           onToggleCollapse={() => setRailCollapsed((v) => !v)}
           onReport={() => setReportOpen(true)}
+          authed={authed}
         />
       )}
 
@@ -143,6 +151,7 @@ const AppShell: React.FC = () => {
             onPress={() => navigationRef.isReady() && navigationRef.navigate('Profile')}
             onReport={() => setReportOpen(true)}
             onHistory={() => navigationRef.isReady() && navigationRef.navigate('History')}
+            authed={authed}
           />
         )}
 
@@ -158,7 +167,7 @@ const AppShell: React.FC = () => {
       </View>
 
       {!isDesktopNav && showChrome && !keyboardOpen && (
-        <TabBar activeRoute={activeRoute} onNavigate={navigate} />
+        <TabBar activeRoute={activeRoute} onNavigate={navigate} authed={authed} />
       )}
 
       <FeedbackSheet visible={reportOpen} onClose={() => setReportOpen(false)} route={activeRoute} />

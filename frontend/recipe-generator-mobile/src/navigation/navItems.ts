@@ -41,3 +41,14 @@ export const PROFILE_NAV_ITEM: NavItem = {
   icon: 'person-circle-outline',
   route: 'Profile',
 };
+
+// What a signed-out visitor sees next to Chat: every other destination is a "sign in" wall.
+export const SIGNIN_NAV_ITEM: NavItem = {
+  key: 'login',
+  labelKey: 'nav.login',
+  icon: 'log-in-outline',
+  route: 'Login',
+};
+
+export const navItemsFor = (authed: boolean): NavItem[] =>
+  authed ? NAV_ITEMS : [NAV_ITEMS[0], SIGNIN_NAV_ITEM];
