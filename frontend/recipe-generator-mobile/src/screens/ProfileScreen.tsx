@@ -31,7 +31,7 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
   const [usage, setUsage] = useState<Usage | null>(null);
   const { theme, mode, setMode } = useTheme();
   const { t, mode: langMode, setMode: setLangMode } = useLanguage();
-  const { showAlert } = useAlert();
+  const { showAlert, confirmAction } = useAlert();
   const styles = useMemo(() => makeStyles(theme), [theme]);
   useEscapeBack();
 
@@ -111,6 +111,20 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
     }
   };
 
+  const handleDeleteAccount = async () => {
+    if (!(await confirmAction(t('profile.deleteTitle'), t('profile.deleteBody'),
+      { confirmLabel: t('profile.deleteConfirm'), destructive: true }))) return;
+    setLoading(true);
+    try {
+      await apiService.deleteAccount();
+      await handleLogout();
+    } catch (error) {
+      console.error('Delete account error:', error);
+      showAlert(t('common.error'), t('profile.deleteFailed'), 'error');
+      setLoading(false);
+    }
+  };
+
   if (loading) {
     return <Loading visible={true} message={t('common.loading')} />;
   }
@@ -174,6 +188,10 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
 
         <TouchableOpacity style={styles.primaryButton} onPress={handleLogout}>
           <Text style={styles.primaryButtonText}>{t('profile.logout')}</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={styles.ghostButton} onPress={handleDeleteAccount}>
+          <Text style={styles.ghostButtonText}>{t('profile.deleteAccount')}</Text>
         </TouchableOpacity>
       </View>
     </View>

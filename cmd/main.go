@@ -103,6 +103,7 @@ func main() {
 	mux.HandleFunc("POST /api/v1/add-recipe", authenticator.Require(service.HandleAddRecipe))
 	mux.HandleFunc("DELETE /api/v1/delete-recipe/{id}", authenticator.Require(HandleDeleteRecipe))
 	mux.HandleFunc("PATCH /api/v1/update-recipe", authenticator.Require(HandleUpdateRecipe))
+	mux.HandleFunc("DELETE /api/v1/account", authenticator.Require(HandleDeleteAccount(authenticator)))
 	mux.HandleFunc("GET /api/v1/usage", authenticator.Require(HandleGetUsage))
 	mux.HandleFunc("GET /api/v1/preferences", authenticator.Require(HandleGetPreferences))
 	mux.HandleFunc("PATCH /api/v1/preferences", authenticator.Require(HandlePatchPreferences))
@@ -288,6 +289,28 @@ func HandleGetUserInfo(w http.ResponseWriter, r *http.Request) {
 		"fullName": user.Name,
 		"provider": user.Provider,
 	})
+}
+
+// HandleDeleteAccount erases the caller's data, then (best effort) their Keycloak identity.
+// The data is the part the user is owed; a Keycloak failure is logged, not surfaced, because
+// the account is already gone from the app's side and a retry would find nothing to delete.
+func HandleDeleteAccount(a *auth.Authenticator) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user, ok := auth.FromContext(r.Context())
+		if !ok {
+			http.Error(w, "Unauthorized: user context missing", http.StatusUnauthorized)
+			return
+		}
+		if err := storage.DeleteUser(r.Context(), user.ID); err != nil {
+			slog.Error("Error deleting account", "error", err)
+			http.Error(w, "Error deleting account", http.StatusInternalServerError)
+			return
+		}
+		if err := a.DeleteKeycloakUser(r.Context(), user.Subject); err != nil {
+			slog.Warn("account data deleted but keycloak user remains", "subject", user.Subject, "error", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 // HandleGetUsage returns the caller's own current-month LLM spend and budget cap, so the

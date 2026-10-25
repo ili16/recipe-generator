@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -121,4 +122,15 @@ func KitchenDietary(ctx context.Context, userID int) (dietary, disliked []string
 		}
 	}
 	return dietary, disliked, rows.Err()
+}
+
+// DeleteUser erases an account (App Store 5.1.1(v) / Play account deletion). The caller leaves
+// their household first so the exit contract runs — a remaining member keeps the shared week —
+// and then every table that references users cascades away with the row.
+func DeleteUser(ctx context.Context, userID int) error {
+	if err := LeaveHousehold(ctx, userID); err != nil && !errors.Is(err, ErrNotInHousehold) {
+		return err
+	}
+	_, err := Pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, userID)
+	return err
 }

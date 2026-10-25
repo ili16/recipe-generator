@@ -257,6 +257,11 @@ class ApiService {
     return response.data;
   }
 
+  // Erases the account and everything in it (store requirement); not recoverable.
+  async deleteAccount(): Promise<void> {
+    await this.client.delete('account');
+  }
+
   // Delete recipe (soft — it lands in the trash for 30 days, BACKLOG 8.2)
   async deleteRecipe(recipeId: number): Promise<void> {
     await this.client.delete(`${API_ENDPOINTS.DELETE_RECIPE}/${recipeId}`);
