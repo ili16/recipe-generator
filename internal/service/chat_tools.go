@@ -89,18 +89,18 @@ func strList(desc string) map[string]any {
 
 var chatTools = map[string]tool{
 	"generate_recipe": {
-		Description: "Create a new recipe from a description, a webpage URL, or a photo the user attached. Returns a draft_ref naming the unsaved draft, and shows the user nothing: call display_recipe with that ref to put the recipe on their screen, then use it with transform_recipe or save_recipe.",
+		Description: "Create a new recipe from a description, a webpage URL, or a photo the user attached. Returns a draft_ref naming the unsaved draft; the recipe card is already on the user's screen, so do not call display_recipe for it. Use the ref with transform_recipe or save_recipe.",
 		Params: obj(map[string]any{
-			"description": str("What the user asked for, e.g. 'a quick vegan pasta for two'. With from_message, only an extra instruction, or omit"),
+			"description":  str("What the user asked for, e.g. 'a quick vegan pasta for two'. With from_message, only an extra instruction, or omit"),
 			"from_message": map[string]any{"type": "boolean", "description": "true when the user's own message contains the recipe itself (ingredients and steps). The server passes their message on unchanged — do not copy it into description"},
-			"url":         str("A webpage to extract the recipe from, if the user gave one"),
-			"image_ref":   str("The ref from an [attached photo] marker in the user's message, e.g. 'image1'"),
-			"language":    str("ISO 639-1 code for the output language; omit to infer"),
+			"url":          str("A webpage to extract the recipe from, if the user gave one"),
+			"image_ref":    str("The ref from an [attached photo] marker in the user's message, e.g. 'image1'"),
+			"language":     str("ISO 639-1 code for the output language; omit to infer"),
 		}),
 		Run: toolGenerateRecipe,
 	},
 	"transform_recipe": {
-		Description: "Apply an instruction ('make it vegan', 'halve it') to a recipe. Returns a new draft_ref and shows nothing — call display_recipe with it. target is a draft_ref from generate_recipe or a saved recipe id.",
+		Description: "Apply an instruction ('make it vegan', 'halve it') to a recipe. Returns a new draft_ref; the new card is shown automatically. target is a draft_ref from generate_recipe or a saved recipe id.",
 		Params: obj(map[string]any{
 			"target":      str("A draft_ref, or the id of a saved recipe"),
 			"instruction": str("The change to make, in the user's own words"),
@@ -173,8 +173,23 @@ var chatTools = map[string]tool{
 		NeedsAuth: true,
 		Run:       toolRenameRecipe,
 	},
+	"offer_options": {
+		Description: "Put tappable choices on the user's screen and end the turn: either several dish ideas, or one clarifying question with 2-4 short answers. Use it instead of listing ideas or asking questions in prose. For dish ideas give every option a detail line (main components, sauce, sides); for a question's answers omit detail.",
+		Params: obj(map[string]any{
+			"prompt": str("One short line shown above the choices: the question, or a lead-in like 'Five takes on gourmet duck'"),
+			"options": map[string]any{
+				"type":        "array",
+				"description": "2-6 choices",
+				"items": obj(map[string]any{
+					"label":  str("Short dish name or answer"),
+					"detail": str("One line describing the dish: key components, sauce, sides. Omit for plain answers"),
+				}, "label"),
+			},
+		}, "prompt", "options"),
+		Run: toolOfferOptions,
+	},
 	"display_recipe": {
-		Description: "Show a recipe to the user as a card they can read and save. Nothing you generate is visible to them until you call this: generate_recipe, transform_recipe, translate_recipe and review_cook_flow all return a draft_ref and show nothing. Call it once per recipe you are actually presenting, before or with the sentence that introduces it. Do not call it for a recipe you are not standing behind — if a source gave you too little to cook from, say so and show nothing. target is a draft_ref or a saved recipe id.",
+		Description: "Show an existing recipe as a card — a saved recipe by id, or an earlier draft the user asked to see again. generate_recipe, transform_recipe, translate_recipe and review_cook_flow already show their own result; never call this for those. target is a draft_ref or a saved recipe id.",
 		Params:      obj(map[string]any{"target": str("A draft_ref, or the id of a saved recipe")}, "target"),
 		Run:         toolDisplayRecipe,
 	},
@@ -334,10 +349,14 @@ var chatTools = map[string]tool{
 
 // toolDefinitions renders the catalog for the OpenAI request, in a stable order so the
 // prompt prefix stays byte-identical across turns and stays cacheable.
-func toolDefinitions() []openai.ChatCompletionToolParam {
+func toolDefinitions(only ...string) []openai.ChatCompletionToolParam {
 	names := make([]string, 0, len(chatTools))
-	for name := range chatTools {
-		names = append(names, name)
+	if len(only) > 0 {
+		names = append(names, only...)
+	} else {
+		for name := range chatTools {
+			names = append(names, name)
+		}
 	}
 	sort.Strings(names)
 
@@ -1550,11 +1569,10 @@ func (s *chatSession) parkDraft(doc model.RecipeDocument, variantOf int, origin 
 }
 
 // addDraft parks a freshly generated document under a new draft_ref and returns the
-// compact summary the model reads. It shows the user nothing: a draft becomes a card
-// only when the model calls display_recipe with its ref. That is deliberate — a
-// generation the model is about to apologise for used to render a save-able card
-// anyway ("Unspecified Recipe", from a Reel whose caption held no recipe), because
-// producing a document and showing one were the same act.
+// compact summary the model reads, plus the card — so a generation is on the user's
+// screen the moment it exists, without a second model round to call display_recipe.
+// Failures that mean "there is no recipe" (an unreadable source, ErrNoRecipeInSource)
+// return before reaching here, which is what keeps an empty card from rendering.
 //
 // variantOf is the saved recipe this document is a twist or a translation of, or 0; see
 // parkDraft. derivedFrom is the draft_ref or `recipe:<id>` this document was made *out of* — a
@@ -1580,8 +1598,58 @@ func (s *chatSession) addDraft(doc model.RecipeDocument, variantOf int, origin *
 		"tags":          doc.Tags,
 		"ingredients":   len(doc.Ingredients),
 		"steps":         len(doc.Steps),
-		"shown":         false,
-	}, nil, nil
+		"shown":         true,
+	}, recipeCard(s, ref, doc), nil
+}
+
+// toolOfferOptions renders option chips and ends the turn: the next move is the user's.
+func toolOfferOptions(_ context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {
+	type option struct {
+		Label  string `json:"label"`
+		Detail string `json:"detail,omitempty"`
+	}
+	var a struct {
+		Prompt  string   `json:"prompt"`
+		Options []option `json:"options"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return nil, nil, errors.New("could not read the arguments")
+	}
+	var items []option
+	for _, o := range a.Options {
+		if o.Label = strings.TrimSpace(o.Label); o.Label != "" {
+			o.Detail = strings.TrimSpace(o.Detail)
+			items = append(items, o)
+		}
+	}
+	if len(items) < 2 {
+		return nil, nil, errors.New("give at least two options")
+	}
+	if len(items) > 6 {
+		items = items[:6]
+	}
+	s.endTurn = true
+	return map[string]any{"shown": true, "count": len(items)}, &artifact{Kind: "options", Data: map[string]any{"prompt": strings.TrimSpace(a.Prompt), "items": items}}, nil
+}
+
+// recipeCard is the recipe artifact for a draft_ref or a saved recipe, shared by addDraft
+// and display_recipe.
+func recipeCard(s *chatSession, ref string, doc model.RecipeDocument) *artifact {
+	data := map[string]any{"document": doc}
+	if _, isDraft := s.drafts[ref]; isDraft {
+		info := s.draftInfo[ref]
+		data["draft_ref"] = ref
+		if info.derivedFrom != "" {
+			data["derived_from"] = info.derivedFrom
+		}
+		// A draft already saved shows as saved, not as one more thing to save.
+		if info.savedID != 0 {
+			data["recipe_id"] = info.savedID
+		}
+	} else {
+		data["recipe_id"] = savedRecipeID(ref)
+	}
+	return &artifact{Kind: "recipe", Data: data}
 }
 
 // toolDisplayRecipe is the only way a recipe reaches the user's screen. It renders no
@@ -1600,21 +1668,7 @@ func toolDisplayRecipe(ctx context.Context, s *chatSession, args json.RawMessage
 		return nil, nil, err
 	}
 
-	data := map[string]any{"document": doc}
-	if _, isDraft := s.drafts[ref]; isDraft {
-		info := s.draftInfo[ref]
-		data["draft_ref"] = ref
-		if info.derivedFrom != "" {
-			data["derived_from"] = info.derivedFrom
-		}
-		// A draft already saved shows as saved, not as one more thing to save.
-		if info.savedID != 0 {
-			data["recipe_id"] = info.savedID
-		}
-	} else {
-		data["recipe_id"] = savedRecipeID(ref)
-	}
-	return map[string]any{"displayed": ref, "title": doc.Title}, &artifact{Kind: "recipe", Data: data}, nil
+	return map[string]any{"displayed": ref, "title": doc.Title}, recipeCard(s, ref, doc), nil
 }
 
 // savedRecipeID reads the saved recipe id out of a target ref ("recipe:12" or "12"),

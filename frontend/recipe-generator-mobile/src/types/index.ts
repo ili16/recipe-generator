@@ -381,7 +381,10 @@ export type ChatArtifact =
   // is how the card finds its own before-state in the thread and shows what changed
   // (BACKLOG.md 10.3) rather than silently replacing the recipe.
   | { kind: 'recipe'; data: { draft_ref?: string; recipe_id?: number; derived_from?: string; document: RecipeDocument } }
-  | { kind: 'week_plan'; data: { starts_on: string; ends_on: string; plan: MealPlanSuggestion } };
+  | { kind: 'week_plan'; data: { starts_on: string; ends_on: string; plan: MealPlanSuggestion } }
+  // Tappable choices (offer_options): ideas, or a clarifying question's answers. A tap is
+  // sent as the user's next message.
+  | { kind: 'options'; data: { prompt: string; items: { label: string; detail?: string }[] } };
 
 // A mutating tool call the agent wants to make, held until the user approves it
 // (BACKLOG.md 10.2). `args` is the tool's own JSON, rendered per tool; `replaces` is what

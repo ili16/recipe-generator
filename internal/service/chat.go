@@ -99,6 +99,11 @@ type chatSession struct {
 	// user has to approve (BACKLOG.md 10.2), and written back to the session state by
 	// the handler. Nil on every turn that ran to completion.
 	pending *pendingApproval
+	// endTurn is set by a tool that hands the move to the user (offer_options): the loop
+	// stops after its result instead of paying a model round to comment on the chips.
+	endTurn bool
+	// intent is the router's verdict for this turn; intentAgent runs the full loop.
+	intent intent
 }
 
 // draftInfo is what a draft carries besides its document: the saved recipe it is a
@@ -641,6 +646,15 @@ func runTurn(ctx context.Context, send emit, session *chatSession) (int, string)
 	before := len(session.messages)
 	produced := func() int { return len(session.messages) - before }
 
+	// Only a fresh user message is routed; an approval resume continues a turn whose
+	// shape was already decided, so it gets the full loop.
+	if n := len(session.messages); n > 0 && session.messages[n-1].Role == "user" {
+		session.intent = routeIntent(ctx, session.messages)
+	}
+	tools := toolDefinitions(routeTools[session.intent]...)
+	chatModel := routedModel(session.intent)
+	steer := routeSteer(session.intent)
+
 	for i := range maxTurnIterations {
 		// A stop (BACKLOG.md 10.1) cancels the request context, and it has to land
 		// here rather than inside the next model call: without this the loop would
@@ -659,10 +673,10 @@ func runTurn(ctx context.Context, send emit, session *chatSession) (int, string)
 		}
 
 		msg, _, err := llm.CallMessage(ctx, llm.Spec{
-			Model:    recipeModel,
+			Model:    chatModel,
 			CallType: "chat",
-			Messages: threadToParams(session.messages, session.language, session.household),
-			Tools:    toolDefinitions(),
+			Messages: threadToParams(session.messages, session.language, session.household, steer),
+			Tools:    tools,
 			OnDelta:  func(delta string) { send("token", map[string]string{"text": delta}) },
 		})
 		if err != nil {
@@ -707,6 +721,9 @@ func runTurn(ctx context.Context, send emit, session *chatSession) (int, string)
 				return produced(), haltCode(ctx)
 			}
 			session.messages = append(session.messages, runToolCall(ctx, send, session, call))
+		}
+		if session.endTurn {
+			return produced(), ""
 		}
 	}
 	// Out of iterations with the model still asking for tools: surface it as a code
@@ -867,7 +884,7 @@ func fromOpenAIMessage(msg openai.ChatCompletionMessage) model.ConversationMessa
 // capped to the most recent maxThreadMessages. language (the caller's device locale, if
 // sent) is appended to the system prompt rather than the thread, so it follows the
 // device making the request instead of being frozen into the conversation.
-func threadToParams(msgs []model.ConversationMessage, language, household string) []openai.ChatCompletionMessageParamUnion {
+func threadToParams(msgs []model.ConversationMessage, language, household string, extra ...string) []openai.ChatCompletionMessageParamUnion {
 	msgs = trimThread(msgs)
 	system := llm.ChatAgentSystemPrompt
 	// Without the date the model guesses starts_on, which is how "plan this week" ended up
@@ -878,6 +895,11 @@ func threadToParams(msgs []model.ConversationMessage, language, household string
 	}
 	if language != "" {
 		system += "- The user's device language is \"" + language + "\" (ISO 639-1). Write in it, and pass it as generate_recipe's `language`, unless the user's own message is clearly in another language.\n"
+	}
+	for _, e := range extra {
+		if e != "" {
+			system += e + "\n"
+		}
 	}
 	params := make([]openai.ChatCompletionMessageParamUnion, 0, len(msgs)+1)
 	params = append(params, openai.SystemMessage(system))

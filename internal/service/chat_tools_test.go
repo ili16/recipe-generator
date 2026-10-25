@@ -324,9 +324,9 @@ func TestSessionDrafts(t *testing.T) {
 	if _, leaked := summary["ingredients"].([]model.RecipeIngredient); leaked {
 		t.Error("draft summary carries the full ingredient list")
 	}
-	// Parking a draft shows the user nothing. display_recipe is the card.
-	if art != nil {
-		t.Fatalf("addDraft emitted an artifact: %+v", art)
+	// A fresh draft arrives with its card; display_recipe renders the same one.
+	if art == nil || art.Kind != "recipe" {
+		t.Fatalf("addDraft emitted no recipe card: %+v", art)
 	}
 	art = displayArtifact(t, session, "draft_1")
 	// Provenance is parked with the draft, since saveDraft is the only thing that can

@@ -46,6 +46,9 @@ const en = {
 
   chat: {
     emptyTitle: 'What are we cooking?',
+    thinking: 'Thinking…',
+    optionsConfirm: 'Create this recipe',
+    optionsRequest: 'Give me the recipe for: {{dish}}',
     opener1: 'A quick vegan pasta for two',
     opener2: 'Make something with what I have: eggs, spinach, feta',
     opener3: 'Plan my week from my saved recipes',

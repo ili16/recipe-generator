@@ -380,8 +380,17 @@ const ChatScreen: React.FC<Props> = ({ route, navigation }) => {
             sending={sending}
             live={sending && i === messages.length - 1}
             onDecide={decide}
+            onPick={(text) => send(text)}
+            answered={i < messages.length - 1}
           />
         ))}
+
+        {sending && !activeTool && isIdleTurn(messages[messages.length - 1]) && (
+          <View style={styles.working}>
+            <ActivityIndicator size="small" color={theme.accent} />
+            <Text style={styles.workingText}>{t('chat.thinking')}</Text>
+          </View>
+        )}
 
         {activeTool && (
           <View style={styles.working}>
@@ -397,6 +406,10 @@ const ChatScreen: React.FC<Props> = ({ route, navigation }) => {
     </KeyboardAvoidingView>
   );
 };
+
+// The turn in flight has produced nothing yet — the gap while the router and model start.
+const isIdleTurn = (m?: ChatMessage) =>
+  !!m && m.role === 'assistant' && m.text === '' && !m.artifacts?.length && !m.approval;
 
 type Translate = (key: string, options?: Record<string, unknown>) => string;
 
@@ -418,9 +431,13 @@ interface TurnProps {
   /** This is the turn in flight: its steps are still the spinner's job, not a summary's. */
   live?: boolean;
   onDecide: (approval: ChatApproval, approve: boolean) => void;
+  /** A tapped option chip, sent as the user's next message. */
+  onPick: (text: string) => void;
+  /** A later message exists, so any options on this turn have been dealt with. */
+  answered?: boolean;
 }
 
-const Turn: React.FC<TurnProps> = ({ message, theme, styles, titles, docsByRef, savingRef, expiredRefs, onSaveDraft, sending, live, onDecide, t }) => {
+const Turn: React.FC<TurnProps> = ({ message, theme, styles, titles, docsByRef, savingRef, expiredRefs, onSaveDraft, sending, live, onDecide, onPick, answered, t }) => {
   if (message.role === 'user') {
     return (
       <View style={styles.userBubble}>
@@ -452,6 +469,9 @@ const Turn: React.FC<TurnProps> = ({ message, theme, styles, titles, docsByRef, 
           savingRef={savingRef}
           expiredRefs={expiredRefs}
           onSaveDraft={onSaveDraft}
+          sending={sending}
+          onPick={onPick}
+          answered={answered}
         />
       ))}
       {message.approval && (
@@ -555,11 +575,63 @@ const ApprovalCard: React.FC<
   );
 };
 
+// Dish ideas (label + a line of detail) are picked in two steps — select, then confirm — and
+// collapse to the chosen one once the recipe is requested. Bare answers to a clarifying
+// question have no detail to weigh, so one tap sends them.
+const OptionsCard: React.FC<{
+  data: { prompt: string; items: { label: string; detail?: string }[] };
+  sending: boolean;
+  answered: boolean;
+  onPick: (text: string) => void;
+} & Pick<TurnProps, 'styles' | 't'>> = ({ data, sending, answered, onPick, styles, t }) => {
+  const [selected, setSelected] = useState<string | null>(null);
+  const [sent, setSent] = useState(false);
+  const rich = data.items.some((o) => o.detail);
+  const collapsed = sent || answered;
+  const shown = collapsed ? data.items.filter((o) => o.label === selected) : data.items;
+
+  const submit = (label: string) => {
+    setSent(true);
+    onPick(rich ? t('chat.optionsRequest', { dish: label }) : label);
+  };
+
+  return (
+    <View style={styles.optionsWrap}>
+      {data.prompt !== '' && <Text style={styles.optionsPrompt}>{data.prompt}</Text>}
+      {shown.map((o) => {
+        const on = o.label === selected;
+        return (
+          <TouchableOpacity
+            key={o.label}
+            style={[styles.option, on && styles.optionOn]}
+            disabled={sending || collapsed}
+            onPress={() => {
+              setSelected(o.label);
+              if (!rich) submit(o.label);
+            }}
+          >
+            <Text style={styles.optionTitle}>{o.label}</Text>
+            {o.detail ? <Text style={styles.optionText}>{o.detail}</Text> : null}
+          </TouchableOpacity>
+        );
+      })}
+      {rich && selected && !collapsed && (
+        <TouchableOpacity style={styles.optionGo} disabled={sending} onPress={() => submit(selected)}>
+          <Text style={styles.optionGoText}>{t('chat.optionsConfirm')}</Text>
+        </TouchableOpacity>
+      )}
+    </View>
+  );
+};
+
 const ArtifactCard: React.FC<
-  { artifact: ChatArtifact } & Pick<TurnProps, 'theme' | 'styles' | 'titles' | 'docsByRef' | 'savingRef' | 'expiredRefs' | 'onSaveDraft' | 't'>
+  { artifact: ChatArtifact } & Pick<TurnProps, 'theme' | 'styles' | 'titles' | 'docsByRef' | 'savingRef' | 'expiredRefs' | 'onSaveDraft' | 't' | 'sending' | 'onPick' | 'answered'>
 > = ({
-  artifact, theme, styles, titles, docsByRef, savingRef, expiredRefs, onSaveDraft, t,
+  artifact, theme, styles, titles, docsByRef, savingRef, expiredRefs, onSaveDraft, t, sending, onPick, answered,
 }) => {
+  if (artifact.kind === 'options') {
+    return <OptionsCard data={artifact.data} sending={sending} answered={!!answered} onPick={onPick} styles={styles} t={t} />;
+  }
   if (artifact.kind === 'recipe') {
     const doc = artifact.data.document;
     const ref = artifact.data.draft_ref;
@@ -723,6 +795,14 @@ const makeStyles = (t: Theme) => StyleSheet.create({
 
   empty: { paddingVertical: 12, gap: 8 },
   emptyTitle: { ...type.title, fontSize: 22, lineHeight: 30, color: t.text, marginBottom: 8 },
+  optionsWrap: { gap: 8 },
+  optionsPrompt: { color: t.text, ...type.body },
+  option: { backgroundColor: t.surfaceRaised, borderWidth: 1, borderColor: t.border, borderRadius: 12, padding: 12 },
+  optionOn: { borderColor: t.accent, borderWidth: 2, padding: 11 },
+  optionTitle: { color: t.text, ...type.body, fontWeight: '600' },
+  optionText: { color: t.subtext, ...type.body, fontSize: 14, marginTop: 2 },
+  optionGo: { backgroundColor: t.accent, borderRadius: 12, padding: 12, alignItems: 'center' },
+  optionGoText: { color: '#fff', ...type.body, fontWeight: '600' },
   opener: { backgroundColor: t.surfaceRaised, borderWidth: 1, borderColor: t.border, borderRadius: 12, padding: 12 },
   openerText: { color: t.subtext, ...type.body, fontSize: 14 },
 

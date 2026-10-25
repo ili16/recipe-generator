@@ -1,8 +1,13 @@
 import axios, { AxiosInstance } from 'axios';
 import { Platform } from 'react-native';
+import { fetch as expoFetch } from 'expo/fetch';
 import { API_BASE_URL, API_ENDPOINTS } from '../constants';
 import { Recipe, RecipeDocument, RecipeResponse, PatchRecipePayload, GenerationOrigin, EditTurn, RecipeVersion, UserPreferences, MealPlanWeek, MealPlanItem, MealSlot, MealPlanSuggestion, GroceryList, GroceryTick, SharedPlan, ChatStreamEvent, ChatAttachment, Collection, PantryItem, FeedbackPayload, Household, CookedResult, ConversationSummary, ConversationThread, Usage } from '../types';
 import authService from './authService';
+
+// RN's global fetch has no readable body on native; expo/fetch does, so SSE streams there too.
+const streamFetch = (url: string, init: RequestInit) =>
+  Platform.OS === 'web' ? fetch(url, init) : (expoFetch(url, init as never) as unknown as Promise<Response>);
 import { currentLocale } from '../i18n';
 import { isOffline } from '../utils/offlineRecipes';
 import { offlineRecipe, rememberForOffline } from '../utils/offlineRecipeStore';
@@ -88,7 +93,7 @@ class ApiService {
     // `isOffline` check cover both (BACKLOG 12.4).
     const send = async (token: string | null) => {
       try {
-        return await fetch(`${API_BASE_URL}/${path}`, { ...init(token), signal });
+        return await streamFetch(`${API_BASE_URL}/${path}`, { ...init(token), signal } as RequestInit);
       } catch (err) {
         if (err instanceof Error && err.name === 'AbortError') throw err;
         throw new ApiError(err instanceof Error ? err.message : 'request failed');
@@ -153,8 +158,7 @@ class ApiService {
   // The agent loop (POST /chat): one user turn in, a stream of prose tokens, tool events
   // and artifact cards out. The thread lives server-side — the only state the client
   // keeps is the conversation id, which this resolves from the closing `done` event.
-  // Native has no readable body, so it asks for `Accept: application/json` and gets the
-  // same events in one buffered array once the turn ends (BACKLOG 3.8).
+  // Native streams too, through expo/fetch (RN's own fetch has no readable body).
   async streamChat(
     message: string,
     conversationId: string | null,
@@ -170,20 +174,6 @@ class ApiService {
   ): Promise<string | null> {
     let conversation = conversationId;
     const body = { conversation_id: conversationId ?? '', message, attachments, approval, language: currentLocale() };
-
-    if (Platform.OS !== 'web') {
-      const { data } = await this.client.post<{ events: { type: string; payload: unknown }[] }>(
-        API_ENDPOINTS.CHAT,
-        body,
-        { headers: { Accept: 'application/json' }, signal },
-      );
-      for (const { type, payload } of data.events ?? []) {
-        if (type === 'error') throw new ApiError((payload as { code?: string })?.code || 'stream error');
-        if (type === 'done') conversation = (payload as { conversation_id?: string }).conversation_id ?? conversation;
-        onEvent({ type, payload } as ChatStreamEvent);
-      }
-      return conversation;
-    }
 
     await this.streamSSE(
       API_ENDPOINTS.CHAT,
