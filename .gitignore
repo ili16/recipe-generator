@@ -7,5 +7,5 @@ terraform*
 /.terraform.tfstate.lock.info
 *.pem
 .env
-main
+/main
 .DS_Store

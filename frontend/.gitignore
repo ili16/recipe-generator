@@ -1,0 +1,11 @@
+# SSL Stuff
+
+localhost.*
+*.cer
+*.pem
+*.pfx
+node_modules/
+.DS_Store
+.expo/
+.env
+.env.local

@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="%LANG_ISO_CODE%">
+  <head>
+    <meta charset="utf-8" />
+    <meta httpEquiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no, viewport-fit=cover" />
+    <title>%WEB_TITLE%</title>
+    <!-- The `react-native-web` recommended style reset: https://necolas.github.io/react-native-web/docs/setup/#root-element -->
+    <style id="expo-reset">
+      /* These styles make the body full-height */
+      html,
+      body {
+        height: 100%;
+      }
+      /* Painted before any JS runs so the first frame, and the strip left under `#root` when
+         the keyboard shrinks the viewport, are never white under a dark app. `ThemeContext`
+         takes over once it knows the real mode (system / light / dark). */
+      html { color-scheme: light dark; }
+      body { background-color: #F9F6F0; }
+      @media (prefers-color-scheme: dark) { body { background-color: #1A1816; } }
+      /* These styles disable body scrolling if you are using <ScrollView> */
+      body {
+        overflow: hidden;
+      }
+      /* These styles make the root element full-height. `--app-height` is kept in
+         sync with the visual viewport below so the layout shrinks to fit above the
+         on-screen keyboard on iOS Safari instead of leaving blank space beneath it. */
+      #root {
+        display: flex;
+        height: var(--app-height, 100%);
+        flex: 1;
+      }
+    </style>
+    <script>
+      (function () {
+        function setAppHeight() {
+          var vv = window.visualViewport;
+          var height = vv ? vv.height : window.innerHeight;
+          document.documentElement.style.setProperty('--app-height', height + 'px');
+        }
+        setAppHeight();
+        if (window.visualViewport) {
+          window.visualViewport.addEventListener('resize', setAppHeight);
+        } else {
+          window.addEventListener('resize', setAppHeight);
+        }
+      })();
+    </script>
+    <!-- Privacy-friendly analytics by Plausible -->
+    <script async src="https://analytics.ili16.de/js/pa-3Ba4mCyWm9KnZGXRl_EHC.js"></script>
+    <script>
+      window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};
+      plausible.init()
+    </script>
+  </head>
+
+  <body>
+    <!-- Use static rendering with Expo Router to support running without JavaScript. -->
+    <noscript>
+      You need to enable JavaScript to run this app.
+    </noscript>
+    <!-- The root element for your Expo app. -->
+    <div id="root"></div>
+  </body>
+</html>
