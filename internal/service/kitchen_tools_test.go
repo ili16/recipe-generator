@@ -54,10 +54,6 @@ func TestCalculators(t *testing.T) {
 	if got := outVal(t, run(t, "salt", map[string]any{"mode": "ferment"}), "salt"); got != 20 {
 		t.Errorf("ferment salt = %v, want 20", got)
 	}
-	r := run(t, "sauce_reduce", map[string]any{"volume_ml": 1000.0, "target_ml": 250.0})
-	if outVal(t, r, "boil_off") != 750 || outVal(t, r, "concentration") != 4 {
-		t.Errorf("reduce: %+v", r)
-	}
 }
 
 func TestCalculatorsRejectBadInput(t *testing.T) {

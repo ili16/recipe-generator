@@ -244,26 +244,6 @@ var calcCatalog = []calculator{
 		},
 	},
 	{
-		ID: "sauce_reduce", Title: L{"Reduce a sauce", "Sauce einkochen"},
-		Desc: L{"How much to boil off, and how much saltier it gets.", "Wie viel einkochen und wie viel salziger es wird."},
-		Fields: []calcField{
-			num("volume_ml", L{"Start", "Start"}, "ml", 1000, 100, 10000),
-			num("target_ml", L{"Target", "Ziel"}, "ml", 500, 50, 10000),
-		},
-		run: func(v calcVals) ([]calcOut, error) {
-			from, to := v.n("volume_ml"), v.n("target_ml")
-			if to >= from {
-				return nil, fmt.Errorf("the target must be less than the start")
-			}
-			note := &L{"Salt after reducing, not before.", "Erst nach dem Einkochen salzen."}
-			return []calcOut{
-				out("boil_off", "Boil off", "Verdampfen", from-to, "ml"),
-				out("left", "Left", "Übrig", to/from*100, "%"),
-				{Key: "concentration", Label: L{"Salt gets", "Salz wird"}, Value: round(from/to, "x"), Unit: "×", Note: note},
-			}, nil
-		},
-	},
-	{
 		ID: "salt", Title: L{"Salt", "Salz"},
 		Desc: L{"Salt for a dry brine, wet brine, fermenting vegetables or cooking water. Not for nitrite curing.", "Salz für Trockenpökeln, Salzlake, Fermentieren oder Kochwasser. Nicht fürs Nitritpökeln."},
 		Fields: []calcField{
