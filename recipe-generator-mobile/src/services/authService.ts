@@ -61,7 +61,10 @@ class AuthService {
         clientId: KEYCLOAK_CONFIG.clientId,
         responseType: AuthSession.ResponseType.Code,
         redirectUri,
-        scopes: ['openid', 'profile', 'email', 'offline_access'],
+        // No offline_access: Keycloak never creates the offline session such a token claims,
+        // and introspection rejects it as user_session_not_found. Plain refresh tokens
+        // (bound to the SSO session) are issued and used by performRefresh.
+        scopes: ['openid', 'profile', 'email'],
         usePKCE: true,
       });
 

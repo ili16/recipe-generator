@@ -1,14 +1,17 @@
+// On web the app and the API share an origin (beta and live both path-split one host), so
+// the page's own origin is the right base wherever the image is served. Native has no
+// origin and talks to beta.
+const WEB_ORIGIN = typeof window !== 'undefined' && window.location ? window.location.origin : null;
+const NATIVE_BASE_URL = 'https://recipe-generator-beta.ili16.de';
+
 // API Configuration
 export const API_BASE_URL = __DEV__
   ? 'http://localhost:8080/api/v1'
-  : 'https://recipe-generator-beta.ili16.de/api/v1';
+  : `${WEB_ORIGIN ?? NATIVE_BASE_URL}/api/v1`;
 
-// Where a share link points (BACKLOG 8.4). In prod the app and the API are the same
-// origin; in dev on web the app serves itself, and native dev has no web origin of its
-// own so it hands out the beta one.
-export const APP_BASE_URL = __DEV__ && typeof window !== 'undefined'
-  ? window.location.origin
-  : 'https://recipe-generator-beta.ili16.de';
+// Where a share link points (BACKLOG 8.4). Native dev has no web origin of its own so it
+// hands out the beta one.
+export const APP_BASE_URL = WEB_ORIGIN ?? NATIVE_BASE_URL;
 
 export const shareUrl = (token: string) => `${APP_BASE_URL}/s/${token}`;
 
