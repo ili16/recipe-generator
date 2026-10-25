@@ -319,7 +319,11 @@ class AuthService {
       return nextAccessToken;
     } catch (error) {
       console.error('Silent token refresh failed:', error);
-      await this.clearSession();
+      // Only a rejected refresh token (invalid_grant) ends the session; a network blip
+      // while the phone is asleep or offline must not log the user out.
+      if (error instanceof AuthSession.TokenError) {
+        await this.clearSession();
+      }
       return null;
     }
   }
