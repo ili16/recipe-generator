@@ -18,6 +18,7 @@ import PantryScreen from '../screens/PantryScreen';
 import HouseholdScreen from '../screens/HouseholdScreen';
 import ThreadListScreen from '../screens/chat/ThreadList';
 import MapScreen from '../screens/MapScreen';
+import ToolsScreen from '../screens/ToolsScreen';
 import { Recipe } from '../types';
 
 export type RootStackParamList = {
@@ -36,6 +37,8 @@ export type RootStackParamList = {
   GroceryList: undefined;
   Pantry: undefined;
   Map: undefined;
+  // `tool` + `inputs` open a calculator prefilled (the chat's tool card); 'seasonal' opens the calendar.
+  Tools: { tool?: string; inputs?: Record<string, number | string> } | undefined;
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -125,6 +128,11 @@ const AppNavigator: React.FC = () => {
         name="Pantry"
         component={PantryScreen}
         options={{ title: t('nav.pantry'), ...topLevel }}
+      />
+      <Stack.Screen
+        name="Tools"
+        component={ToolsScreen}
+        options={{ title: t('nav.tools') }}
       />
     </Stack.Navigator>
   );

@@ -61,13 +61,22 @@ const TabBar: React.FC<{ activeRoute: string; onNavigate: NavigateFn; authed: bo
  * above every screen — a title the tab bar already gives, on a phone that has none to spare. All
  * that is left is the way into Profile, which narrow has no rail for.
  */
-const TopBar: React.FC<{ onPress: () => void; onReport: () => void; onHistory: () => void; authed: boolean }> = ({ onPress, onReport, onHistory, authed }) => {
+const TopBar: React.FC<{ onPress: () => void; onReport: () => void; onHistory: () => void; onTools: () => void; authed: boolean }> = ({ onPress, onReport, onHistory, onTools, authed }) => {
   const { theme } = useTheme();
   const { t } = useLanguage();
   const styles = useMemo(() => makeStyles(theme), [theme]);
 
   return (
     <View style={styles.topBar}>
+      <TouchableOpacity
+        style={styles.topBtn}
+        onPress={onTools}
+        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+        accessibilityRole="button"
+        accessibilityLabel={t('nav.tools')}
+      >
+        <Ionicons name="construct-outline" size={23} color={theme.subtext} />
+      </TouchableOpacity>
       {authed && <TouchableOpacity
         style={styles.topBtn}
         onPress={onHistory}
@@ -151,6 +160,7 @@ const AppShell: React.FC = () => {
             onPress={() => navigationRef.isReady() && navigationRef.navigate('Profile')}
             onReport={() => setReportOpen(true)}
             onHistory={() => navigationRef.isReady() && navigationRef.navigate('History')}
+            onTools={() => navigationRef.isReady() && navigationRef.navigate('Tools')}
             authed={authed}
           />
         )}

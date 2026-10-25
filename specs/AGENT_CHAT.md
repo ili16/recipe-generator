@@ -130,6 +130,8 @@ Each tool returns **JSON**, never prose.
 | `clear_plan_day` | `date` | `DELETE /meal-plan/items/{id}` |
 | `get_preferences` / `set_preferences` | — / `patch` | `GET`/`PATCH /preferences` |
 | `fetch_url` | `url` | the inline `utils.GetWebsite` pre-step |
+| `calculate` | `tool, inputs?` | — (new: deterministic dough/brine/vinaigrette/sauce/salt maths; emits a `tool` artifact) |
+| `seasonal` | `month?, category?, query?` | — (new: Germany-only seasonal calendar) |
 | `answer_cooking_question` | `recipe_ref?, step?, question` | `POST /cooking-chat` |
 
 Two rules for the catalog:

@@ -42,7 +42,7 @@ otherwise), rate-limited and budget-capped per the "Rate limiting + budget" note
 	  the same order, for React Native, whose `fetch` has no readable body (BACKLOG 3.8).
 	  Anything else streams SSE. The agent loop is identical either way.
 	- Events: `token` `{text}` (assistant prose, streamed) · `tool_start` `{name,args}` ·
-	  `tool_end` `{name,ok}` · `artifact` `{kind:"recipe"|"week_plan",data}` (the card the
+	  `tool_end` `{name,ok}` · `artifact` `{kind:"recipe"|"week_plan"|"options"|"tool",data}` (the card the
 	  client renders inline, and the reason the reply itself does not repeat a recipe) ·
 	  `approval_request` `{id,name,args,replaces}` · `done` `{conversation_id}` · `error`
 	  `{code}` — a code, never `err.Error()`.
@@ -414,3 +414,12 @@ Notes:
   edit trail comes from `recipe_versions`, not from a resent `history` array.
 - Ownership always comes from the token subject, never from the request body.
 
+
+## Kitchen tools (public, no auth, no model — BACKLOG 19.1)
+
+- `GET /api/v1/tools` -> `{calculators:[{id,title:{en,de},desc,fields:[{name,label,kind:"number"|"select",unit?,default,min?,max?,options?}]}]}`.
+  The Tools screen renders its forms from this.
+- `POST /api/v1/tools/{id}` body `{inputs:{name:value}}` (missing = default) -> `{id,inputs,outputs:[{key,label,value,unit,note?}]}`.
+  400 with a plain-text reason on an unknown id, an out-of-range number or a bad option.
+- `GET /api/v1/tools/seasonal?month=1-12&category=vegetable|fruit|game&q=` -> `{region:"DE",note,month,in_season,ending_soon,next_month}`
+  (entries `{name:{en,de},category,status:"fresh"|"stored"}`). **Germany only**; month defaults to now in Europe/Berlin.

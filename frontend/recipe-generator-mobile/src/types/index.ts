@@ -384,7 +384,10 @@ export type ChatArtifact =
   | { kind: 'week_plan'; data: { starts_on: string; ends_on: string; plan: MealPlanSuggestion } }
   // Tappable choices (offer_options): ideas, or a clarifying question's answers. A tap is
   // sent as the user's next message.
-  | { kind: 'options'; data: { prompt: string; items: { label: string; detail?: string }[] } };
+  | { kind: 'options'; data: { prompt: string; items: { label: string; detail?: string }[] } }
+  // A kitchen calculator's result (the `calculate` tool). `inputs` is the resolved set, so
+  // "Open in Tools" lands on the same numbers.
+  | { kind: 'tool'; data: { tool: string; inputs: KitchenInputs; outputs: KitchenOutput[] } };
 
 // A mutating tool call the agent wants to make, held until the user approves it
 // (BACKLOG.md 10.2). `args` is the tool's own JSON, rendered per tool; `replaces` is what
@@ -494,4 +497,39 @@ export interface Usage {
   cap_usd: number;
   period_start: string;
   pct_used: number;
+}
+
+// ---- GET/POST /tools (kitchen calculators and the seasonal calendar) --------
+
+export interface LText { en: string; de: string }
+export type KitchenInputs = Record<string, number | string>;
+
+export interface KitchenField {
+  name: string;
+  label: LText;
+  kind: 'number' | 'select';
+  unit?: string;
+  default: number | string;
+  min?: number;
+  max?: number;
+  options?: { value: string; label: LText }[];
+}
+
+export interface KitchenCalculator {
+  id: string;
+  title: LText;
+  desc: LText;
+  fields: KitchenField[];
+}
+
+export interface KitchenOutput { key: string; label: LText; value: number; unit: string; note?: LText }
+
+export type SeasonCategory = 'vegetable' | 'fruit' | 'game';
+export interface SeasonEntry { name: LText; category: SeasonCategory; status: 'fresh' | 'stored' }
+export interface SeasonResult {
+  region: 'DE';
+  month: number;
+  in_season: SeasonEntry[];
+  ending_soon: SeasonEntry[];
+  next_month: SeasonEntry[];
 }

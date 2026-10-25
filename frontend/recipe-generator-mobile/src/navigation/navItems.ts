@@ -35,6 +35,14 @@ export const HISTORY_NAV_ITEM: NavItem = {
   route: 'History',
 };
 
+// Not a tab either, and it needs no account: the calculators and the seasonal calendar are pure.
+export const TOOLS_NAV_ITEM: NavItem = {
+  key: 'tools',
+  labelKey: 'nav.tools',
+  icon: 'construct-outline',
+  route: 'Tools',
+};
+
 export const PROFILE_NAV_ITEM: NavItem = {
   key: 'profile',
   labelKey: 'nav.profile',

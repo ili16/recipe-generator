@@ -15,9 +15,10 @@ import { useLanguage } from '../context/LanguageContext';
 import { currentLocale } from '../i18n';
 import en from '../i18n/en';
 import { parseISODate } from '../utils/mealPlanDates';
-import { NativeStackScreenProps } from '@react-navigation/native-stack';
+import { NativeStackScreenProps, NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { useNavigation } from '@react-navigation/native';
 import { RootStackParamList } from '../navigation/AppNavigator';
-import { ChatApproval, ChatArtifact, ChatAttachment, ChatMessage, ChatSource, RecipeDocument } from '../types';
+import { ChatApproval, ChatArtifact, ChatAttachment, ChatMessage, ChatSource, KitchenInputs, KitchenOutput, RecipeDocument } from '../types';
 import { hostLabel } from '../utils/recipeOrigin';
 import { foldArtifact } from '../utils/chatArtifacts';
 import { formatUSD, resetsOn } from '../utils/budget';
@@ -624,6 +625,28 @@ const OptionsCard: React.FC<{
   );
 };
 
+// A calculator result from the agent. The numbers are the server's; the button opens the same
+// calculator prefilled so the user can change an input without another turn.
+const ToolCard: React.FC<{
+  data: { tool: string; inputs: KitchenInputs; outputs: KitchenOutput[] };
+} & Pick<TurnProps, 'styles' | 't'>> = ({ data, styles, t }) => {
+  const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
+  return (
+    <View style={styles.card}>
+      {data.outputs.map((o) => (
+        <View key={o.key} style={styles.planRow}>
+          <Text style={styles.planDay}>{o.label[currentLocale()]}</Text>
+          <Text style={styles.planMeal}>{o.value.toLocaleString(currentLocale(), { maximumFractionDigits: 1 })} {o.unit}</Text>
+        </View>
+      ))}
+      <TouchableOpacity style={styles.saveButton} onPress={() => navigation.navigate('Tools', { tool: data.tool, inputs: data.inputs })}>
+        <Ionicons name="construct-outline" size={14} color={styles.saveButtonText.color as string} />
+        <Text style={styles.saveButtonText}>{t('chat.openInTools')}</Text>
+      </TouchableOpacity>
+    </View>
+  );
+};
+
 const ArtifactCard: React.FC<
   { artifact: ChatArtifact } & Pick<TurnProps, 'theme' | 'styles' | 'titles' | 'docsByRef' | 'savingRef' | 'expiredRefs' | 'onSaveDraft' | 't' | 'sending' | 'onPick' | 'answered'>
 > = ({
@@ -631,6 +654,9 @@ const ArtifactCard: React.FC<
 }) => {
   if (artifact.kind === 'options') {
     return <OptionsCard data={artifact.data} sending={sending} answered={!!answered} onPick={onPick} styles={styles} t={t} />;
+  }
+  if (artifact.kind === 'tool') {
+    return <ToolCard data={artifact.data} styles={styles} t={t} />;
   }
   if (artifact.kind === 'recipe') {
     const doc = artifact.data.document;

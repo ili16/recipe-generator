@@ -74,6 +74,11 @@ func main() {
 
 	mux.HandleFunc("GET /health", HandleHealth)
 
+	// Kitchen tools: pure maths and a static calendar, so public and not LLM-guarded.
+	mux.HandleFunc("GET /api/v1/tools", service.HandleListKitchenTools)
+	mux.HandleFunc("GET /api/v1/tools/seasonal", service.HandleSeasonalTool)
+	mux.HandleFunc("POST /api/v1/tools/{id}", service.HandleRunKitchenTool)
+
 	mux.HandleFunc("POST /api/v1/transcribe", llm(rl, service.HandleTranscribeAudio))
 	// The one conversational endpoint (specs/AGENT_CHAT.md §2). Every per-capability
 	// AI route it replaced is gone (BACKLOG.md 3.5, 3.9, 3.13).

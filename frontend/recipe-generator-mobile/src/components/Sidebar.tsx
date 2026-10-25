@@ -4,7 +4,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useTheme, Theme } from '../context/ThemeContext';
 import { useLanguage } from '../context/LanguageContext';
 import { type } from '../theme';
-import { navItemsFor, HISTORY_NAV_ITEM, PROFILE_NAV_ITEM, NavItem } from '../navigation/navItems';
+import { navItemsFor, HISTORY_NAV_ITEM, PROFILE_NAV_ITEM, TOOLS_NAV_ITEM, NavItem } from '../navigation/navItems';
 import { RootStackParamList } from '../navigation/AppNavigator';
 
 /**
@@ -73,6 +73,7 @@ const Sidebar: React.FC<Props> = ({ activeRoute, onNavigate, collapsed = false, 
             {!collapsed && <Text style={styles.itemLabel} numberOfLines={1}>{t('nav.report')}</Text>}
           </TouchableOpacity>
         )}
+        {renderItem(TOOLS_NAV_ITEM)}
         {authed && renderItem(HISTORY_NAV_ITEM)}
         {authed && renderItem(PROFILE_NAV_ITEM)}
       </View>

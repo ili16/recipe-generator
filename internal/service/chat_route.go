@@ -85,10 +85,10 @@ func routeIntent(ctx context.Context, msgs []model.ConversationMessage) intent {
 var routeTools = map[intent][]string{
 	intentOptions: {"offer_options"},
 	intentClarify: {"offer_options"},
-	intentChat:    {"answer_cooking_question", "get_preferences", "search_my_recipes", "meal_history", "get_recipe"},
+	intentChat:    {"answer_cooking_question", "get_preferences", "search_my_recipes", "meal_history", "get_recipe", "calculate", "seasonal"},
 	intentPrefs:   {"get_preferences", "set_preferences", "note_preference"},
 	intentPlan: {"plan_week", "apply_week_plan", "set_plan_day", "clear_plan_day", "mark_meal_cooked",
-		"search_my_recipes", "meal_history", "get_recipe", "display_recipe", "get_preferences"},
+		"search_my_recipes", "meal_history", "get_recipe", "display_recipe", "get_preferences", "seasonal"},
 	intentPantry: {"get_pantry", "scan_pantry", "add_pantry_items", "search_my_recipes", "get_recipe", "display_recipe"},
 }
 

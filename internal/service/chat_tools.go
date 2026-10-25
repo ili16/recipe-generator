@@ -44,7 +44,7 @@ var errSignInRequired = errors.New("this needs a signed-in account; ask the user
 // than as prose — the primitive that makes "make it vegan" work in the same surface as
 // "what's a good side for this?" (specs/AGENT_CHAT.md §2).
 type artifact struct {
-	Kind string `json:"kind"` // recipe | week_plan
+	Kind string `json:"kind"` // recipe | week_plan | options | tool
 	Data any    `json:"data"`
 }
 
@@ -88,6 +88,23 @@ func strList(desc string) map[string]any {
 }
 
 var chatTools = map[string]tool{
+	"calculate": {
+		Description: "Exact kitchen maths — never work these out yourself. tool is one of: pizza_dough (pizzas, ball_g, hydration %, salt %, hours, where=room|fridge), sourdough (flour, hydration, levain %, starter_hydration, salt), vinaigrette (total_ml, ratio oil:acid, mustard=yes|no, salt_per_100), sauce_thicken (volume_ml, thickness=thin|medium|thick), sauce_reduce (volume_ml, target_ml), salt (mode=dry_brine|wet_brine|ferment|water, amount g, percent; 0 = the usual). Pass only the inputs the user specified; the rest default. Shows a card with the numbers the user can adjust in the Tools screen, so summarise in one sentence rather than repeating the table.",
+		Params: obj(map[string]any{
+			"tool":   str("The calculator id"),
+			"inputs": map[string]any{"type": "object", "description": "Input values by name; numbers as numbers, choices as strings"},
+		}, "tool"),
+		Run: toolCalculate,
+	},
+	"seasonal": {
+		Description: "What is in season in Germany (domestic vegetables, fruit, and game by hunting season). Defaults to the current month. Germany only: say so if the user is elsewhere. category is vegetable, fruit or game; query filters by name (English or German).",
+		Params: obj(map[string]any{
+			"month":    integer("1-12; omit for this month"),
+			"category": str("vegetable | fruit | game; omit for all"),
+			"query":    str("Part of a name, to check one item"),
+		}),
+		Run: toolSeasonal,
+	},
 	"generate_recipe": {
 		Description: "Create a new recipe from a description, a webpage URL, or a photo the user attached. Returns a draft_ref naming the unsaved draft; the recipe card is already on the user's screen, so do not call display_recipe for it. Use the ref with transform_recipe or save_recipe.",
 		Params: obj(map[string]any{

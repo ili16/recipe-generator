@@ -2,7 +2,7 @@ import axios, { AxiosInstance } from 'axios';
 import { Platform } from 'react-native';
 import { fetch as expoFetch } from 'expo/fetch';
 import { API_BASE_URL, API_ENDPOINTS } from '../constants';
-import { Recipe, RecipeDocument, RecipeResponse, PatchRecipePayload, GenerationOrigin, EditTurn, RecipeVersion, UserPreferences, MealPlanWeek, MealPlanItem, MealSlot, MealPlanSuggestion, GroceryList, GroceryTick, SharedPlan, ChatStreamEvent, ChatAttachment, Collection, PantryItem, FeedbackPayload, Household, CookedResult, ConversationSummary, ConversationThread, Usage } from '../types';
+import { Recipe, RecipeDocument, RecipeResponse, PatchRecipePayload, GenerationOrigin, EditTurn, RecipeVersion, UserPreferences, MealPlanWeek, MealPlanItem, MealSlot, MealPlanSuggestion, GroceryList, GroceryTick, SharedPlan, ChatStreamEvent, ChatAttachment, Collection, PantryItem, FeedbackPayload, Household, CookedResult, ConversationSummary, ConversationThread, Usage, KitchenCalculator, KitchenInputs, KitchenOutput, SeasonResult, SeasonCategory } from '../types';
 import authService from './authService';
 
 // RN's global fetch has no readable body on native; expo/fetch does, so SSE streams there too.
@@ -334,6 +334,22 @@ class ApiService {
 
   // null when the caller is in no household — the server answers 204, which is a normal
   // state and not an error, and the screen renders the create/join form for it.
+  // Kitchen tools are public and pure: no token needed, no model behind them.
+  async getKitchenTools(): Promise<KitchenCalculator[]> {
+    const response = await this.client.get<{ calculators: KitchenCalculator[] }>(API_ENDPOINTS.TOOLS);
+    return response.data.calculators;
+  }
+
+  async runKitchenTool(id: string, inputs: KitchenInputs): Promise<KitchenOutput[]> {
+    const response = await this.client.post<{ outputs: KitchenOutput[] }>(`${API_ENDPOINTS.TOOLS}/${id}`, { inputs });
+    return response.data.outputs;
+  }
+
+  async getSeasonal(month: number, category?: SeasonCategory): Promise<SeasonResult> {
+    const response = await this.client.get<SeasonResult>(`${API_ENDPOINTS.TOOLS}/seasonal`, { params: { month, category } });
+    return response.data;
+  }
+
   async getHousehold(): Promise<Household | null> {
     const response = await this.client.get<Household | ''>(API_ENDPOINTS.HOUSEHOLD);
     return response.status === 204 || !response.data ? null : (response.data as Household);

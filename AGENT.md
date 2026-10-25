@@ -273,6 +273,9 @@ soft delete.
 - internal/service/tags.go: fixed recipe tagging vocabulary (`AllTagSlugs`), see specs/RECIPE_TAGS.md
 - internal/service/chat.go: the agent loop behind POST /chat — session/thread resolution, SSE
   event emission, iteration/deadline/budget bounds
+- internal/service/calculators.go + seasonal.go + kitchen_tools.go: the kitchen tools (BACKLOG 19.1) — pure calculators
+  (`calcCatalog`, rendered as forms by the Tools screen), the Germany-only seasonal table, the three public `/tools` handlers
+  and the `calculate` / `seasonal` agent tools. No DB, no model
 - internal/service/chat_tools.go: the tool catalog the loop dispatches (specs/AGENT_CHAT.md §2.2)
 - internal/service/handlers.go: transcribe + add-recipe handlers
 - internal/storage/db.go: pgx pool and recipe queries

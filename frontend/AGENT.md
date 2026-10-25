@@ -119,6 +119,8 @@ src/
 │   └── navItems.ts             — the 5 real destinations + Profile. `route` is required, so a
 │                                 route-less "Soon" entry no longer typechecks
 ├── screens/
+│   ├── ToolsScreen.tsx         — Kitchen tools (BACKLOG 19.1): calculators rendered from GET /tools + the
+│   │                             Germany-only seasonal calendar. Sidebar footer / TopBar, not a tab
 │   ├── ChatScreen.tsx          — the ONLY creation surface: one agent thread (POST /chat),
 │   │                             tool activity, artifact cards rendered via RecipeView
 │   ├── chat/Composer.tsx       — the composer: text + photo attachments + voice, the four

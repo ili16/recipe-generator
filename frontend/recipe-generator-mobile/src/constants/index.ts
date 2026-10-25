@@ -51,6 +51,7 @@ export const API_ENDPOINTS = {
   MEAL_PLAN_VARIANTS: 'meal-plan/variants',
   COLLECTIONS: 'collections',
   PANTRY: 'pantry',
+  TOOLS: 'tools',
   HOUSEHOLD: 'household',
   SHARED: 'shared',
   SHARED_PLAN: 'shared-plan',
