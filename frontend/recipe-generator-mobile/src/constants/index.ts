@@ -1,8 +1,8 @@
 // On web the app and the API share an origin (beta and live both path-split one host), so
 // the page's own origin is the right base wherever the image is served. Native has no
-// origin and talks to beta.
+// origin and talks to live (store builds).
 const WEB_ORIGIN = typeof window !== 'undefined' && window.location ? window.location.origin : null;
-const NATIVE_BASE_URL = 'https://recipe-generator-beta.ili16.de';
+const NATIVE_BASE_URL = 'https://recipe-generator.ili16.de';
 
 // API Configuration
 export const API_BASE_URL = __DEV__

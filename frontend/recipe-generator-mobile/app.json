@@ -2,11 +2,11 @@
   "expo": {
     "name": "recipe-generator-mobile",
     "slug": "recipe-generator-mobile",
-    "schmeme": "com.recipegenerator",
+    "scheme": "com.recipegenerator",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "splash": {
       "image": "./assets/splash-icon.png",
@@ -14,9 +14,12 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "de.ili16.recipegenerator",
+      "infoPlist": { "ITSAppUsesNonExemptEncryption": false }
     },
     "android": {
+      "package": "de.ili16.recipegenerator",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
