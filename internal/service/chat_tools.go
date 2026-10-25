@@ -89,7 +89,7 @@ func strList(desc string) map[string]any {
 
 var chatTools = map[string]tool{
 	"calculate": {
-		Description: "Exact kitchen maths — never work these out yourself. tool is one of: pizza_dough (pizzas, ball_g, hydration %, salt %, hours, where=room|fridge), sourdough (flour, hydration, levain %, starter_hydration, salt), vinaigrette (total_ml, ratio oil:acid, mustard=yes|no, salt_per_100), sauce_thicken (volume_ml, thickness=thin|medium|thick), salt (mode=dry_brine|wet_brine|ferment|water, amount g, percent; 0 = the usual). Pass only the inputs the user specified; the rest default. Shows a card with the numbers the user can adjust in the Tools screen, so summarise in one sentence rather than repeating the table.",
+		Description: "Exact kitchen maths — never work these out yourself. tool is one of: pizza_dough (pizzas, ball_g, hydration %, salt %, hours, where=room|fridge), sourdough (flour, hydration, levain %, starter_hydration, salt), vinaigrette (total_ml, ratio oil:acid, mustard=yes|no, salt_per_100), sauce_thicken (volume_ml, thickness=thin|medium|thick), salt (mode=dry_brine|wet_brine|ferment|water, amount g, percent; 0 = the usual), units (value, mode=g_oz|oz_g|ml_cup|cup_ml|c_f|f_c|tsp_tbsp|tbsp_tsp; US cups). Pass only the inputs the user specified; the rest default. Shows a card with the numbers the user can adjust in the Tools screen, so summarise in one sentence rather than repeating the table.",
 		Params: obj(map[string]any{
 			"tool":   str("The calculator id"),
 			"inputs": map[string]any{"type": "object", "description": "Input values by name; numbers as numbers, choices as strings"},

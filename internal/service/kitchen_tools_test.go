@@ -1,6 +1,7 @@
 package service
 
 import (
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -50,6 +51,13 @@ func TestCalculators(t *testing.T) {
 		t.Errorf("3:1 of 100 ml: %+v", v)
 	}
 
+	for mode, want := range map[string]float64{"g_oz": 3.5, "oz_g": 2835, "ml_cup": 0.4, "cup_ml": 23659, "c_f": 212, "f_c": 37.8, "tsp_tbsp": 33.3, "tbsp_tsp": 300} {
+		in := map[string]any{"mode": mode, "value": 100.0}
+		got := outVal(t, run(t, "units", in), "result")
+		if math.Abs(got-want) > 1 && math.Abs(got-want)/want > 0.01 {
+			t.Errorf("units %s of 100 = %v, want ~%v", mode, got, want)
+		}
+	}
 	// 1 kg of vegetables at the usual 2% is 20 g of salt.
 	if got := outVal(t, run(t, "salt", map[string]any{"mode": "ferment"}), "salt"); got != 20 {
 		t.Errorf("ferment salt = %v, want 20", got)

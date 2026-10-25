@@ -268,4 +268,33 @@ var calcCatalog = []calculator{
 			}, nil
 		},
 	},
+	{
+		ID: "units", Title: L{"Unit conversion", "Einheiten umrechnen"},
+		Desc: L{"Grams, ounces, millilitres, US cups, °C/°F and spoons. Cups are US cups (236.6 ml); a tablespoon is 3 teaspoons.", "Gramm, Unzen, Milliliter, US-Cups, °C/°F und Löffel. Cups sind US-Cups (236,6 ml); ein Esslöffel sind 3 Teelöffel."},
+		Fields: []calcField{
+			num("value", L{"Amount", "Menge"}, "", 100, -100, 100000),
+			pick("mode", L{"Convert", "Umrechnen"}, "g_oz",
+				op("g_oz", "g → oz", "g → oz"), op("oz_g", "oz → g", "oz → g"),
+				op("ml_cup", "ml → cups", "ml → Cups"), op("cup_ml", "cups → ml", "Cups → ml"),
+				op("c_f", "°C → °F", "°C → °F"), op("f_c", "°F → °C", "°F → °C"),
+				op("tsp_tbsp", "tsp → tbsp", "TL → EL"), op("tbsp_tsp", "tbsp → tsp", "EL → TL")),
+		},
+		run: func(v calcVals) ([]calcOut, error) {
+			x := v.n("value")
+			conv := map[string]struct {
+				f    func(float64) float64
+				unit string
+			}{
+				"g_oz":     {func(x float64) float64 { return x / 28.3495 }, "oz"},
+				"oz_g":     {func(x float64) float64 { return x * 28.3495 }, "g"},
+				"ml_cup":   {func(x float64) float64 { return x / 236.588 }, "cups"},
+				"cup_ml":   {func(x float64) float64 { return x * 236.588 }, "ml"},
+				"c_f":      {func(x float64) float64 { return x*9/5 + 32 }, "°F"},
+				"f_c":      {func(x float64) float64 { return (x - 32) * 5 / 9 }, "°C"},
+				"tsp_tbsp": {func(x float64) float64 { return x / 3 }, "tbsp"},
+				"tbsp_tsp": {func(x float64) float64 { return x * 3 }, "tsp"},
+			}[v.s("mode")]
+			return []calcOut{out("result", "Result", "Ergebnis", conv.f(x), conv.unit)}, nil
+		},
+	},
 }
