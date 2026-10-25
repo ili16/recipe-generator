@@ -46,6 +46,8 @@ func buildOriginUserText(origin model.GenerationOrigin) string {
 			text += " Additional instructions: " + origin.Prompt
 		}
 		return text
+	case "import":
+		return pastedRecipeAsk + "\n\n" + origin.Prompt
 	default:
 		return "Generate a recipe for: " + origin.Prompt
 	}
@@ -370,7 +372,26 @@ func generateRecipe(ctx context.Context, input model.GenerateRecipeInput) (model
 	if input.URL != "" {
 		return generateFromURL(ctx, input.URL, input.Prompt, input.PreferredLanguage)
 	}
+	if input.SourceText != "" {
+		return generateFromSourceText(ctx, input.SourceText, input.Prompt, input.PreferredLanguage)
+	}
 	return generateFromText(ctx, input.Prompt, input.PreferredLanguage)
+}
+
+// pastedRecipeAsk frames a recipe the user pasted as one to transcribe. Framed like a
+// description ("Generate a recipe for: …") the model treats a full recipe as a brief and
+// writes its own — a 150 g poolish came back as 500 g, instant yeast as fresh.
+const pastedRecipeAsk = "Extract and structure this recipe from the text the user pasted."
+
+func generateFromSourceText(ctx context.Context, text, prompt, preferredLanguage string) (model.RecipeDocument, error) {
+	userText := pastedRecipeAsk
+	if prompt != "" {
+		userText += " Additional instructions: " + prompt
+	}
+	// The language is the recipe's, not the device's: a German recipe stays German.
+	language := resolveLanguage(text, preferredLanguage)
+	slog.Debug("generate: pasted recipe", "text_len", len(text), "language", language)
+	return generateStructured(ctx, language, openai.TextContentPart(userText+"\n\n"+text))
 }
 
 func generateFromText(ctx context.Context, prompt, preferredLanguage string) (model.RecipeDocument, error) {

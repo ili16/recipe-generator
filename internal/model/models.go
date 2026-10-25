@@ -10,6 +10,10 @@ import (
 type GenerateRecipeInput struct {
 	Prompt string
 	URL    string
+	// SourceText is a recipe the user pasted, passed through from their own message
+	// rather than retyped by the agent — retyping is where a pasted recipe got summarised
+	// into a different one. When set, Prompt is only an extra instruction.
+	SourceText string
 	// Image is any reader over the image bytes: the multipart file on /generate, a
 	// bytes.Reader over a /chat attachment. Nil when there is no image.
 	Image             io.Reader
@@ -242,7 +246,7 @@ type CookingProfile struct {
 // refinements (and the eventual save) can be traced back to the initial ask.
 type GenerationOrigin struct {
 	Prompt     string `json:"prompt"`
-	SourceType string `json:"source_type"` // text | url | image
+	SourceType string `json:"source_type"` // text | url | image | import (a pasted recipe)
 	SourceURL  string `json:"source_url,omitempty"`
 }
 

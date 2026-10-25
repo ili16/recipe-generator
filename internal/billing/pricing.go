@@ -12,6 +12,8 @@ import (
 var modelPricing = map[string]struct{ PromptPer1M, CompletionPer1M float64 }{
 	"gpt-5.6-luna": {PromptPer1M: 5.00, CompletionPer1M: 15.00},
 	"gpt-5.4-nano": {PromptPer1M: 0.15, CompletionPer1M: 0.60},
+	// Decisions API: input only, output is free.
+	"gpt-6-luna": {PromptPer1M: 0.10, CompletionPer1M: 0},
 }
 
 // fallbackPricing is charged for any model not in modelPricing (e.g. an LLM_MODEL A/B

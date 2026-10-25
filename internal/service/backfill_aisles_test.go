@@ -1,6 +1,26 @@
 package service
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/ili16/recipe-generator/internal/llm"
+)
+
+// TestAislesFromKeepsOnlyConfidentChoices: an answer is joined by the question name we
+// gave it, and anything we would be guessing at stays NULL for a later run.
+func TestAislesFromKeepsOnlyConfidentChoices(t *testing.T) {
+	items := []string{"flour", "chicken thighs", "parsley", "mystery"}
+	got := aislesFrom(items, map[string]llm.Answer{
+		"i0": {Type: "choice", Name: "i0", Choice: "pantry", Confidence: 0.95},
+		"i1": {Type: "choice", Name: "i1", Choice: "protein", Confidence: 0.4}, // unsure
+		"i2": {Type: "refusal", Name: "i2"},
+		// i3 never answered
+		"i9": {Type: "choice", Name: "i9", Choice: "dairy", Confidence: 1}, // not asked
+	})
+	if len(got) != 1 || got["flour"] != "pantry" {
+		t.Errorf("got %v, want only flour→pantry", got)
+	}
+}
 
 // TestPickPairsIsKeyedByName is the regression for the bug BACKLOG 9.3's dry run found:
 // classifyAisles used to return a bare []string joined to the batch by index, so an

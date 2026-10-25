@@ -514,3 +514,21 @@ func TestDisplayRecipeRejectsUnknownRef(t *testing.T) {
 		t.Errorf("displayed a draft that does not exist: art=%+v err=%v", art, err)
 	}
 }
+
+// TestLastUserText pins what generate_recipe's from_message hands the recipe model: the
+// latest user message as typed, minus the attachment markers HandleChat appends.
+func TestLastUserText(t *testing.T) {
+	pasted := "Baguette\nZutaten\n    150 g lauwarmes Wasser\n    Eine Prise Instant-Hefe"
+	msgs := []model.ConversationMessage{
+		{Role: "user", Content: "an older message"},
+		{Role: "assistant", Content: "reply"},
+		{Role: "user", Content: pasted + "\n\n[attached link] https://example.com\n\n[attached photo] image_ref=image1"},
+		{Role: "tool", Content: "{}"},
+	}
+	if got := lastUserText(msgs); got != pasted {
+		t.Fatalf("lastUserText = %q, want %q", got, pasted)
+	}
+	if got := lastUserText(nil); got != "" {
+		t.Fatalf("lastUserText(nil) = %q, want empty", got)
+	}
+}

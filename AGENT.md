@@ -655,8 +655,9 @@ soft delete.
 - cmd/main.go: route registration, handlers for user info/recipes/usage/admin
 - cmd/mealplan.go: meal-plan handlers (range get / add / patch / delete item, variants)
 - cmd/backfill-aisles: one-off `make backfill-aisles` — classifies pre-BACKLOG-6.1
-  ingredients into shopping aisles in batched assist-model calls; re-running with nothing
-  NULL costs nothing
+  ingredients into shopping aisles, one `choice` question per item on the **Decisions API**
+  (`llm.Decide`, `POST /v1/decisions`, `gpt-6-luna`); answers under 0.6 confidence stay NULL
+  for the next run. Re-running with nothing NULL costs nothing
 - cmd/backfill-grams: the same shape for `ingredient_grams` (BACKLOG 16.2) — resolves every
   (item, unit) in use that nothing can convert yet. Live saves resolve their own
   (`service.LearnGrams`), so this is for the library that predates them. Safe to re-run, and
@@ -674,7 +675,9 @@ soft delete.
   `CallMessage` for the raw assistant message with its tool calls, which is what the agent
   loop iterates on) — every LLM call in the service goes through it, which is what makes cost recording and telemetry unconditional. Also
   owns the prompt files (`prompts/*.txt`, loaded via `go:embed`) and `PromptVersion`, a content
-  hash of the prompts that shape a saved `RecipeDocument`.
+  hash of the prompts that shape a saved `RecipeDocument`. `Decide` is the second path: typed
+  classification over `POST /v1/decisions` (raw `client.Post` — openai-go v1 predates it),
+  recorded through the same cost and telemetry calls.
 - internal/service/generate_recipe.go: recipe generation logic (text/url/image), tags and naming
 - internal/service/mealplan.go: meal-plan suggestion/chat prompt-building + LLM calls, recipe variant generation — mirrors generate_recipe.go's structured-output pattern
 - internal/service/tags.go: fixed recipe tagging vocabulary (`AllTagSlugs`), see specs/RECIPE_TAGS.md

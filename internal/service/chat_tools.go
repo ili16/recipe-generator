@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -90,7 +91,8 @@ var chatTools = map[string]tool{
 	"generate_recipe": {
 		Description: "Create a new recipe from a description, a webpage URL, or a photo the user attached. Returns a draft_ref naming the unsaved draft, and shows the user nothing: call display_recipe with that ref to put the recipe on their screen, then use it with transform_recipe or save_recipe.",
 		Params: obj(map[string]any{
-			"description": str("What the user asked for, e.g. 'a quick vegan pasta for two'"),
+			"description": str("What the user asked for, e.g. 'a quick vegan pasta for two'. With from_message, only an extra instruction, or omit"),
+			"from_message": map[string]any{"type": "boolean", "description": "true when the user's own message contains the recipe itself (ingredients and steps). The server passes their message on unchanged — do not copy it into description"},
 			"url":         str("A webpage to extract the recipe from, if the user gave one"),
 			"image_ref":   str("The ref from an [attached photo] marker in the user's message, e.g. 'image1'"),
 			"language":    str("ISO 639-1 code for the output language; omit to infer"),
@@ -378,12 +380,19 @@ func toolGenerateRecipe(ctx context.Context, s *chatSession, args json.RawMessag
 		URL         string `json:"url"`
 		ImageRef    string `json:"image_ref"`
 		Language    string `json:"language"`
+		FromMessage bool   `json:"from_message"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, nil, errors.New("could not read the arguments")
 	}
-	if a.Description == "" && a.URL == "" && a.ImageRef == "" {
-		return nil, nil, errors.New("give a description, a url or an image_ref")
+	var source string
+	if a.FromMessage {
+		if source = lastUserText(s.messages); source == "" {
+			return nil, nil, errors.New("the user's message holds no text; ask them to paste the recipe")
+		}
+	}
+	if a.Description == "" && a.URL == "" && a.ImageRef == "" && source == "" {
+		return nil, nil, errors.New("give a description, a url, an image_ref or from_message")
 	}
 
 	var image io.Reader
@@ -398,6 +407,7 @@ func toolGenerateRecipe(ctx context.Context, s *chatSession, args json.RawMessag
 	doc, err := GenerateRecipe(ctx, model.GenerateRecipeInput{
 		Prompt:            a.Description,
 		URL:               a.URL,
+		SourceText:        source,
 		Image:             image,
 		PreferredLanguage: a.Language,
 	})
@@ -415,14 +425,34 @@ func toolGenerateRecipe(ctx context.Context, s *chatSession, args json.RawMessag
 	}
 	// Which of the three inputs the user actually gave is the provenance, and this is
 	// the only place that still knows it.
-	origin := &model.GenerationOrigin{Prompt: a.Description, SourceType: "text", SourceURL: a.URL}
+	origin := &model.GenerationOrigin{Prompt: cmp.Or(source, a.Description), SourceType: "text", SourceURL: a.URL}
 	switch {
 	case a.URL != "":
 		origin.SourceType = "url"
 	case a.ImageRef != "":
 		origin.SourceType = "image"
+	case source != "":
+		origin.SourceType = "import"
 	}
 	return s.addDraft(doc, 0, origin, "")
+}
+
+// lastUserText is the latest user message as the user wrote it: the attachment markers
+// HandleChat appends ("[attached link] …", "[attached photo] …") are ours, not theirs.
+func lastUserText(messages []model.ConversationMessage) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "user" {
+			continue
+		}
+		var keep []string
+		for _, line := range strings.Split(messages[i].Content, "\n") {
+			if !strings.HasPrefix(line, "[attached link] ") && !strings.HasPrefix(line, "[attached photo] ") {
+				keep = append(keep, line)
+			}
+		}
+		return strings.TrimSpace(strings.Join(keep, "\n"))
+	}
+	return ""
 }
 
 func toolTransformRecipe(ctx context.Context, s *chatSession, args json.RawMessage) (any, *artifact, error) {

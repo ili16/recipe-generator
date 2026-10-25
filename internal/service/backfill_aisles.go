@@ -10,7 +10,6 @@ import (
 	"github.com/ili16/recipe-generator/internal/llm"
 	"github.com/ili16/recipe-generator/internal/model"
 	"github.com/ili16/recipe-generator/internal/storage"
-	"github.com/openai/openai-go"
 )
 
 // aisleBatchSize is how many ingredient names go into one classification call. Big
@@ -18,14 +17,21 @@ import (
 // response doesn't cost the whole run.
 const aisleBatchSize = 100
 
-const aisleSystemPrompt = `You sort grocery items into supermarket aisles.
-For every item you are given, answer with the aisle it is bought from, one of:
-produce, protein, dairy, pantry, other.
-Rules: fresh fruit and vegetables and herbs are produce; meat, fish and eggs are
-protein; milk, cheese, yoghurt, butter and cream are dairy; anything dry, tinned,
-bottled, frozen or a spice is pantry; use other only when you genuinely cannot tell.
-Answer for every item you were given, in the same order, and change nothing about the
-item names.`
+// aisleChoices are model.GroceryCategories with the rules that used to be a system
+// prompt, now attached to the option they describe.
+var aisleChoices = []llm.Choice{
+	{Value: "produce", Description: "Fresh fruit, vegetables and herbs."},
+	{Value: "protein", Description: "Meat, fish and eggs."},
+	{Value: "dairy", Description: "Milk, cheese, yoghurt, butter and cream."},
+	{Value: "pantry", Description: "Anything dry, tinned, bottled, frozen, or a spice."},
+	{Value: "other", Description: "Only when it genuinely cannot be told."},
+}
+
+// minAisleConfidence is below which an answer is left unwritten. NULL already renders as
+// "other" and stays on the worklist, so a coin-flip costs nothing to skip and a wrong
+// aisle costs a trip down the wrong one.
+// ponytail: guessed, not calibrated; tune against a labelled sample if skips pile up.
+const minAisleConfidence = 0.6
 
 // BackfillIngredientAisles fills recipe_ingredients.category for ingredients saved
 // before BACKLOG 6.1 taught the generation call to emit one. Names are classified once
@@ -87,60 +93,39 @@ func pickPairs(chunk []string, aisles map[string]string) (names, cats []string) 
 	return names, cats
 }
 
-// classifyAisles asks the assist model for one aisle per item and returns them keyed by
-// item name. The name is the join, deliberately: an earlier version pinned the answer to
-// a bare string array and joined on index, which silently mis-labelled everything after
-// the first insertion or omission — a real run returned 111 aisles for 100 items. The
-// model echoing a name back wrong costs that one item; it can no longer shift the rest.
+// classifyAisles asks the Decisions API one choice question per item and returns the
+// confident answers keyed by item name. Each question is named by its index in the
+// batch, a name we chose and the API echoes back verbatim, so the join that once
+// mislabelled everything after an inserted answer (111 aisles for 100 items) has nothing
+// left to drift: an answer cannot be reworded, invented, or outside the vocabulary.
 func classifyAisles(ctx context.Context, items []string) (map[string]string, error) {
-	type pair struct {
-		Item  string `json:"item"`
-		Aisle string `json:"aisle"`
+	questions := make([]llm.Question, len(items))
+	for i, item := range items {
+		questions[i] = llm.Question{
+			Type:         "choice",
+			Name:         fmt.Sprintf("i%d", i),
+			Instructions: fmt.Sprintf("Which supermarket aisle is %q bought from?", item),
+			Choices:      aisleChoices,
+		}
 	}
-	type answer struct {
-		Aisles []pair `json:"aisles"`
-	}
-	out, _, err := llm.Call[answer](ctx, llm.Spec{
-		Model:    assistModel,
-		CallType: "aisle_backfill",
-		Messages: []openai.ChatCompletionMessageParamUnion{
-			openai.SystemMessage(aisleSystemPrompt),
-			openai.UserMessage(strings.Join(items, "\n")),
-		},
-		Schema: &llm.Schema{Name: "aisles", Schema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"aisles": map[string]any{
-					"type": "array",
-					"items": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"item":  map[string]any{"type": "string"},
-							"aisle": map[string]any{"type": "string", "enum": model.GroceryCategories},
-						},
-						"required":             []string{"item", "aisle"},
-						"additionalProperties": false,
-					},
-				},
-			},
-			"required":             []string{"aisles"},
-			"additionalProperties": false,
-		}},
-	})
+	answers, err := llm.Decide(ctx, "aisle_backfill", "Sort grocery items into supermarket aisles.", questions)
 	if err != nil {
 		return nil, fmt.Errorf("classify aisles: %w", err)
 	}
-	byItem := make(map[string]string, len(out.Aisles))
-	for _, p := range out.Aisles {
-		byItem[p.Item] = p.Aisle
+	return aislesFrom(items, answers), nil
+}
+
+// aislesFrom keeps the confident choice answers. A refusal, a missing answer or a
+// low-confidence one leaves its item out, so it stays NULL for a later run.
+func aislesFrom(items []string, answers map[string]llm.Answer) map[string]string {
+	byItem := make(map[string]string, len(items))
+	for i, item := range items {
+		a, ok := answers[fmt.Sprintf("i%d", i)]
+		if ok && a.Type == "choice" && a.Confidence >= minAisleConfidence {
+			byItem[item] = a.Choice
+		}
 	}
-	// Only names the model echoed back exactly can be written. Anything it dropped,
-	// invented or reworded is left NULL rather than guessed at, so a later run retries it.
-	if len(byItem) != len(items) {
-		slog.WarnContext(ctx, "aisle backfill: answer did not cover the batch",
-			"items", len(items), "answered", len(out.Aisles), "matched", len(byItem))
-	}
-	return byItem, nil
+	return byItem
 }
 
 func sampleOf(names, cats []string) string {
